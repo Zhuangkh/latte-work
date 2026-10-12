@@ -1,7 +1,9 @@
+import { BrowserPane } from "./BrowserPane";
 import { TaskChangesView } from "./TaskChangesView";
 import { ChangesView } from "./ChangesView";
 import {
   openSubagent,
+  openBrowser,
   useWorkspaceState,
   type WorkspaceTab as Tab,
 } from "./workspaceState";
@@ -9,6 +11,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Bot,
+  Globe2,
   Files,
   GitCompareArrows,
   TerminalSquare,
@@ -58,9 +61,10 @@ function ConversationTab({
   );
 }
 
-type Kind = "terminal" | "files" | "diff" | "subagents";
+type Kind = "terminal" | "files" | "diff" | "subagents" | "browser";
 
 const labels = {
+  browser: "浏览器",
   terminal: "终端",
   files: "文件",
   diff: "变更",
@@ -69,6 +73,7 @@ const labels = {
   subagent: "子智能体",
 };
 const icons = {
+  browser: Globe2,
   subagents: Bot,
   subagent: Bot,
   terminal: TerminalSquare,
@@ -123,16 +128,19 @@ export function Workspace({
       key: string;
       hostId: string;
       hostName: string;
-      project: Project;
+      project?: Project;
       sessionId?: string;
     }[]
   >([]);
   useEffect(() => {
-    if (!project) return;
     const key = workspaceId;
     setPages((pages) =>
       pages.some((p) => p.key === key)
-        ? pages
+        ? pages.map((page) =>
+            page.key === key
+              ? { ...page, hostId, hostName, project, sessionId }
+              : page,
+          )
         : [...pages, { key, hostId, hostName, project, sessionId }],
     );
   }, [workspaceId, hostId, hostName, project]);
@@ -143,7 +151,7 @@ export function Workspace({
       hidden={!visible}
     >
       {pages.map((page) => {
-        const selected = !!project && page.key === workspaceId;
+        const selected = page.key === workspaceId;
         return (
           <WorkspacePage
             key={page.key}
@@ -160,78 +168,16 @@ export function Workspace({
             sidebarPreview={sidebarPreview}
             hostId={selected ? hostId : page.hostId}
             hostName={selected ? hostName : page.hostName}
-            project={selected ? project! : page.project}
+            project={selected ? project : page.project}
             selected={selected}
             active={selected && visible}
-            connected={selected && connected}
+            connected={selected && connected && !!project}
             expanded={expanded}
             expand={() => update((state) => ({ expanded: !state.expanded }))}
             close={close}
           />
         );
       })}
-      {!project && (
-        <div className="workspace-page empty">
-          <header data-tauri-drag-region="deep">
-            {expanded && statusCenter}
-            {expanded && !sidebarOpen && toggleSidebar && (
-              <>
-                <SidebarToggle
-                  toggle={toggleSidebar}
-                  preview={sidebarPreview}
-                />
-                <span className="titlebar-divider" aria-hidden="true" />
-              </>
-            )}
-            {expanded && (
-              <div
-                className="workspace-tabs"
-                role="tablist"
-                aria-label="工作区标签"
-              >
-                <ConversationTab
-                  title={conversationTitle}
-                  active={conversationActive}
-                  select={() => update({ conversationActive: true })}
-                />
-              </div>
-            )}
-            <div className="workspace-header-space" data-tauri-drag-region />
-            {expanded && conversationActions}
-            {expanded && overview}
-            {expanded && (
-              <span className="titlebar-divider" aria-hidden="true" />
-            )}
-            <button
-              className="icon-button"
-              aria-label={expanded ? "分离右侧栏" : "收起工作区"}
-              title={expanded ? "分离右侧栏" : "收起工作区"}
-              onClick={close}
-            >
-              <PanelRight size={16} />
-            </button>
-          </header>
-          <div
-            className="workspace-empty"
-            aria-label="工作区入口"
-            hidden={conversationActive}
-          >
-            <div className="workspace-launchers">
-              {(["diff", "terminal", "files", "subagents"] as const).map(
-                (kind) => {
-                  const Icon = icons[kind];
-                  return (
-                    <button key={kind} disabled title="选择项目后打开">
-                      <Icon size={18} />
-                      <span>{labels[kind]}</span>
-                    </button>
-                  );
-                },
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </aside>
   );
 }
@@ -271,7 +217,7 @@ function WorkspacePage({
   sidebarOpen: boolean;
   toggleSidebar?: () => void;
   sidebarPreview?: SidebarPreview;
-  project: Project;
+  project?: Project;
   selected: boolean;
   active: boolean;
   connected: boolean;
@@ -337,7 +283,7 @@ function WorkspacePage({
         ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [active, current, conversationActive]);
   useEffect(() => {
-    if (!selected || !connected) return;
+    if (!selected || !connected || !project) return;
     let disposed = false;
     const groups = new Map<
       string,
@@ -393,13 +339,22 @@ function WorkspacePage({
     return () => {
       disposed = true;
     };
-  }, [selected, connected, hostId, project.id, revision]);
+  }, [selected, connected, hostId, project?.id, revision]);
   useEffect(() => {
     if (!active) setMenu(false);
   }, [active]);
   async function add(kind: Kind) {
     setMenu(false);
     setError("");
+    if (kind === "browser") {
+      try {
+        openBrowser(workspaceId);
+      } catch (e) {
+        setError(message(e));
+      }
+      return;
+    }
+    if (!project) return;
     if (kind !== "terminal") {
       setTabs((tabs) =>
         tabs.some((t) => t.id === kind)
@@ -478,7 +433,7 @@ function WorkspacePage({
       : tab.kind === "subagent"
         ? (subagents?.tasks.find((task) => task.id === tab.taskId)?.title ??
           tab.title)
-        : tab.kind === "turnChanges"
+        : tab.kind === "turnChanges" || tab.kind === "browser"
           ? tab.title
           : labels[tab.kind];
   return (
@@ -585,7 +540,7 @@ function WorkspacePage({
       {menu && trigger.current && (
         <AddMenu
           trigger={trigger.current}
-          connected={connected}
+          connected={connected && !!project}
           close={() => {
             setMenu(false);
             trigger.current?.focus();
@@ -602,7 +557,18 @@ function WorkspacePage({
           className="workspace-pane"
           hidden={conversationActive || current !== tab.id}
         >
-          {tab.kind === "terminal" ? (
+          {["files", "diff", "turnChanges"].includes(tab.kind) &&
+          !(tab.project ?? project) ? (
+            <div className="workspace-empty">选择项目后打开此标签。</div>
+          ) : tab.kind === "browser" ? (
+            <BrowserPane
+              workspaceId={workspaceId}
+              tab={tab}
+              active={
+                active && !conversationActive && current === tab.id && !menu
+              }
+            />
+          ) : tab.kind === "terminal" ? (
             <TerminalPane
               hostId={tab.hostId ?? hostId}
               terminal={tab.terminal}
@@ -615,7 +581,7 @@ function WorkspacePage({
           ) : tab.kind === "turnChanges" ? (
             <TaskChangesView
               hostId={hostId}
-              project={project}
+              project={tab.project ?? project!}
               sessionId={tab.sessionId}
               requestId={tab.requestId}
               initialPath={tab.file}
@@ -628,7 +594,7 @@ function WorkspacePage({
               sessionId={sessionId}
               lastTurnVersion={lastTurnVersion}
               hostId={tab.hostId ?? hostId}
-              project={tab.project ?? project}
+              project={tab.project ?? project!}
               active={
                 active && !conversationActive && current === tab.id && connected
               }
@@ -649,7 +615,7 @@ function WorkspacePage({
           ) : (
             <WorkspaceFiles
               hostId={tab.hostId ?? hostId}
-              project={tab.project ?? project}
+              project={tab.project ?? project!}
               tab={tab.kind}
               path={tab.path ?? ""}
               file={tab.file ?? ""}
@@ -668,21 +634,23 @@ function WorkspacePage({
       {!tabs.length && !conversationActive && (
         <div className="workspace-empty" aria-label="工作区入口">
           <div className="workspace-launchers">
-            {(["diff", "terminal", "files", "subagents"] as const).map(
-              (kind) => {
-                const Icon = icons[kind];
-                return (
-                  <button
-                    key={kind}
-                    disabled={!connected || busy}
-                    onClick={() => void add(kind)}
-                  >
-                    <Icon size={18} />
-                    <span>{labels[kind]}</span>
-                  </button>
-                );
-              },
-            )}
+            {(
+              ["diff", "terminal", "files", "subagents", "browser"] as const
+            ).map((kind) => {
+              const Icon = icons[kind];
+              return (
+                <button
+                  key={kind}
+                  disabled={
+                    busy || (kind !== "browser" && (!connected || !project))
+                  }
+                  onClick={() => void add(kind)}
+                >
+                  <Icon size={18} />
+                  <span>{labels[kind]}</span>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
@@ -762,20 +730,22 @@ function AddMenu({
         top: Math.min(rect.bottom + 6, window.innerHeight - 132),
       }}
     >
-      {(["diff", "terminal", "files", "subagents"] as const).map((kind) => {
-        const Icon = icons[kind];
-        return (
-          <button
-            key={kind}
-            role="menuitem"
-            disabled={kind === "terminal" && !connected}
-            onClick={() => choose(kind)}
-          >
-            <Icon size={18} />
-            <span>{labels[kind]}</span>
-          </button>
-        );
-      })}
+      {(["diff", "terminal", "files", "subagents", "browser"] as const).map(
+        (kind) => {
+          const Icon = icons[kind];
+          return (
+            <button
+              key={kind}
+              role="menuitem"
+              disabled={kind !== "browser" && !connected}
+              onClick={() => choose(kind)}
+            >
+              <Icon size={18} />
+              <span>{labels[kind]}</span>
+            </button>
+          );
+        },
+      )}
     </div>,
     document.body,
   );

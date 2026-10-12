@@ -13,9 +13,11 @@ import { ProviderSettings } from "./ProviderSettings";
 import { SSHSettings } from "./SSHSettings";
 import type { Workbench } from "./useWorkbench";
 
+import { BrowserSettings } from "./BrowserSettings";
 import { AppearanceSettings } from "./AppearanceSettings";
 
 const tabs = [
+  { id: "browser", label: "浏览器", icon: Globe2 },
   { id: "appearance", label: "外观", icon: Palette },
   { id: "agents", label: "连接与 Agent", icon: MessageSquare },
   { id: "providers", label: "模型", icon: Settings2 },
@@ -122,6 +124,14 @@ export function SettingsPage({
           </div>
         </aside>
         <main className="settings-body" aria-label="设置">
+          <section
+            id="settings-panel-browser"
+            role="tabpanel"
+            aria-labelledby="settings-tab-browser"
+            hidden={tab !== "browser"}
+          >
+            <BrowserSettings />
+          </section>
           <section
             id="settings-panel-archived"
             role="tabpanel"

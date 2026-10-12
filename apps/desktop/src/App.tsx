@@ -1,3 +1,4 @@
+import { LinkHandling } from "./LinkHandling";
 import { TaskOverview } from "./TaskOverview";
 import { useAppLifecycle } from "./appLifecycle";
 import { StatusCenter } from "./StatusCenter";
@@ -173,7 +174,7 @@ export default function App() {
     />
   );
   return (
-    <>
+    <LinkHandling workspaceId={workbench.workspaceId}>
       <div
         hidden={workbench.modal === "settings"}
         className={`app ${sidebarOpen ? "" : "sidebar-collapsed"}${panel ? " workspace-visible" : ""}${merged ? " workspace-merged" : ""}`}
@@ -394,6 +395,6 @@ export default function App() {
           cancel={workbench.cancelPasswordPrompt}
         />
       )}
-    </>
+    </LinkHandling>
   );
 }

@@ -1,4 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod browser;
+mod browser_downloads;
+mod browser_native;
 mod lifecycle;
 mod paste;
 mod pending_close;
@@ -18,7 +21,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::{
     io::AsyncWriteExt,
@@ -850,6 +853,8 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Connections::default())
+        .manage(browser::Tools::default())
+        .manage(browser_downloads::Downloads::default())
         .menu(|app| {
             let menu = tauri::menu::Menu::default(app)?;
             #[cfg(target_os = "macos")]
@@ -867,11 +872,31 @@ fn main() {
                 )?;
                 application.insert(&quit, position)?;
             }
+            let tools = tauri::menu::Submenu::with_id(app, "browser-menu", "浏览器", true)?;
+            for (id, title, shortcut) in [
+                ("find", "在页面中查找", "CmdOrCtrl+F"),
+                ("print", "打印…", "CmdOrCtrl+P"),
+                ("zoom-in", "放大", "CmdOrCtrl+Plus"),
+                ("zoom-out", "缩小", "CmdOrCtrl+-"),
+                ("zoom-reset", "实际大小", "CmdOrCtrl+0"),
+                ("history", "历史记录", "CmdOrCtrl+Y"),
+            ] {
+                tools.append(&tauri::menu::MenuItem::with_id(
+                    app,
+                    format!("browser-{id}"),
+                    title,
+                    true,
+                    Some(shortcut),
+                )?)?;
+            }
+            menu.append(&tools)?;
             Ok(menu)
         })
         .on_menu_event(|app, event| {
             if event.id().as_ref() == "latte-quit" {
                 app.exit(0);
+            } else if let Some(action) = event.id().as_ref().strip_prefix("browser-") {
+                let _ = app.emit_to("main", "browser-shortcut", action);
             }
         })
         .on_window_event(|window, event| {
@@ -888,6 +913,17 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             lifecycle::app_close_ready,
+            browser::browser_create,
+            browser::browser_sync,
+            browser::browser_action,
+            browser::browser_close,
+            browser::browser_find,
+            browser::browser_capture,
+            browser::browser_clear_data,
+            browser_downloads::browser_downloads,
+            browser_downloads::browser_clear_downloads,
+            browser_downloads::browser_reveal_download,
+            browser::open_external_url,
             connect_host,
             disconnect_host,
             host_request,
@@ -922,7 +958,7 @@ fn main() {
             }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event
-                && let Some(window) = app.get_webview_window("main")
+                && let Some(window) = app.get_window("main")
             {
                 let _ = window.unminimize();
                 let _ = window.show();

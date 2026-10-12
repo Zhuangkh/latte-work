@@ -1,3 +1,4 @@
+import { WebLink } from "./LinkHandling";
 import { copyText } from "./clipboard";
 import {
   Children,
@@ -63,7 +64,7 @@ export function MessageContent({ text }: { text: string }) {
     <>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{ pre: CodeBlock }}
+        components={{ pre: CodeBlock, a: WebLink }}
       >
         {text}
       </ReactMarkdown>

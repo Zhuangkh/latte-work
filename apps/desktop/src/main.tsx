@@ -5,6 +5,7 @@ import { AppearanceProvider } from "./AppearanceProvider";
 import "./style.css";
 import "./appearance.css";
 import "./settings.css";
+import "./browser.css";
 
 // Suppress WebView menus (reload, lookup, translation, etc.) across the app,
 // including portal content and editable fields. Custom menu handlers still run.

@@ -547,3 +547,48 @@ precedes writes; only full success becomes reverted. Failure/crash stays unknown
 and is never automatically retried. Completed repeated Undo requests reconcile
 idempotently. Independent external writers are not locked; post-turn conflicts
 are rejected and an interrupted restoration requires manual workspace inspection.
+
+## Embedded browser
+
+The browser toolbar's menu supports find, 25–300% page zoom, the system print/PDF
+panel, visible-viewport PNG snapshots, native downloads, searchable visit history,
+and explicitly confirmed data clearing. Native menu accelerators route through
+the selected browser pane (including when the child WebView owns keyboard focus).
+History is bounded to 500 entries; title callbacks and data-clear reloads cannot
+recreate cleared history. Downloads retain WebKit's original request and cookies;
+at most four transfers/save dialogs can be outstanding and the latest 100 records
+are persisted. Finished files up to 128 MiB are offered in the native save picker;
+cancel/failure/interruption are explicit and never auto-replayed. Larger files are
+rejected after transfer; this is a saved-file limit, not a network transfer quota.
+Clearing download records preserves user-saved files.
+
+On macOS, `macos_browser.m` gives only incognito-constructed browser surfaces a
+shared profile separate from the workbench. macOS 14+ uses a persistent named
+WebKit data store; older macOS uses a shared session-only store. Existing default
+store website logins are not migrated. Find/snapshot/clear use a single-use nonce
+bridge backed by a private per-process request directory, bound to the exact
+WebView, with bounded payloads and ten-second completion timeouts. Pages cannot
+pass paths or arbitrary commands; Rust remains free of unsafe code. Snapshots
+capture only the current viewport (up to 4096 × 4096 points, 64 MiB PNG), and show
+a save picker only after successful native capture. None of these tools grant
+remote pages the workbench IPC capability. Non-macOS find/snapshot/profile tools
+fail explicitly; no native cross-platform smoke claim is implied.
+
+Focused checks: `BrowserTools.test.tsx`, `browserHistory.test.ts`, native desktop
+tests, and separate real macOS smoke of find/zoom/PDF/PNG/POST downloads/clear.
+
+The desktop uses Tauri's `unstable` child-WebView API to place independent native
+HTTP(S) pages in workspace tabs. Main UI capabilities target only the `main`
+WebView, not the whole window. Browser commands validate their caller and URLs;
+remote pages cannot navigate to the App origin, custom protocols or URLs with
+credentials. The App CSP keeps `frame-src 'none'`; no iframe is used. New-window
+requests create workspace tabs; downloads use the native transfer and explicit save
+flow described above. Closing a tab releases its native surface; hiding it retains navigation.
+Dock reopening uses the native Window handle because a multi-WebView window is
+no longer a WebviewWindow. Server/Agent execution and SSH contracts are unchanged.
+
+Browser preference lives in `latte-work.link-target.v1` local storage (default
+`internal`). Browser URL/title metadata follows workspace persistence; pages are
+created lazily when selected. Native IDs are per-mounted-pane, so first-send draft
+migration does not collide with a retained draft surface. Focused tests cover link
+routing, preference write failure, unsafe URL restoration and surface lifecycle.

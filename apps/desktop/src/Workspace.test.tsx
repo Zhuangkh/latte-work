@@ -674,3 +674,19 @@ it("keeps a merged conversation tab when all resources close or no project is se
   ).toBe("true");
   expect(screen.getByRole("button", { name: "分离右侧栏" })).toBeTruthy();
 });
+
+it("offers browser access without a project and defers saved project previews", async () => {
+  updateWorkspace(props.workspaceId, {
+    tabs: [{ id: "diff", kind: "diff" }],
+    current: "diff",
+  });
+  render(<Workspace {...props} project={undefined} />);
+  expect(screen.getByText("选择项目后打开此标签。")).toBeTruthy();
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "关闭变更" }));
+  });
+  expect(
+    (screen.getByRole("button", { name: "浏览器" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
+});

@@ -1,3 +1,4 @@
+import { webLink } from "./browserLinks";
 import { useSyncExternalStore } from "react";
 import type { Project, TerminalInfo, Subagent } from "./protocol";
 
@@ -21,6 +22,7 @@ export type WorkspaceTab = {
       file?: string;
     }
   | { id: string; kind: "subagent"; taskId: string; title: string }
+  | { id: string; kind: "browser"; url: string; title: string }
   | { id: string; kind: "terminal"; terminal: TerminalInfo }
 );
 export interface WorkspaceState {
@@ -97,22 +99,29 @@ export function readWorkspace(key: string): WorkspaceState {
           tab.kind === "subagents"
             ? (tab.path === undefined || typeof tab.path === "string") &&
               (tab.file === undefined || typeof tab.file === "string")
-            : tab.kind === "turnChanges"
-              ? typeof tab.requestId === "string" &&
-                !!tab.requestId &&
-                tab.requestId.length <= 256 &&
-                typeof tab.sessionId === "string" &&
-                !!tab.sessionId &&
+            : tab.kind === "browser"
+              ? !!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+                  tab.id,
+                ) &&
                 typeof tab.title === "string" &&
-                (tab.file === undefined || typeof tab.file === "string")
-              : tab.kind === "subagent"
-                ? typeof tab.taskId === "string" &&
-                  !!tab.taskId &&
-                  typeof tab.title === "string"
-                : tab.kind === "terminal" &&
-                  tab.terminal?.id === tab.id &&
-                  typeof tab.terminal.project_id === "string" &&
-                  typeof tab.terminal.title === "string";
+                typeof tab.url === "string" &&
+                (tab.url === "" || webLink(tab.url) !== null)
+              : tab.kind === "turnChanges"
+                ? typeof tab.requestId === "string" &&
+                  !!tab.requestId &&
+                  tab.requestId.length <= 256 &&
+                  typeof tab.sessionId === "string" &&
+                  !!tab.sessionId &&
+                  typeof tab.title === "string" &&
+                  (tab.file === undefined || typeof tab.file === "string")
+                : tab.kind === "subagent"
+                  ? typeof tab.taskId === "string" &&
+                    !!tab.taskId &&
+                    typeof tab.title === "string"
+                  : tab.kind === "terminal" &&
+                    tab.terminal?.id === tab.id &&
+                    typeof tab.terminal.project_id === "string" &&
+                    typeof tab.terminal.title === "string";
         if (valid) ids.add(tab.id);
         return valid;
       });
@@ -248,4 +257,37 @@ export function openTurnChanges(
     visible: true,
     conversationActive: false,
   }));
+}
+
+export function openBrowser(workspaceId: string, value = "", newTab = false) {
+  const url = value ? webLink(value) : "";
+  if (url === null) return;
+  updateWorkspace(workspaceId, (state) => {
+    const existing =
+      url && !newTab
+        ? state.tabs.find((tab) => tab.kind === "browser" && tab.url === url)
+        : undefined;
+    if (
+      !existing &&
+      state.tabs.filter((tab) => tab.kind === "browser").length >= 32
+    )
+      throw new Error("最多打开 32 个浏览器标签");
+    const id = existing?.id ?? crypto.randomUUID();
+    return {
+      tabs: existing
+        ? state.tabs
+        : [
+            ...state.tabs,
+            {
+              id,
+              kind: "browser",
+              url,
+              title: url ? new URL(url).hostname : "浏览器",
+            },
+          ],
+      current: id,
+      visible: true,
+      conversationActive: false,
+    };
+  });
 }

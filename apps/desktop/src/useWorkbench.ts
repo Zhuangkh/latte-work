@@ -275,7 +275,7 @@ export function useWorkbench() {
   const openedEvidence = useRef(new Map<string, number>());
   const [modal, setModal] = useState<"project" | "settings" | null>(null);
   const [settingsTab, setSettingsTab] = useState<
-    "agents" | "providers" | "ssh" | "appearance" | "archived"
+    "agents" | "providers" | "ssh" | "appearance" | "archived" | "browser"
   >("agents");
   const [settingsReturnToProject, setSettingsReturnToProject] = useState(false);
   const [busy, setBusy] = useState(false);

@@ -12,7 +12,7 @@ tauri-build = { version = "2", features = [] }
 anyhow.workspace = true
 uuid.workspace = true
 latte-work-config.workspace = true
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-dialog = "2"
 latte-work-protocol.workspace = true
 latte-work-client.workspace = true
