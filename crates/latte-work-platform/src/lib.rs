@@ -6,4 +6,6 @@ pub mod fs;
 pub mod ipc;
 pub mod lock;
 pub mod paths;
+#[cfg(windows)]
+pub mod pipe;
 pub mod process;

@@ -299,6 +299,8 @@ async fn connection(stream: Stream, service: Service) -> Result<()> {
                             agents: vec![service.agent.clone()],
                             permission_settings: true,
                             history_window: true,
+                            terminal: terminal::SUPPORTED,
+                            undo: task_changes::UNDO_SUPPORTED,
                         }
                     } else {
                         Response::Error {

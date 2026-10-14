@@ -12,6 +12,7 @@ import { Conversation } from "./Conversation";
 import { Workspace } from "./Workspace";
 import { Sidebar } from "./Sidebar";
 import { SidebarToggle } from "./SidebarToggle";
+import { WindowControls } from "./WindowControls";
 import { SessionMenuButton } from "./SessionMenuButton";
 import { useSidebarPreview } from "./useSidebarPreview";
 import { SettingsPage } from "./SettingsPage";
@@ -290,6 +291,7 @@ export default function App() {
               >
                 <PanelRight size={16} />
               </button>
+              {!merged && <WindowControls />}
             </div>
           </header>
           <Conversation
@@ -308,6 +310,7 @@ export default function App() {
             agent={agent}
             session={session}
             hostId={hostId}
+            supportsUndo={workbench.hostSupportsUndo(hostId)}
             agentSessionState={
               session
                 ? workbench.agentSessionState({ ...session, hostId })
@@ -443,6 +446,7 @@ export default function App() {
           sidebarPreview={sidebarPreview}
           hostId={hostId}
           hostName={host.name}
+          supportsTerminal={workbench.hostSupportsTerminal}
           project={project}
           visible={panel && workbench.modal !== "settings"}
           connected={connected}

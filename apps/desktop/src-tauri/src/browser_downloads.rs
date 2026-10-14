@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, Webview, webview::DownloadEvent};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 const LIMIT: usize = 100;
 const MAX_BYTES: u64 = 128 * 1024 * 1024;
@@ -304,26 +305,10 @@ pub async fn browser_reveal_download(view: Webview, id: String) -> Result<(), St
     if !path.is_file() {
         return Err("下载文件已移动或删除".into());
     }
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("open");
-        command.arg("-R");
-        command
-    };
-    #[cfg(not(target_os = "macos"))]
-    let mut command = tokio::process::Command::new("xdg-open");
-    let status = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        command.arg(path).kill_on_drop(true).status(),
-    )
-    .await
-    .map_err(|_| "打开文件位置超时")?
-    .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("无法显示下载文件".into())
-    }
+    view.app_handle()
+        .opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("无法显示下载文件：{e}"))
 }
 #[cfg(test)]
 mod tests {

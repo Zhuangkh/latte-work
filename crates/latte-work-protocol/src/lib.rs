@@ -879,6 +879,12 @@ pub struct TaskSource {
     pub uses: u32,
 }
 
+/// Host capabilities default to supported so older Servers keep working; new
+/// Servers report an explicit `false` for a capability they cannot serve yet.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
@@ -995,6 +1001,10 @@ pub enum Response {
         permission_settings: bool,
         #[serde(default)]
         history_window: bool,
+        #[serde(default = "default_true")]
+        terminal: bool,
+        #[serde(default = "default_true")]
+        undo: bool,
     },
     Projects {
         projects: Vec<Project>,
@@ -1098,6 +1108,19 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"method":"shell","command":"rm"}"#).is_err());
         assert!(!Status::Unknown.active());
         assert!(Status::Waiting.active());
+    }
+    #[test]
+    fn hello_host_capabilities_default_to_supported_for_older_servers() {
+        let response: Response = serde_json::from_str(
+            r#"{"kind":"hello","version":1,"server_id":"s","agents":[],
+                "permission_settings":true,"history_window":true}"#,
+        )
+        .unwrap();
+        let Response::Hello { terminal, undo, .. } = response else {
+            panic!("expected hello");
+        };
+        assert!(terminal, "missing terminal capability must stay compatible");
+        assert!(undo, "missing undo capability must stay compatible");
     }
 }
 

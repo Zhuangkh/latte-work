@@ -66,6 +66,8 @@ beforeEach(() => {
     hostId: "local",
     host: { id: "local", name: "本机" },
     connected: true,
+    hostSupportsTerminal: () => true,
+    hostSupportsUndo: () => true,
     connecting: false,
     hostErrors: { remote: "SSH 连接已关闭" },
     hostConnectionStatus: (id: string) =>

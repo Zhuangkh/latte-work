@@ -11,6 +11,8 @@ mod backend;
 #[path = "task_changes/windows.rs"]
 mod backend;
 
+pub const UNDO_SUPPORTED: bool = backend::UNDO_SUPPORTED;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum Identity {

@@ -158,6 +158,31 @@ button svg {
   flex: none;
   gap: var(--space-1);
 }
+/* Undecorated windows: controls sit flush in the titlebar's top-right corner. */
+.window-controls {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  margin-right: calc(-1 * var(--space-2));
+}
+.window-control {
+  width: 46px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text-secondary);
+  display: grid;
+  place-items: center;
+}
+.window-control:hover {
+  background: var(--color-hover);
+  color: var(--color-text);
+}
+.window-control-close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
 .titlebar-divider {
   flex: none;
   width: 1px;
@@ -3659,6 +3684,8 @@ button.recent-notice {
   inset: 0 0 auto;
   height: var(--titlebar-height);
   z-index: 2;
+  display: flex;
+  justify-content: flex-end;
 }
 .model-picker {
   display: flex;

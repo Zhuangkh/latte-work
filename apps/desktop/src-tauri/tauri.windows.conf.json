@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "title": "Latte Work",
+        "width": 1440,
+        "height": 940,
+        "minWidth": 960,
+        "minHeight": 640,
+        "decorations": false,
+        "backgroundColor": "#111111"
+      }
+    ]
+  }
+}

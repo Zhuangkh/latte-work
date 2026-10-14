@@ -18,6 +18,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+/// Host Hello advertises PTY support from this constant.
+pub const SUPPORTED: bool = true;
 const MAX_TERMINALS: usize = 16;
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const READ_LIMIT: usize = 64 * 1024;

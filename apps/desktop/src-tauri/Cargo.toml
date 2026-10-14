@@ -12,8 +12,10 @@ tauri-build = { version = "2", features = [] }
 anyhow.workspace = true
 uuid.workspace = true
 latte-work-config.workspace = true
+latte-work-platform.workspace = true
 tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-opener = "=2.5.5"
 latte-work-protocol.workspace = true
 latte-work-client.workspace = true
 serde.workspace = true
@@ -21,6 +23,10 @@ serde_json.workspace = true
 tokio.workspace = true
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = { version = "5", features = ["std"] }
+latte-work-windows-webview.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }

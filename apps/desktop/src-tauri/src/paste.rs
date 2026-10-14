@@ -6,6 +6,8 @@ use std::{path::Path, sync::Arc};
 use tauri::State;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 const MAX_FILE: u64 = 64 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+mod windows_clipboard;
 
 #[tauri::command]
 pub fn clipboard_file_paths() -> Result<Vec<String>, String> {
@@ -37,7 +39,14 @@ pub fn clipboard_file_paths() -> Result<Vec<String>, String> {
         }
         Ok(paths)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_clipboard::file_paths(
+            || clipboard_win::Clipboard::new_attempts(10),
+            clipboard_win::formats::FileList,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Ok(Vec::new())
     }

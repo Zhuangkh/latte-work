@@ -5,6 +5,7 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
 };
+pub(super) const UNDO_SUPPORTED: bool = true;
 pub(super) fn identity(path: &Path) -> Result<Identity> {
     let metadata = path.metadata()?;
     Ok(Identity::Unix((metadata.dev(), metadata.ino())))

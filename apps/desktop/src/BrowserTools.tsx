@@ -67,6 +67,10 @@ export function BrowserTools({
   const [find, setFind] = useState(false);
   const [query, setQuery] = useState("");
   const [found, setFound] = useState<boolean | null>(null);
+  const findOpen = useRef(false);
+  const findRevision = useRef(0);
+  const findUsed = useRef(false);
+  const findReset = useRef<Promise<unknown>>(Promise.resolve());
   const [zoom, setZoom] = useState(1);
   const zoomRef = useRef(1);
   const [busy, setBusy] = useState(false);
@@ -81,6 +85,33 @@ export function BrowserTools({
     (error: unknown) => reportError(message(error)),
     [reportError],
   );
+  const resetFind = useCallback(() => {
+    findRevision.current += 1;
+    setFound(null);
+    if (!findUsed.current) return;
+    findUsed.current = false;
+    // Reset bypasses the pane queue so it can cancel an in-flight native Start.
+    findReset.current = invoke("browser_find", {
+      id,
+      query: "",
+      backwards: false,
+    }).catch(report);
+  }, [id, report]);
+  function closeFind() {
+    findOpen.current = false;
+    setFind(false);
+    resetFind();
+    trigger.current?.focus();
+  }
+  useEffect(() => {
+    return () => {
+      findOpen.current = false;
+      resetFind();
+    };
+  }, [resetFind]);
+  useEffect(() => {
+    resetFind();
+  }, [url, active, ready, resetFind]);
   const visits = useBrowserHistory(report);
   const state = useRef({ active, ready, url, panel });
   state.current = { active, ready, url, panel };
@@ -105,9 +136,6 @@ export function BrowserTools({
       setPanel(null);
     }
   }, [active]);
-  useEffect(() => {
-    setFound(null);
-  }, [url, query]);
   useEffect(() => {
     if (find && active) search.current?.focus();
   }, [find, active]);
@@ -136,6 +164,13 @@ export function BrowserTools({
       listen<string>("browser-download-error", ({ payload }) => {
         if (!disposed && state.current.active) reportError(payload);
       }),
+      listen<{ id: string; error: string }>(
+        "browser-find-error",
+        ({ payload }) => {
+          if (!disposed && state.current.active && payload.id === id)
+            reportError(payload.error);
+        },
+      ),
     ];
     void invoke<Download[]>("browser_downloads").then((items) => {
       if (!disposed) setDownloads(items);
@@ -147,7 +182,7 @@ export function BrowserTools({
           void pending.then((unlisten) => unlisten()).catch(() => {}),
       );
     };
-  }, [report, reportError]);
+  }, [id, report, reportError]);
   async function perform(work: () => Promise<unknown>, success?: string) {
     if (busyRef.current) return;
     busyRef.current = true;
@@ -174,20 +209,39 @@ export function BrowserTools({
     });
   }
   async function findNext(backwards: boolean) {
-    if (!query.trim()) return;
+    if (!query.trim() || !findOpen.current || busyRef.current) return;
     const current = query;
-    await perform(async () => {
-      const result = await invoke<boolean>("browser_find", {
-        id,
-        query: current,
-        backwards,
+    const revision = findRevision.current;
+    findUsed.current = true;
+    busyRef.current = true;
+    setBusy(true);
+    const isCurrent = () =>
+      findOpen.current && findRevision.current === revision;
+    try {
+      const result = await enqueue(async () => {
+        await findReset.current;
+        if (!isCurrent()) return null;
+        return invoke<boolean>("browser_find", {
+          id,
+          query: current,
+          backwards,
+        });
       });
-      setFound(result);
-    });
+      if (isCurrent() && typeof result === "boolean") {
+        setFound(result);
+        reportError("");
+      }
+    } catch (error) {
+      if (isCurrent()) report(error);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
   }
   function choose(action: string) {
     closeMenu();
     if (action === "find") {
+      findOpen.current = true;
       setFind(true);
       search.current?.focus();
     } else if (
@@ -280,12 +334,17 @@ export function BrowserTools({
               value={query}
               maxLength={512}
               placeholder="在页面中查找"
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                const value = event.target.value;
+                findRevision.current += 1;
+                setQuery(value);
+                setFound(null);
+                if (!value) resetFind();
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
                   event.preventDefault();
-                  setFind(false);
-                  trigger.current?.focus();
+                  closeFind();
                 } else if (event.key === "Enter" && event.shiftKey) {
                   event.preventDefault();
                   void findNext(true);
@@ -316,10 +375,7 @@ export function BrowserTools({
               type="button"
               className="icon-button"
               aria-label="关闭查找"
-              onClick={() => {
-                setFind(false);
-                trigger.current?.focus();
-              }}
+              onClick={closeFind}
             >
               <X size={16} />
             </button>

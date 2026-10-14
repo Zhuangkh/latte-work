@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod askpass;
 mod browser;
 mod browser_downloads;
 mod browser_native;
@@ -14,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
-    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
         Arc,
@@ -23,12 +23,8 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
-use tokio::{
-    io::AsyncWriteExt,
-    net::UnixListener,
-    sync::{Mutex, RwLock},
-    task::JoinHandle,
-};
+use tauri_plugin_opener::OpenerExt;
+use tokio::sync::{Mutex, RwLock};
 #[derive(Default)]
 struct Connections {
     clients: Mutex<HashMap<String, Arc<Mutex<Client>>>>,
@@ -62,55 +58,52 @@ impl CachedPassword {
         (self.ssh == ssh && self.port == port).then_some(self.value.as_str())
     }
 }
-struct Askpass {
-    directory: PathBuf,
-    socket: PathBuf,
-    task: JoinHandle<()>,
+#[cfg(unix)]
+fn askpass_helper(path: PathBuf) -> Result<(), String> {
+    use std::io::Write;
+    let stream = std::os::unix::net::UnixStream::connect(path)
+        .map_err(|_| "askpass socket unavailable".to_string())?;
+    let mut password = Vec::new();
+    stream
+        .take(4097)
+        .read_to_end(&mut password)
+        .map_err(|_| "askpass read failed".to_string())?;
+    if password.len() > 4096 {
+        return Err("askpass response too long".into());
+    }
+    std::io::stdout()
+        .write_all(&password)
+        .map_err(|_| "askpass write failed".to_string())
 }
-impl Askpass {
-    fn start(password: String) -> Result<Self, String> {
-        if password.is_empty() || password.len() > 4096 || password.contains('\0') {
-            return Err("SSH 密码长度无效".into());
+
+#[cfg(windows)]
+fn askpass_helper(path: PathBuf) -> Result<(), String> {
+    use std::io::Write;
+    let name = path
+        .to_str()
+        .ok_or_else(|| "askpass pipe path is not UTF-8".to_string())?;
+    let mut stream = latte_work_platform::pipe::connect_file_once(name)
+        .map_err(|_| "askpass pipe unavailable".to_string())?;
+    let mut password = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == 0 => break,
+            Ok(_) => {
+                password.push(byte[0]);
+                if password.len() > 4096 {
+                    return Err("askpass response too long".into());
+                }
+            }
+            Err(_) => return Err("askpass read failed".into()),
         }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("lw-a-{:x}-{stamp:x}", std::process::id()));
-        std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
-        let socket = directory.join("socket");
-        let listener = (|| -> std::io::Result<UnixListener> {
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-            UnixListener::bind(&socket)
-        })();
-        let listener = match listener {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = std::fs::remove_file(&socket);
-                let _ = std::fs::remove_dir(&directory);
-                return Err(error.to_string());
-            }
-        };
-        let task = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream.write_all(password.as_bytes()).await;
-            }
-        });
-        Ok(Self {
-            directory,
-            socket,
-            task,
-        })
     }
+    std::io::stdout()
+        .write_all(&password)
+        .map_err(|_| "askpass write failed".to_string())
 }
-impl Drop for Askpass {
-    fn drop(&mut self) {
-        self.task.abort();
-        let _ = std::fs::remove_file(&self.socket);
-        let _ = std::fs::remove_dir(&self.directory);
-    }
-}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SshAuthMode {
@@ -290,19 +283,21 @@ async fn open_host_client(
         };
         let identity = host.identity_file.as_deref().map(PathBuf::from);
         let askpass = std::env::current_exe().map_err(|e| e.to_string())?;
-        let challenge = secret
-            .as_ref()
-            .map(|value| Askpass::start(value.clone()))
-            .transpose()?;
+        let mut challenge = None;
         let auth = match host.auth {
             SshAuthMode::None => SshAuthentication::OpenSsh,
             SshAuthMode::IdentityFile => {
                 SshAuthentication::IdentityFile(identity.as_deref().ok_or("请选择身份文件")?)
             }
-            SshAuthMode::Password => SshAuthentication::Password {
-                askpass: &askpass,
-                socket: &challenge.as_ref().ok_or("请输入 SSH 密码")?.socket,
-            },
+            SshAuthMode::Password => {
+                challenge = Some(askpass::Askpass::start(
+                    secret.clone().ok_or("请输入 SSH 密码")?,
+                )?);
+                SshAuthentication::Password {
+                    askpass: &askpass,
+                    socket: challenge.as_ref().expect("askpass challenge").target(),
+                }
+            }
         };
         let result = Client::ssh_with_auth(
             ssh,
@@ -357,17 +352,32 @@ async fn reconnect_for_cleanup(
     .map_err(|_| format!("{host_id} 重连超时"))?
 }
 fn local_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let mut binary = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .with_file_name("latte-work-server");
-    if !binary.is_file() {
-        let resource = app.path().resource_dir().map_err(|e| e.to_string())?;
-        binary = resource.join("latte-work-server");
-    }
     if cfg!(debug_assertions)
         && let Ok(path) = std::env::var("LATTE_WORK_SERVER")
     {
-        binary = PathBuf::from(path);
+        return Ok(PathBuf::from(path));
+    }
+    let name = format!("latte-work-server{}", std::env::consts::EXE_SUFFIX);
+    let mut binary = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .with_file_name(&name);
+    if !binary.is_file() {
+        let resource = app.path().resource_dir().map_err(|e| e.to_string())?;
+        binary = resource.join(&name);
+    }
+    if !binary.is_file() && cfg!(debug_assertions) {
+        // `cargo run` does not run Tauri's sidecar copy; fall back to the
+        // prepared external-binaries directory so dev builds stay usable.
+        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join(format!(
+                "latte-work-server-{}{}",
+                env!("TAURI_ENV_TARGET_TRIPLE"),
+                std::env::consts::EXE_SUFFIX
+            ));
+        if bundled.is_file() {
+            binary = bundled;
+        }
     }
     Ok(binary)
 }
@@ -804,12 +814,13 @@ async fn choose_identity_file(app: tauri::AppHandle) -> Result<Option<String>, S
 }
 #[tauri::command]
 async fn reveal_project(
+    app: tauri::AppHandle,
     state: State<'_, Connections>,
     host_id: String,
     project_id: String,
 ) -> Result<(), String> {
     if host_id != "local" {
-        return Err("仅本机项目可在 Finder 中显示".into());
+        return Err("仅本机项目可在文件管理器中显示".into());
     }
     let client = state
         .clients
@@ -837,44 +848,27 @@ async fn reveal_project(
     if !path.is_dir() {
         return Err("项目目录不存在".into());
     }
-    if !cfg!(target_os = "macos") {
-        return Err("此平台暂不支持 Finder".into());
-    }
-    let status = tokio::process::Command::new("/usr/bin/open")
-        .arg("-R")
-        .arg(path)
-        .status()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("无法在 Finder 中显示项目".into());
-    }
-    Ok(())
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("无法在文件管理器中显示项目：{e}"))
+}
+#[tauri::command]
+fn desktop_platform() -> &'static str {
+    std::env::consts::OS
 }
 fn main() {
     if std::env::var("LATTE_WORK_SSH_ASKPASS").as_deref() == Ok("1") {
         let result = std::env::var_os("LATTE_WORK_SSH_ASKPASS_SOCKET")
-            .ok_or("missing askpass socket")
-            .and_then(|path| {
-                let stream = std::os::unix::net::UnixStream::connect(PathBuf::from(path))
-                    .map_err(|_| "askpass socket unavailable")?;
-                let mut password = Vec::new();
-                stream
-                    .take(4097)
-                    .read_to_end(&mut password)
-                    .map_err(|_| "askpass read failed")?;
-                if password.len() > 4096 {
-                    return Err("askpass response too long");
-                }
-                use std::io::Write;
-                std::io::stdout()
-                    .write_all(&password)
-                    .map_err(|_| "askpass write failed")
-            });
+            .ok_or_else(|| "missing askpass socket".to_string())
+            .and_then(|path| askpass_helper(PathBuf::from(path)));
+        if let Err(error) = &result {
+            eprintln!("latte-work-desktop askpass: {error}");
+        }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(Connections::default())
         .manage(browser::Tools::default())
         .manage(browser_downloads::Downloads::default())
@@ -968,7 +962,8 @@ fn main() {
             paste::finish_paste_upload,
             paste::import_clipboard_file,
             choose_identity_file,
-            reveal_project
+            reveal_project,
+            desktop_platform
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Latte Work desktop")
@@ -998,7 +993,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     #[test]
     fn native_provider_snapshots_cannot_reach_the_webview() {
@@ -1055,25 +1049,5 @@ mod tests {
         );
         assert_eq!(saved.for_target("user@new-host", Some(2222)), None);
         assert_eq!(saved.for_target("user@old-host", Some(22)), None);
-    }
-
-    #[tokio::test]
-    async fn askpass_uses_private_socket_and_removes_it_after_use() {
-        let challenge = Askpass::start("test-password".to_owned()).unwrap();
-        assert_eq!(
-            std::fs::metadata(&challenge.directory)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        let socket = challenge.socket.clone();
-        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        let mut secret = String::new();
-        stream.read_to_string(&mut secret).await.unwrap();
-        assert_eq!(secret, "test-password");
-        drop(challenge);
-        assert!(!socket.exists());
     }
 }

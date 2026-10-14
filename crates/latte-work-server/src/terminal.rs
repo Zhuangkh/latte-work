@@ -6,3 +6,4 @@ mod backend;
 #[path = "terminal/windows.rs"]
 mod backend;
 pub use backend::{SharedTerminals, Terminals, write};
+pub const SUPPORTED: bool = backend::SUPPORTED;

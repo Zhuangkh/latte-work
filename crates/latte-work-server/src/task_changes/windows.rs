@@ -4,6 +4,7 @@ use std::{
     fs::{File, Metadata},
     path::Path,
 };
+pub(super) const UNDO_SUPPORTED: bool = false;
 pub(super) fn identity(path: &Path) -> Result<Identity> {
     let (volume, file_id) = latte_work_platform::fs::directory_identity(path)?;
     Ok(Identity::Windows {

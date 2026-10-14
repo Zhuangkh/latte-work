@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 const MESSAGE: &str = "此 Windows Host 尚不支持 PTY 终端";
+pub const SUPPORTED: bool = false;
 #[derive(Default)]
 pub struct Terminals {
     _unsupported: (),

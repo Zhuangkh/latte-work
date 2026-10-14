@@ -54,15 +54,27 @@ fn validate_name(name: &str) -> io::Result<()> {
 }
 
 pub(crate) fn connect_once(name: &str) -> io::Result<Stream> {
-    validate_name(name)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .security_qos_flags(SECURITY_IDENTIFICATION)
-        .custom_flags(FILE_FLAG_OVERLAPPED)
-        .open(name)?;
+    let file = open_pipe_file(name, true)?;
     let handle: OwnedHandle = file.into();
     Stream::try_from(handle).map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// Open a local pipe without overlapped I/O for a synchronous helper process.
+pub(crate) fn connect_file_once(name: &str) -> io::Result<std::fs::File> {
+    open_pipe_file(name, false)
+}
+
+fn open_pipe_file(name: &str, overlapped: bool) -> io::Result<std::fs::File> {
+    validate_name(name)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .security_qos_flags(SECURITY_IDENTIFICATION);
+    if overlapped {
+        options.custom_flags(FILE_FLAG_OVERLAPPED);
+    }
+    options.open(name)
 }
 
 pub(crate) fn verify_peer(stream: &Stream) -> io::Result<u32> {

@@ -10,6 +10,7 @@ import {
 import { ArchivedChats } from "./ArchivedChats";
 import { AgentSettings } from "./AgentSettings";
 import { ProviderSettings } from "./ProviderSettings";
+import { WindowControls } from "./WindowControls";
 import { SSHSettings } from "./SSHSettings";
 import type { Workbench } from "./useWorkbench";
 
@@ -69,7 +70,9 @@ export function SettingsPage({
   }
   return (
     <div className="settings-page">
-      <div className="settings-window-drag" data-tauri-drag-region />
+      <div className="settings-window-drag" data-tauri-drag-region>
+        <WindowControls />
+      </div>
       <div className="settings-layout">
         <aside className="settings-navigation">
           <h1>设置</h1>

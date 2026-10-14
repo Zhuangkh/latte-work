@@ -7,3 +7,4 @@ trap 'rm -rf "$generated_dir"' EXIT
 node_modules/.bin/tauri icon "$icon_dir/source.svg" --output "$generated_dir"
 cp "$generated_dir/icon.png" "$icon_dir/icon.png"
 cp "$generated_dir/icon.icns" "$icon_dir/icon.icns"
+cp "$generated_dir/icon.ico" "$icon_dir/icon.ico"

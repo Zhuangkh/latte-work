@@ -282,6 +282,7 @@ mod tests {
     async fn unavailable(_: String) -> Result<latte_work_client::Client, String> {
         Err("未连接，无法确认会话或终端已关闭".into())
     }
+    #[cfg(unix)]
     fn bridge(break_ack: bool) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let stamp = std::time::SystemTime::now()
@@ -318,6 +319,7 @@ for line in sys.stdin:
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         (directory, binary)
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn lost_close_ack_reconnects_once_without_replaying_tasks_and_settles_terminals() {
         let (directory, binary) = bridge(true);
@@ -363,6 +365,7 @@ for line in sys.stdin:
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn missing_or_already_broken_bridge_can_be_replaced_during_quit() {
         for cached in [false, true] {
@@ -400,6 +403,7 @@ for line in sys.stdin:
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn unavailable_host_preserves_unknown_ownership_but_other_hosts_still_close() {
         let (directory, binary) = bridge(false);
@@ -445,6 +449,7 @@ for line in sys.stdin:
             .contains("只允许关闭")
         );
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn quit_closes_completed_agent_sessions_without_polling_away_ownership() {
         use std::os::unix::fs::PermissionsExt;

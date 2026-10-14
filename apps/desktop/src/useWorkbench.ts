@@ -1356,6 +1356,14 @@ export function useWorkbench() {
     hostId,
     setHostId,
     connected,
+    hostSupportsTerminal: (id: string) => {
+      const hello = hostHellos.current.get(id);
+      return !hello || hello.terminal !== false;
+    },
+    hostSupportsUndo: (id: string) => {
+      const hello = hostHellos.current.get(id);
+      return !hello || hello.undo !== false;
+    },
     connectionLost: connectedHosts.current.has(hostId),
     agentSessionTransitions,
     agentSessionState: (target: HostedSession) =>

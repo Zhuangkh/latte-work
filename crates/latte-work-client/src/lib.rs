@@ -57,6 +57,12 @@ impl Client {
             .context("SSH 连接失败；请确认主机指纹已在终端验证，并检查认证方式和远程 Server")
     }
     async fn spawn(mut command: Command) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            // The bridge is a console program. A GUI parent must not flash a
+            // console window for every local or SSH connection.
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -500,7 +506,7 @@ fn ssh_command(
             command.arg("-i").arg(path);
         }
         SshAuthentication::Password { askpass, socket } => {
-            if !askpass.is_absolute() || !socket.is_absolute() {
+            if !askpass.is_absolute() || !valid_askpass_target(socket) {
                 bail!("SSH 密码交互程序不可用");
             }
             command.args([
@@ -560,6 +566,27 @@ pub fn validate_identity_file(path: &Path) -> Result<()> {
         bail!("身份文件必须是本机现有文件的绝对路径");
     }
     Ok(())
+}
+/// The askpass target is either a Unix socket path or a local Windows pipe name.
+fn valid_askpass_target(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(value) = path.to_str() else {
+            return false;
+        };
+        let Some(name) = value.strip_prefix(r"\\.\pipe\latte-work-") else {
+            return false;
+        };
+        !name.is_empty()
+            && name.len() <= 160
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }
+    #[cfg(not(windows))]
+    {
+        path.is_absolute()
+    }
 }
 pub fn validate_host(host: &str) -> Result<()> {
     if host.is_empty()
@@ -690,13 +717,17 @@ for line in sys.stdin:
                 .any(|pair| pair == ["-i", key.to_str().unwrap()])
         );
         assert!(identity.contains(&"IdentitiesOnly=yes".to_owned()));
+        #[cfg(windows)]
+        let askpass_target = std::path::PathBuf::from(r"\\.\pipe\latte-work-askpass-test");
+        #[cfg(not(windows))]
+        let askpass_target = key.clone();
         let command = ssh_command(
             "devbox",
             "/server",
             None,
             SshAuthentication::Password {
                 askpass: &key,
-                socket: &key,
+                socket: &askpass_target,
             },
         )
         .unwrap();

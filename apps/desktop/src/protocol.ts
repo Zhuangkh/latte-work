@@ -602,6 +602,8 @@ export type Response =
       agents: Array<AgentInfo>;
       permission_settings: boolean;
       history_window: boolean;
+      terminal: boolean;
+      undo: boolean;
     }
   | { kind: "projects"; projects: Array<Project> }
   | { kind: "project"; project: Project }

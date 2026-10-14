@@ -1,6 +1,7 @@
 //! App-owned browser surfaces. Remote pages never receive main-WebView capabilities.
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, Webview, WebviewUrl, webview::WebviewBuilder};
+use tauri_plugin_opener::OpenerExt;
 
 fn caller(view: &Webview) -> Result<(), String> {
     if view.label() != "main" {
@@ -126,6 +127,29 @@ pub async fn browser_create(
         })
         .on_page_load(move |view, payload| {
             let finished = matches!(payload.event(), tauri::webview::PageLoadEvent::Finished);
+            if !finished {
+                let tools = view.app_handle().state::<Tools>();
+                let previous = tools
+                    .find_terms
+                    .lock()
+                    .ok()
+                    .and_then(|mut terms| terms.get_mut(&id).map(FindState::reset));
+                if let Some(previous) = previous {
+                    let reset_view = view.clone();
+                    let reset_id = id.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) =
+                            super::browser_native::stop_find(&reset_view, &previous).await
+                        {
+                            let _ = reset_view.app_handle().emit_to(
+                                "main",
+                                "browser-find-error",
+                                serde_json::json!({"id": reset_id, "error": error}),
+                            );
+                        }
+                    });
+                }
+            }
             let ignored = finished
                 && view
                     .app_handle()
@@ -277,6 +301,19 @@ pub async fn browser_action(
         .app_handle()
         .get_webview(&label(&id)?)
         .ok_or("浏览器标签已关闭")?;
+    if matches!(action.as_str(), "navigate" | "back" | "forward" | "reload") {
+        let previous = view
+            .app_handle()
+            .state::<Tools>()
+            .find_terms
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get_mut(&id)
+            .map(FindState::reset);
+        if let Some(previous) = previous {
+            super::browser_native::stop_find(&browser, &previous).await?;
+        }
+    }
     let result = match action.as_str() {
         "navigate" => browser.navigate(parse_url(
             url.as_deref().unwrap_or(""),
@@ -301,6 +338,33 @@ pub async fn browser_action(
 pub struct Tools {
     operation: tokio::sync::Mutex<()>,
     suppressed: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    find_terms: std::sync::Mutex<std::collections::HashMap<String, FindState>>,
+}
+#[derive(Clone, Default)]
+struct FindState {
+    query: Option<String>,
+    session: super::browser_native::FindSession,
+    revision: u64,
+}
+impl FindState {
+    fn begin(&mut self) -> u64 {
+        self.revision += 1;
+        self.revision
+    }
+
+    fn reset(&mut self) -> super::browser_native::FindSession {
+        self.revision += 1;
+        self.query = None;
+        self.session.cancel();
+        self.session.clone()
+    }
+
+    fn complete(&mut self, revision: u64, query: Option<String>) {
+        // Native cleanup owns cancellation. Completion only owns this cache revision.
+        if self.revision == revision {
+            self.query = query;
+        }
+    }
 }
 #[tauri::command]
 pub async fn browser_find(
@@ -314,15 +378,66 @@ pub async fn browser_find(
         return Err("查找内容过长".into());
     }
     let state = view.app_handle().state::<Tools>();
-    let _guard = state
-        .operation
-        .try_lock()
-        .map_err(|_| "浏览器操作进行中，请稍后再试")?;
     let browser = view
         .app_handle()
         .get_webview(&label(&id)?)
         .ok_or("浏览器标签已关闭")?;
-    let (result, _) = super::browser_native::run(&browser, "find", &query, backwards).await?;
+    // Reset must cancel an in-flight Start, even while the operation gate is held.
+    if query.is_empty() {
+        let previous = state
+            .find_terms
+            .lock()
+            .map_err(|e| e.to_string())?
+            .entry(id)
+            .or_default()
+            .reset();
+        super::browser_native::stop_find(&browser, &previous).await?;
+        return Ok(false);
+    }
+    let _guard = state
+        .operation
+        .try_lock()
+        .map_err(|_| "浏览器操作进行中，请稍后再试")?;
+    let (current, revision) = {
+        let mut terms = state.find_terms.lock().map_err(|e| e.to_string())?;
+        let entry = terms.entry(id.clone()).or_default();
+        let revision = entry.begin();
+        (entry.clone(), revision)
+    };
+    let restart = current.query.as_deref() != Some(query.as_str());
+    let outcome = super::browser_native::run(
+        &browser,
+        "find",
+        &query,
+        backwards,
+        restart,
+        &current.session,
+    )
+    .await;
+    let (result, _) = match outcome {
+        Ok(result) => {
+            if let Some(entry) = state
+                .find_terms
+                .lock()
+                .map_err(|e| e.to_string())?
+                .get_mut(&id)
+            {
+                entry.complete(revision, Some(query));
+            }
+            result
+        }
+        Err(error) => {
+            if let Some(entry) = state
+                .find_terms
+                .lock()
+                .map_err(|e| e.to_string())?
+                .get_mut(&id)
+            {
+                entry.complete(revision, None);
+            }
+            return Err(error);
+        }
+    };
     Ok(result
         .get("found")
         .and_then(serde_json::Value::as_bool)
@@ -350,7 +465,9 @@ pub async fn browser_capture(view: Webview, id: String) -> Result<Option<String>
         .app_handle()
         .get_webview(&label(&id)?)
         .ok_or("浏览器标签已关闭")?;
-    let (_, bytes) = super::browser_native::run(&browser, "capture", "", false).await?;
+    let (_, bytes) =
+        super::browser_native::run(&browser, "capture", "", false, true, &Default::default())
+            .await?;
     let bytes = bytes.ok_or("网页截图失败")?;
     if let Some(path) =
         super::browser_downloads::choose_save(view.app_handle(), "网页截图.png", Some("png"))
@@ -374,7 +491,12 @@ pub async fn browser_clear_data(view: Webview, id: String) -> Result<(), String>
         .app_handle()
         .get_webview(&label(&id)?)
         .ok_or("浏览器标签已关闭")?;
-    super::browser_native::run(&browser, "clear", "", false).await?;
+    #[cfg(target_os = "macos")]
+    super::browser_native::run(&browser, "clear", "", false, true, &Default::default()).await?;
+    #[cfg(not(target_os = "macos"))]
+    browser
+        .clear_all_browsing_data()
+        .map_err(|e| e.to_string())?;
     for (name, browser) in view.app_handle().webviews() {
         if name.starts_with("browser-") {
             state
@@ -397,6 +519,16 @@ pub async fn browser_close(view: Webview, id: String) -> Result<(), String> {
         .lock()
         .map_err(|e| e.to_string())?
         .remove(&name);
+    if let Some(previous) = view
+        .app_handle()
+        .state::<Tools>()
+        .find_terms
+        .lock()
+        .map_err(|e| e.to_string())?
+        .remove(&id)
+    {
+        previous.session.cancel();
+    }
     if let Some(browser) = view.app_handle().get_webview(&name) {
         browser.close().map_err(|e| e.to_string())?;
     }
@@ -406,26 +538,74 @@ pub async fn browser_close(view: Webview, id: String) -> Result<(), String> {
 pub async fn open_external_url(view: Webview, url: String) -> Result<(), String> {
     caller(&view)?;
     let url = parse_url(&url, view.app_handle().config().build.dev_url.as_ref())?;
-    #[cfg(target_os = "macos")]
-    let mut command = tokio::process::Command::new("open");
-    #[cfg(not(target_os = "macos"))]
-    let mut command = tokio::process::Command::new("xdg-open");
-    let status = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        command.arg(url.as_str()).kill_on_drop(true).status(),
-    )
-    .await
-    .map_err(|_| "打开系统浏览器超时")?
-    .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("无法打开系统默认浏览器".into())
-    }
+    view.app_handle()
+        .opener()
+        .open_url(url.as_str(), None::<&str>)
+        .map_err(|e| format!("无法打开系统默认浏览器：{e}"))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn current_find_failure_clears_query_without_cancelling_native_cleanup() {
+        let mut state = FindState {
+            query: Some("needle".into()),
+            ..FindState::default()
+        };
+        let revision = state.begin();
+        state.session.begin();
+        // Native timeout cleanup owns this token while the command returns Err.
+        let cleanup = state.session.begin();
+        state.complete(revision, None);
+        assert!(state.query.is_none());
+        assert!(cleanup.check().is_ok());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn old_find_failure_keeps_its_pending_stop_current() {
+        let mut state = FindState::default();
+        let revision = state.begin();
+        let old_start = state.session.begin();
+        let reset = state.reset();
+        let queued_stop = reset.begin();
+        assert!(old_start.check().is_err());
+        state.complete(revision, None);
+        // This is the production predicate used before native Stop is called.
+        assert!(queued_stop.check().is_ok());
+        assert!(state.query.is_none());
+    }
+    #[test]
+    fn old_find_completion_preserves_replacement_query() {
+        let mut state = FindState::default();
+        let old_revision = state.begin();
+        state.reset();
+        let replacement = state.begin();
+        state.complete(replacement, Some("replacement".into()));
+        state.complete(old_revision, Some("old query".into()));
+        assert_eq!(state.query.as_deref(), Some("replacement"));
+        state.complete(old_revision, None);
+        assert_eq!(state.query.as_deref(), Some("replacement"));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn find_reset_clears_query_and_retains_shared_cancellation_generation() {
+        let mut state = FindState {
+            query: Some("needle".into()),
+            ..FindState::default()
+        };
+        let old_request = state.session.begin();
+        let reset_session = state.reset();
+        assert!(state.query.is_none());
+        assert_eq!(
+            old_request.check().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        let reset_request = reset_session.begin();
+        let replacement = state.session.begin();
+        assert!(reset_request.check().is_err());
+        assert!(replacement.check().is_ok());
+    }
     #[test]
     fn only_web_urls_without_app_access_or_credentials_are_allowed() {
         let dev = tauri::Url::parse("http://127.0.0.1:1420").unwrap();
