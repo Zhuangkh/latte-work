@@ -177,6 +177,7 @@ impl Store {
         if !path.is_absolute() {
             bail!("项目路径必须是绝对路径");
         }
+        latte_work_platform::paths::absolute(path)?;
         let canonical = path.canonicalize().context("项目目录不存在或无法访问")?;
         if !canonical.is_dir() {
             bail!("请选择目录");
@@ -195,8 +196,9 @@ impl Store {
                 canonical
                     .file_name()
                     .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
+                    .to_str()
+                    .expect("canonical path checked as UTF-8")
+                    .to_owned()
             }),
             path,
         };

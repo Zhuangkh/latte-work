@@ -1,6 +1,7 @@
 //! Host-owned provider configuration, independent of agent-native launch protocols.
 use anyhow::{Context, Result, bail};
 use latte_work_config::validate_provider as validate;
+use latte_work_platform::fs::PrivateDir;
 use latte_work_protocol::{
     AgentProviderBinding, Provider, ProviderDraft, ProviderSnapshot, Response, TurnProvider,
 };
@@ -8,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::{
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -85,18 +85,20 @@ impl LaunchConfig {
     }
 }
 pub struct ProviderStore {
+    directory: PrivateDir,
     path: PathBuf,
     config: Config,
 }
 impl ProviderStore {
     pub fn open(directory: &Path) -> Result<Self> {
-        let path = directory.join("providers.json");
+        let directory = PrivateDir::prepare(&crate::host_paths::provider_directory(directory)?)?;
+        let path = directory.path().join("providers.json");
         let mut config = if path.exists() {
             let metadata = path.symlink_metadata()?;
             if !metadata.is_file() || metadata.len() > MAX_CONFIG as u64 {
                 bail!("Provider 配置文件无效");
             }
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            directory.protect_file("providers.json")?;
             serde_json::from_slice::<Config>(&std::fs::read(&path)?)
                 .map_err(|_| anyhow::anyhow!("Provider 配置文件格式无效"))?
         } else {
@@ -119,7 +121,11 @@ impl ProviderStore {
             }
         }
         validate_config(&config)?;
-        Ok(Self { path, config })
+        Ok(Self {
+            directory,
+            path,
+            config,
+        })
     }
     pub fn list(&self) -> Response {
         self.list_bindings(&self.config.bindings)
@@ -213,10 +219,7 @@ impl ProviderStore {
         if bytes.len() > MAX_CONFIG {
             bail!("Provider 配置超出大小限制");
         }
-        let mut file =
-            tempfile::NamedTempFile::new_in(self.path.parent().context("Provider 配置路径无效")?)?;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mut file = self.directory.tempfile("providers-", ".json")?;
         file.write_all(&bytes)?;
         file.as_file().sync_all()?;
         file.persist(&self.path)
@@ -492,11 +495,7 @@ impl ProviderStore {
             effort: None,
             permission_mode: None,
             model: None,
-            settings_dir: self
-                .path
-                .parent()
-                .expect("provider file has a parent")
-                .to_owned(),
+            settings_dir: self.directory.path().to_owned(),
             provider: self
                 .config
                 .bindings
@@ -699,7 +698,7 @@ mod tests {
         let mut store = ProviderStore::open(dir.path()).unwrap();
         let id = saved(&mut store, draft(ProviderProtocol::AnthropicMessages));
         store.bind("claude", Some(id.clone())).unwrap();
-        let before = std::fs::read(dir.path().join("providers.json")).unwrap();
+        let before = std::fs::read(&store.path).unwrap();
         assert!(
             store
                 .turn_config("claude", None, Some(TurnProvider::Cli))
@@ -748,10 +747,7 @@ mod tests {
             fingerprint,
             turn_fingerprint(Some(&TurnProvider::Snapshot(rotated))).unwrap()
         );
-        assert_eq!(
-            std::fs::read(dir.path().join("providers.json")).unwrap(),
-            before
-        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), before);
     }
     #[test]
     fn catalog_binding_sync_and_revision_are_independent() {
@@ -809,14 +805,8 @@ mod tests {
                 .unwrap()
                 .contains("fixture-private-key")
         );
-        assert_eq!(
-            std::fs::metadata(b.path().join("providers.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        latte_work_platform::fs::verify_private_file(&std::fs::File::open(&remote.path).unwrap())
+            .unwrap();
         let mut reopened = ProviderStore::open(b.path()).unwrap();
         assert_eq!(
             reopened
@@ -857,11 +847,7 @@ mod tests {
         value["schema"] = serde_json::json!(1);
         value["active_id"] = serde_json::json!(id);
         value.as_object_mut().unwrap().remove("bindings");
-        std::fs::write(
-            dir.path().join("providers.json"),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&store.path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(
             ProviderStore::open(dir.path())
                 .unwrap()

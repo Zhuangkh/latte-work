@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 [dependencies]
+latte-work-platform.workspace = true
 latte-work-protocol.workspace = true
 anyhow.workspace = true
 serde.workspace = true

@@ -14,6 +14,7 @@ pub async fn reference(root: &Path, path: &str) -> Result<FileEntry> {
     if path.len() > 4096 || path.contains('\0') || !Path::new(path).is_absolute() {
         bail!("请输入不超过 4096 字节的绝对路径");
     }
+    latte_work_platform::paths::absolute(Path::new(path))?;
     tokio::time::timeout(Duration::from_secs(5), async {
         let target = tokio::fs::canonicalize(path)
             .await
@@ -23,19 +24,18 @@ pub async fn reference(root: &Path, path: &str) -> Result<FileEntry> {
             bail!("只能引用普通文件或目录");
         }
         let root = tokio::fs::canonicalize(root).await?;
-        let reference = target.strip_prefix(&root).unwrap_or(&target);
-        let path = reference.to_str().context("路径不是 UTF-8")?;
+        let path = if let Ok(relative) = target.strip_prefix(&root) {
+            latte_work_platform::paths::relative_text(relative)?
+        } else {
+            target.to_str().context("路径不是 UTF-8")?.to_owned()
+        };
         Ok(FileEntry {
             name: target
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("/")
                 .into(),
-            path: if path.is_empty() {
-                ".".into()
-            } else {
-                path.into()
-            },
+            path: if path.is_empty() { ".".into() } else { path },
             directory: metadata.is_dir(),
         })
     })
@@ -47,16 +47,18 @@ pub async fn reference(root: &Path, path: &str) -> Result<FileEntry> {
 pub fn browse_directories(path: Option<&str>) -> Result<latte_work_protocol::Response> {
     let folder = match path {
         Some(path) => std::path::PathBuf::from(path),
-        None => std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .context("无法确定主目录，请输入绝对路径")?,
+        None => latte_work_platform::dirs::home_dir().context("无法确定主目录，请输入绝对路径")?,
     };
     if !folder.is_absolute() {
         bail!("目录必须是绝对路径");
     }
+    latte_work_platform::paths::absolute(&folder)?;
     let folder = folder.canonicalize().context("目录不存在或无法访问")?;
     let path = folder.to_str().context("目录路径不是 UTF-8")?.to_owned();
-    let parent = folder.parent().map(|p| p.to_string_lossy().into_owned());
+    let parent = folder
+        .parent()
+        .map(|p| p.to_str().map(str::to_owned).context("目录路径不是 UTF-8"))
+        .transpose()?;
     let mut entries = Vec::new();
     let mut bytes = 0;
     let mut truncated = false;
@@ -95,6 +97,7 @@ pub fn browse_directories(path: Option<&str>) -> Result<latte_work_protocol::Res
 }
 pub fn resolve(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
     let path = Path::new(relative);
+    latte_work_platform::paths::relative(path)?;
     if path.is_absolute()
         || path
             .components()
@@ -103,6 +106,7 @@ pub fn resolve(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
         bail!("路径必须位于项目目录内");
     }
     let root = root.canonicalize()?;
+    latte_work_platform::paths::check_project_links(&root, path)?;
     let target = root.join(path).canonicalize()?;
     if !target.starts_with(&root) {
         bail!("拒绝访问指向项目外部的路径");
@@ -114,18 +118,18 @@ pub fn list(root: &Path, path: &str) -> Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
     for entry in folder.read_dir()?.take(1001) {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = entry
+            .file_name()
+            .to_str()
+            .context("文件名不是 UTF-8")?
+            .to_owned();
         if matches!(
             name.as_str(),
             ".git" | "node_modules" | "target" | ".DS_Store"
         ) {
             continue;
         }
-        let relative = if path.is_empty() {
-            name.clone()
-        } else {
-            format!("{path}/{name}")
-        };
+        let relative = latte_work_platform::paths::relative_text(&Path::new(path).join(&name))?;
         let Ok(target) = resolve(root, &relative) else {
             continue;
         };
@@ -332,11 +336,55 @@ pub(crate) async fn git(root: &Path, args: &[&str]) -> Result<(String, bool)> {
         bail!("无法读取 Git 状态，请确认项目是 Git 仓库");
     }
     bytes.truncate(LIMIT);
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+    if truncated
+        && let Err(error) = std::str::from_utf8(&bytes)
+        && error.error_len().is_none()
+    {
+        bytes.truncate(error.valid_up_to());
+    }
+    let text = if args
+        .iter()
+        .any(|arg| matches!(*arg, "-z" | "--show-prefix" | "--show-toplevel"))
+    {
+        String::from_utf8(bytes).context("Git 文件路径不是 UTF-8")?
+    } else {
+        // Diff contents are display-only; metadata used as paths must remain exact.
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok((text, truncated))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn native_references_use_protocol_relative_separators() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("子目录")).unwrap();
+        let file = root.path().join("子目录").join("file.txt");
+        std::fs::write(&file, "text").unwrap();
+        let entry = reference(root.path(), file.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry.path, "子目录/file.txt");
+        assert_eq!(read(root.path(), &entry.path).await.unwrap().0, "text");
+        assert_eq!(
+            list(root.path(), "子目录").unwrap()[0].path,
+            "子目录/file.txt"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_backslash_names_remain_literal() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a\\b.txt");
+        std::fs::write(&file, "literal").unwrap();
+        let entry = reference(root.path(), file.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry.path, "a\\b.txt");
+        assert_eq!(read(root.path(), &entry.path).await.unwrap().0, "literal");
+    }
+    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_references_resolve_without_expanding_project_access() {
         let root = tempfile::tempdir().unwrap();
@@ -418,6 +466,7 @@ mod tests {
         std::fs::write(&file, "not a folder").unwrap();
         assert!(browse_directories(file.to_str()).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn traversal_and_symlink_escape_are_denied() {
         let root = tempfile::tempdir().unwrap();
@@ -429,6 +478,7 @@ mod tests {
         std::fs::write(root.path().join("ok"), "text").unwrap();
         assert!(resolve(root.path(), "ok").is_ok());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn changes_are_project_scoped_and_preserve_unusual_paths() {
         let root = tempfile::tempdir().unwrap();

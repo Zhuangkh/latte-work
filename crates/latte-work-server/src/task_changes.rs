@@ -4,7 +4,24 @@ use crate::{files, store::now};
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{ChangeSummary, TaskChange};
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
+#[path = "task_changes/unix.rs"]
+mod backend;
+#[cfg(windows)]
+#[path = "task_changes/windows.rs"]
+mod backend;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Identity {
+    Unix((u64, u64)),
+    Windows { windows_v1: WindowsIdentity },
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowsIdentity {
+    volume: u64,
+    file_id: [u8; 16],
+}
 use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
 const FILE_LIMIT: usize = 512 * 1024;
@@ -14,7 +31,7 @@ const COUNT_LIMIT: usize = 1000;
 const INVENTORY_LIMIT: usize = 5000;
 fn no_symlink_ancestors(root: &Path, relative: &Path) -> Result<()> {
     let mut path = root.to_path_buf();
-    if path.symlink_metadata()?.file_type().is_symlink() {
+    if latte_work_platform::fs::is_link(&path.symlink_metadata()?) {
         bail!("拒绝采集符号链接目录");
     }
     for component in relative.components() {
@@ -22,7 +39,7 @@ fn no_symlink_ancestors(root: &Path, relative: &Path) -> Result<()> {
             bail!("路径必须位于项目目录内");
         }
         path.push(component);
-        if path.symlink_metadata()?.file_type().is_symlink() {
+        if latte_work_platform::fs::is_link(&path.symlink_metadata()?) {
             bail!("拒绝采集符号链接路径");
         }
     }
@@ -160,7 +177,7 @@ async fn inventory(root: &Path) -> Result<(Vec<String>, bool)> {
 pub struct Snapshot {
     pub at: f64,
     #[serde(default)]
-    root_identity: Option<(u64, u64)>,
+    root_identity: Option<Identity>,
     files: BTreeMap<String, Option<Vec<u8>>>,
     #[serde(default)]
     modes: BTreeMap<String, u32>,
@@ -183,10 +200,9 @@ impl Snapshot {
             // Git keeps its tracked/ignored-file semantics. Ordinary directories
             // use a bounded, symlink-free inventory with the same byte limits.
             let (paths, inventory_truncated) = inventory(root).await?;
-            let root_metadata = std::fs::metadata(root)?;
             let mut snapshot = Self {
                 at: now(),
-                root_identity: Some((root_metadata.dev(), root_metadata.ino())),
+                root_identity: Some(backend::identity(root)?),
                 files: BTreeMap::new(),
                 modes: BTreeMap::new(),
                 truncated: inventory_truncated,
@@ -202,6 +218,7 @@ impl Snapshot {
                 if snapshot.files.contains_key(path) {
                     continue;
                 }
+                validate_path(path)?;
                 let target = root.join(path);
                 let metadata = match target.symlink_metadata() {
                     Ok(metadata) => metadata,
@@ -211,7 +228,7 @@ impl Snapshot {
                     }
                     Err(error) => return Err(error.into()),
                 };
-                if metadata.file_type().is_symlink() {
+                if latte_work_platform::fs::is_link(&metadata) {
                     snapshot.truncated = true;
                     continue;
                 }
@@ -242,11 +259,12 @@ impl Snapshot {
                     snapshot.truncated = true;
                     continue;
                 }
-                snapshot.modes.insert(path.into(), metadata.mode());
+                if let Some(mode) = backend::mode(&metadata) {
+                    snapshot.modes.insert(path.into(), mode);
+                }
                 snapshot.files.insert(path.into(), Some(bytes));
             }
-            let root_metadata = std::fs::metadata(root)?;
-            if snapshot.root_identity != Some((root_metadata.dev(), root_metadata.ino())) {
+            if snapshot.root_identity != Some(backend::identity(root)?) {
                 bail!("项目目录在采集时已改变，请核对工作区");
             }
             Ok(snapshot)
@@ -415,14 +433,55 @@ impl Snapshot {
         };
         let (patch, truncated) = no_index(old_path, new_path, false).await?;
         Ok((
-            patch
-                .replace(&before.to_string_lossy().to_string(), &format!("/{path}"))
-                .replace(&after.to_string_lossy().to_string(), &format!("/{path}")),
+            patch_labels(&patch, path, old.is_some(), new.is_some()),
             truncated,
         ))
     }
 }
+fn patch_labels(patch: &str, path: &str, old: bool, new: bool) -> String {
+    fn label(prefix: &str, path: &str) -> String {
+        let value = format!("{prefix}/{path}");
+        if value
+            .bytes()
+            .any(|b| !b.is_ascii_graphic() || matches!(b, b'"' | b'\\'))
+        {
+            crate::git_review::quote_path(&value)
+        } else {
+            value
+        }
+    }
+    let a = label("a", path);
+    let b = label("b", path);
+    let old_label = if old { a.as_str() } else { "/dev/null" };
+    let new_label = if new { b.as_str() } else { "/dev/null" };
+    let mut in_hunk = false;
+    patch
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.starts_with("@@") {
+                in_hunk = true;
+            }
+            if !in_hunk {
+                if line.starts_with("diff --git ") {
+                    return format!("diff --git {a} {b}\n");
+                }
+                if line.starts_with("--- ") {
+                    return format!("--- {old_label}\n");
+                }
+                if line.starts_with("+++ ") {
+                    return format!("+++ {new_label}\n");
+                }
+                if line.starts_with("Binary files ") {
+                    return format!("Binary files {old_label} and {new_label} differ\n");
+                }
+            }
+            line.to_owned()
+        })
+        .collect()
+}
+
 fn validate_path(path: &str) -> Result<()> {
+    latte_work_platform::paths::relative(Path::new(path))?;
     if path.is_empty()
         || Path::new(path).is_absolute()
         || Path::new(path)
@@ -472,6 +531,7 @@ impl FrozenTurn {
         })
     }
     pub fn validate_undo(&self, root: &Path) -> Result<()> {
+        backend::require_undo()?;
         if self.changes.undo != latte_work_protocol::TurnUndoStatus::Ready
             || self.changes.summary.truncated
             || self.changes.summary.unavailable.is_some()
@@ -480,9 +540,8 @@ impl FrozenTurn {
         {
             bail!("此轮变更无法安全撤销，请查看工作区并手动核对");
         }
-        let metadata = std::fs::metadata(root)?;
-        if root.symlink_metadata()?.file_type().is_symlink()
-            || self.before.root_identity != Some((metadata.dev(), metadata.ino()))
+        if latte_work_platform::fs::is_link(&root.symlink_metadata()?)
+            || self.before.root_identity != Some(backend::identity(root)?)
             || self.after.root_identity != self.before.root_identity
         {
             bail!("项目目录已改变，无法安全撤销");
@@ -504,9 +563,8 @@ impl FrozenTurn {
     }
     fn verify_current(&self, root: &Path, path: &str) -> Result<()> {
         use std::io::Read;
-        let metadata = std::fs::metadata(root)?;
-        if self.before.root_identity != Some((metadata.dev(), metadata.ino()))
-            || root.symlink_metadata()?.file_type().is_symlink()
+        if self.before.root_identity != Some(backend::identity(root)?)
+            || latte_work_platform::fs::is_link(&root.symlink_metadata()?)
         {
             bail!("项目目录已改变，无法安全撤销");
         }
@@ -519,7 +577,7 @@ impl FrozenTurn {
             }
             target.push(component);
             match target.symlink_metadata() {
-                Ok(meta) if meta.file_type().is_symlink() => {
+                Ok(meta) if latte_work_platform::fs::is_link(&meta) => {
                     bail!("文件路径已变为符号链接：{path}")
                 }
                 Ok(meta) if components.peek().is_some() && !meta.is_dir() => {
@@ -545,7 +603,7 @@ impl FrozenTurn {
                         .after
                         .modes
                         .get(path)
-                        .is_none_or(|mode| *mode != meta.mode())
+                        .is_none_or(|mode| Some(*mode) != backend::mode(&meta))
                 {
                     bail!("文件在本轮结束后已改变，未撤销：{path}");
                 }
@@ -555,6 +613,7 @@ impl FrozenTurn {
         Ok(())
     }
     pub fn restore(&self, root: &Path) -> Result<()> {
+        backend::require_undo()?;
         use std::io::Write;
         // Called only after durable Unknown intent, with host admission paused and
         // overlapping idle native processes closed. External edits are checked again.
@@ -570,9 +629,7 @@ impl FrozenTurn {
                 let mut temporary =
                     tempfile::NamedTempFile::new_in(target.parent().context("文件目录缺失")?)?;
                 temporary.write_all(bytes)?;
-                temporary
-                    .as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(*mode & 0o777))?;
+                backend::restore_mode(temporary.as_file(), *mode)?;
                 temporary.as_file().sync_all()?;
                 self.verify_current(root, &entry.path)?;
                 if self
@@ -619,12 +676,13 @@ async fn no_index(before: &Path, after: &Path, stats: bool) -> Result<(String, b
     if stats {
         command.args(["--numstat", "-z"]);
     }
+    let empty_config = tempfile::NamedTempFile::new()?;
     let mut child = command
         .arg("--")
         .arg(before)
         .arg(after)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", empty_config.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -757,6 +815,76 @@ pub async fn workspace_summary(root: &Path) -> Result<ChangeSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_identity_preserves_legacy_unix_and_full_windows_ids() {
+        let legacy = serde_json::json!({"at":0.0,"root_identity":[1,2],"files":{},"modes":{},"truncated":false,"unavailable":null});
+        let snapshot: Snapshot = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), legacy);
+        let native = serde_json::json!({"at":0.0,"root_identity":{"windows_v1":{"volume":7,"file_id":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,255]}},"files":{},"modes":{},"truncated":false,"unavailable":null});
+        let snapshot: Snapshot = serde_json::from_value(native.clone()).unwrap();
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), native);
+    }
+
+    #[test]
+    fn patch_header_rewrite_preserves_content_and_quotes_unusual_paths() {
+        let patch = "diff --git a/C:/tmp/before b/C:/tmp/after\n--- a/C:/tmp/before\n+++ b/C:/tmp/after\n@@ -1 +1 @@\n--- content\n+++ content\n";
+        let rewritten = patch_labels(patch, "a\nb.txt", true, true);
+        assert!(rewritten.contains("--- \"a/a\\012b.txt\"\n"));
+        assert!(rewritten.ends_with("@@ -1 +1 @@\n--- content\n+++ content\n"));
+        assert!(!rewritten.contains("C:/tmp"));
+    }
+
+    #[tokio::test]
+    async fn added_and_deleted_file_previews_use_git_null_path_on_each_host() {
+        let dir = tempfile::tempdir().unwrap();
+        repository(dir.path());
+        let before = Snapshot::capture(dir.path()).await.unwrap();
+        std::fs::remove_file(dir.path().join("delete.txt")).unwrap();
+        std::fs::write(dir.path().join("new.txt"), "new content\n").unwrap();
+        let after = Snapshot::capture(dir.path()).await.unwrap();
+        assert!(
+            before
+                .patch_between(&after, "delete.txt")
+                .await
+                .unwrap()
+                .0
+                .contains("+++ /dev/null")
+        );
+        assert!(
+            before
+                .patch_between(&after, "new.txt")
+                .await
+                .unwrap()
+                .0
+                .contains("--- /dev/null")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_undo_is_refused_before_any_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        repository(dir.path());
+        let before = Snapshot::capture(dir.path()).await.unwrap();
+        std::fs::write(dir.path().join("dirty.txt"), "changed\n").unwrap();
+        let after = Snapshot::capture(dir.path()).await.unwrap();
+        let frozen = FrozenTurn::freeze("r".into(), before, after, false, false)
+            .await
+            .unwrap();
+        assert!(
+            frozen
+                .validate_undo(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("Windows")
+        );
+        assert!(frozen.restore(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dirty.txt")).unwrap(),
+            "changed\n"
+        );
+    }
+
     fn git(root: &Path, args: &[&str]) {
         assert!(
             std::process::Command::new("git")
@@ -770,6 +898,7 @@ mod tests {
     }
     fn repository(root: &Path) {
         git(root, &["init", "-q"]);
+        git(root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("dirty.txt"), "original\n").unwrap();
         std::fs::write(root.join("delete.txt"), "gone\n").unwrap();
         std::fs::write(root.join("binary.dat"), [0, 1, 2]).unwrap();
@@ -931,7 +1060,10 @@ mod tests {
             patch.contains("-existing dirty") && patch.contains("+task edit"),
             "{patch}"
         );
-        assert!(patch.contains("--- a/dirty.txt") && patch.contains("+++ b/dirty.txt"));
+        assert!(
+            patch.contains("--- a/dirty.txt") && patch.contains("+++ b/dirty.txt"),
+            "{patch}"
+        );
         assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
         assert!(baseline.patch(root, "../private").await.is_err());
         assert!(baseline.patch(root, "existing.txt").await.is_err());
@@ -965,6 +1097,7 @@ mod tests {
                 .is_err()
         );
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn frozen_turns_survive_later_edits_and_restore_only_the_latest_exact_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1033,6 +1166,7 @@ mod tests {
         assert!(two.validate_undo(root).is_err());
         assert_eq!(one.patch("dirty.txt").await.unwrap(), patch_one);
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn undo_refuses_symlink_ancestors_and_partial_snapshots() {
         let dir = tempfile::tempdir().unwrap();
@@ -1064,6 +1198,7 @@ mod tests {
         turn.changes.background_pending = true;
         assert!(turn.validate_undo(root).is_err());
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn undo_refuses_replaced_project_roots_even_with_matching_file_bytes() {
         let dir = tempfile::tempdir().unwrap();

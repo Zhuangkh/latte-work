@@ -24,12 +24,12 @@ fmt-check: ## Check Rust and frontend formatting
 	cargo fmt --all -- --check
 	npm run format:check
 lint: prepare ## Check all Rust crates, denying warnings
-	cargo clippy --workspace --all-targets --locked -- -D warnings
+	cargo clippy --workspace --all-targets --features latte-work-server/test-fixture --locked -- -D warnings
 test-unit: ## Rust crate-local unit tests and frontend reducers
 	cargo test --workspace --exclude latte-work-desktop --lib --bins --locked
 	npm test
-test-e2e: ## Final server binary, socket bridge, and deterministic Claude fixture
-	cargo test -p latte-work-server --test e2e --locked -- --test-threads=1
+test-e2e: ## Final server binary, IPC bridge, and deterministic native/Unix fixtures
+	cargo test -p latte-work-server --features test-fixture --test e2e --test native --test native_upgrade --test stdio_bridge --locked -- --test-threads=1
 test-doc: ## Rust documentation tests
 	cargo test --workspace --exclude latte-work-desktop --doc --locked
 test-native: ## macOS WebKit site-data boundaries and localhost favicon transport

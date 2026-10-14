@@ -1,0 +1,23 @@
+[package]
+name = "latte-work-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirs = "6"
+tempfile = "3"
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["user", "signal", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+latte-work-windows-security.workspace = true
+interprocess = { version = "=2.4.5", features = ["tokio"] }
+sha2 = "0.10"
+widestring = "1"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[lints]
+workspace = true

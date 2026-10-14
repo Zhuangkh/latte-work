@@ -46,6 +46,7 @@ fn valid_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn valid_path(path: &str) -> Result<()> {
+    latte_work_platform::paths::relative(Path::new(path))?;
     if path.is_empty()
         || path.len() > 4096
         || path.contains('\0')
@@ -275,7 +276,7 @@ async fn listing(root: &Path, args: &[String]) -> Result<(Vec<GitReviewFile>, bo
 async fn untracked_content(root: &Path, path: &str) -> Result<(Vec<u8>, bool)> {
     valid_path(path)?;
     let metadata = tokio::fs::symlink_metadata(root.join(path)).await?;
-    if metadata.file_type().is_symlink() {
+    if latte_work_platform::fs::is_link(&metadata) {
         bail!("未跟踪符号链接不支持内容预览");
     }
     let target = files::resolve(root, path)?;
@@ -447,7 +448,7 @@ pub async fn review(
     .await
     .context("读取变更超时，请缩小项目范围")?
 }
-fn quote_path(path: &str) -> String {
+pub(crate) fn quote_path(path: &str) -> String {
     let mut quoted = String::from("\"");
     for byte in path.bytes() {
         match byte {
@@ -781,6 +782,7 @@ mod tests {
         assert!(patch.contains("rename from old.txt"));
         run(root.path(), &["checkout", "-q", "feature"]);
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn index_worktree_binary_untracked_and_literal_paths_are_distinct() {
         let root = fixture();
@@ -914,6 +916,7 @@ mod tests {
         assert_eq!(snapshot.entries.len(), FILE_LIMIT);
         assert!(snapshot.truncated);
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn untracked_patches_quote_paths_preserve_eof_and_reject_internal_symlinks() {
         let root = fixture();

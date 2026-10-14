@@ -12,7 +12,11 @@ const FAMILIES: &[&str] = &["SONNET", "OPUS", "HAIKU", "FABLE"];
 pub fn labels(project: Option<&Path>) -> BTreeMap<String, String> {
     let directory = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")));
+        .or_else(|| {
+            latte_work_platform::dirs::home_dir()
+                .ok()
+                .map(|h| h.join(".claude"))
+        });
     let mut files = Vec::new();
     if let Some(directory) = directory {
         files.push(directory.join("settings.json"));

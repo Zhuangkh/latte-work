@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/latte-work-protocol", "crates/latte-work-client", "crates/latte-work-config", "crates/latte-work-server", "apps/desktop/src-tauri"]
-default-members = ["crates/latte-work-protocol", "crates/latte-work-client", "crates/latte-work-config", "crates/latte-work-server"]
+members = ["crates/latte-work-platform", "crates/latte-work-windows-security", "crates/latte-work-protocol", "crates/latte-work-client", "crates/latte-work-config", "crates/latte-work-server", "apps/desktop/src-tauri"]
+default-members = ["crates/latte-work-platform", "crates/latte-work-windows-security", "crates/latte-work-protocol", "crates/latte-work-client", "crates/latte-work-config", "crates/latte-work-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,8 @@ edition = "2024"
 rust-version = "1.97"
 
 [workspace.dependencies]
+latte-work-platform = { path = "crates/latte-work-platform" }
+latte-work-windows-security = { path = "crates/latte-work-windows-security" }
 latte-work-config = { path = "crates/latte-work-config" }
 latte-work-protocol = { path = "crates/latte-work-protocol" }
 latte-work-client = { path = "crates/latte-work-client" }

@@ -1,9 +1,11 @@
 [package]
 name = "latte-work-server"
+default-run = "latte-work-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 [dependencies]
+latte-work-platform.workspace = true
 latte-work-config.workspace = true
 latte-work-protocol.workspace = true
 serde.workspace = true
@@ -15,10 +17,27 @@ tokio-util.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
-nix = { version = "0.30", features = ["signal", "process", "user"] }
 url = "2"
 tempfile = "3"
+which = "=8.0.6"
 latte-work-client.workspace = true
+[features]
+test-fixture = []
+
+[[bin]]
+name = "native-claude-fixture"
+path = "tests/fixtures/native_claude.rs"
+required-features = ["test-fixture"]
+
+[[bin]]
+name = "native-alternate-server"
+path = "tests/fixtures/alternate_server.rs"
+required-features = ["test-fixture"]
+test = false
+bench = false
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal", "process", "user"] }
 portable-pty = "0.9"
 filedescriptor = "0.8"
 [dev-dependencies]

@@ -1,9 +1,10 @@
-//! A single host daemon; `connect` is a disposable local/SSH byte bridge.
+// A single host daemon; `connect` is a disposable local/SSH byte bridge.
 mod agent_environment;
 mod agents;
 mod attachments;
 mod files;
 mod git_review;
+mod host_paths;
 mod message_queue;
 mod providers;
 mod questions;
@@ -15,22 +16,20 @@ mod terminal;
 mod upgrade;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use latte_work_platform::{
+    fs::prepare_state_dir,
+    ipc::{self, Endpoint, Stream},
+    process::{self, Shutdown},
+};
 use latte_work_protocol::{AgentInfo, MAX_FRAME, Request, Response, VERSION};
 use runtime::{Control, Database, Runs, db};
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{
-    io::AsyncWriteExt,
-    net::{UnixListener, UnixStream},
-    sync::oneshot,
-};
+use tokio::{io::AsyncWriteExt, sync::oneshot};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 #[derive(Clone)]
@@ -43,20 +42,58 @@ struct Service {
     title_refresh: Arc<Mutex<runtime::TitleRefreshCache>>,
     command_probes: Arc<tokio::sync::Semaphore>,
     file_admission: Arc<tokio::sync::RwLock<()>>,
-    agent_binary: String,
+    agent_binary: Option<PathBuf>,
     agent: AgentInfo,
     server_id: String,
     providers: Arc<Mutex<providers::ProviderStore>>,
 }
-#[tokio::main]
-async fn main() {
-    if let Err(error) = entry().await {
+impl Service {
+    fn executable(&self) -> Result<&Path> {
+        self.agent_binary
+            .as_deref()
+            .context("Agent 原生 CLI 路径未解析")
+    }
+}
+fn main() -> std::process::ExitCode {
+    let bridge = std::env::args_os()
+        .nth(1)
+        .is_some_and(|command| command == "connect" || command == "connect-local");
+    let runtime = if bridge {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    };
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("latte-work-server: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(entry());
+    if bridge {
+        // Tokio stdin's blocking read cannot be cancelled when IPC reaches EOF.
+        // All bridge futures/streams are already dropped; bound runtime shutdown
+        // before immediately returning from this disposable process. At most one
+        // pending stdin read remains until OS process exit, with no runtime reuse.
+        runtime.shutdown_timeout(Duration::from_millis(250));
+    } else {
+        // The daemon retains normal runtime shutdown after its owned cleanup.
+        drop(runtime);
+    }
+    if let Err(error) = result {
         eprintln!("latte-work-server: {error:#}");
-        std::process::exit(1);
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
     }
 }
 async fn entry() -> Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
         println!(
             "latte-work-server 0.1.0\nUsage: latte-work-server <serve|connect|connect-local> [--state-dir PATH]\nOne daemon per host user; connect starts it if absent.\nLATTE_WORK_CLAUDE: absolute CLI path override (default auto-detected claude)."
@@ -66,16 +103,16 @@ async fn entry() -> Result<()> {
     let dir = if args.len() == 3 && args[1] == "--state-dir" {
         PathBuf::from(&args[2])
     } else if args.len() == 1 {
-        PathBuf::from(std::env::var_os("HOME").context("HOME missing")?)
-            .join(".local/share/latte-work")
+        host_paths::default_state_dir().context("无法确定状态目录")?
     } else {
         bail!("无效参数；使用 --help 查看用法");
     };
     let dir = prepare_dir(&dir)?;
-    match args[0].as_str() {
-        "serve" => serve(&dir).await,
-        "connect" => bridge(&dir).await,
-        "connect-local" => match upgrade::connect_local(&dir).await {
+    let endpoint = Endpoint::prepare(&dir)?;
+    match args[0].to_str().context("命令名称不是 UTF-8")? {
+        "serve" => serve(&endpoint).await,
+        "connect" => bridge(&endpoint).await,
+        "connect-local" => match upgrade::connect_local(&endpoint).await {
             Ok(stream) => forward(stream).await,
             Err(error) => {
                 let response = Response::Error {
@@ -84,7 +121,9 @@ async fn entry() -> Result<()> {
                 };
                 let mut bytes = serde_json::to_vec(&response)?;
                 bytes.push(b'\n');
-                tokio::io::stdout().write_all(&bytes).await?;
+                let mut output = tokio::io::stdout();
+                output.write_all(&bytes).await?;
+                output.flush().await?;
                 Ok(())
             }
         },
@@ -92,74 +131,69 @@ async fn entry() -> Result<()> {
     }
 }
 fn prepare_dir(dir: &Path) -> Result<PathBuf> {
-    if dir.exists() && dir.symlink_metadata()?.file_type().is_symlink() {
-        bail!("状态目录不能是符号链接");
+    Ok(prepare_state_dir(dir)?)
+}
+async fn bridge(endpoint: &Endpoint) -> Result<()> {
+    forward(connect_server(endpoint).await?).await
+}
+async fn connect_server(endpoint: &Endpoint) -> Result<Stream> {
+    match endpoint.connect(Duration::from_secs(3)).await {
+        Ok(stream) => return Ok(stream),
+        Err(error) if ipc::daemon_absent(&error) => {}
+        Err(error) => return Err(error).context("无法验证或连接 Host Server"),
     }
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(dir.canonicalize()?)
-}
-fn lock(dir: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("server.lock"))?;
-    file.try_lock().context("此 Host 的 Server 已运行")?;
-    Ok(file)
-}
-async fn bridge(dir: &Path) -> Result<()> {
-    forward(connect_socket(dir).await?).await
-}
-async fn connect_socket(dir: &Path) -> Result<UnixStream> {
-    let socket = dir.join("control.sock");
-    let stream = match UnixStream::connect(&socket).await {
-        Ok(s) => s,
-        Err(_) => {
-            let mut command = std::process::Command::new(std::env::current_exe()?);
-            use std::os::unix::process::CommandExt;
-            command
-                .arg("serve")
-                .arg("--state-dir")
-                .arg(dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0);
-            let mut daemon = command.spawn().context("无法启动 Host Server")?;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-            loop {
-                if let Ok(s) = UnixStream::connect(&socket).await {
-                    break s;
-                }
-                if tokio::time::Instant::now() > deadline {
-                    bail!("无法连接 Server；请运行 latte-work-server serve 查看诊断");
-                }
-                // A concurrent bridge may win the singleton lock; still wait for its socket.
-                let _ = daemon.try_wait();
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+    let mut command = tokio::process::Command::new(std::env::current_exe()?);
+    command
+        .arg("serve")
+        .arg("--state-dir")
+        .arg(endpoint.state_dir());
+    let mut daemon = process::spawn_daemon(&mut command).context("无法启动 Host Server")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("无法连接 Server；请运行 latte-work-server serve 查看诊断");
         }
-    };
-    Ok(stream)
+        match endpoint
+            .connect(remaining.min(Duration::from_secs(3)))
+            .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if ipc::daemon_absent(&error) || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(error).context("无法验证或连接 Host Server"),
+        }
+        // A concurrent bridge may win the singleton lock; wait for its endpoint.
+        let _ = daemon.try_wait();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
-async fn forward(stream: UnixStream) -> Result<()> {
+async fn forward(stream: Stream) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
-    tokio::select! {result=tokio::io::copy(&mut input,&mut writer)=>{result?;},result=tokio::io::copy(&mut reader,&mut output)=>{result?;}}
+    let result = tokio::select! {
+        result = tokio::io::copy(&mut input, &mut writer) => result,
+        result = tokio::io::copy(&mut reader, &mut output) => result,
+    };
+    // Close both IPC halves before the binary bounds its stdio runtime lifetime.
+    drop(reader);
+    drop(writer);
+    drop(input);
+    result?;
+    tokio::time::timeout(Duration::from_secs(1), output.flush())
+        .await
+        .context("bridge stdout flush timed out")??;
     Ok(())
 }
-async fn serve(dir: &Path) -> Result<()> {
-    let _lock = lock(dir)?;
-    let socket = dir.join("control.sock");
-    if let Ok(metadata) = socket.symlink_metadata() {
-        if !metadata.file_type().is_socket() {
-            bail!("control.sock 被非 socket 文件占用");
-        }
-        std::fs::remove_file(&socket)?;
-    }
+async fn serve(endpoint: &Endpoint) -> Result<()> {
+    let mut shutdown = Shutdown::new().context("无法注册 Host 退出通知")?;
+    // Binding owns the singleton lease and validates transport before recovery/probes.
+    let listener = endpoint
+        .bind()
+        .await
+        .context("无法绑定 Host Server 控制通道")?;
+    let dir = endpoint.state_dir();
     let database = Arc::new(Mutex::new(store::Store::open(&dir.join("state.sqlite"))?));
     let environment_warning = agent_environment::initialize().await;
     let (agent_binary, mut agent) = agents::discover().await;
@@ -180,47 +214,56 @@ async fn serve(dir: &Path) -> Result<()> {
         agent,
         server_id: uuid::Uuid::new_v4().to_string(),
     };
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     eprintln!(
         "Latte Work server {} listening at {}",
         service.server_id,
-        socket.display()
+        endpoint.address()
     );
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    loop {
+    let mut clients = tokio::task::JoinSet::new();
+    let accept_result: Result<()> = loop {
         tokio::select! {
-            result=listener.accept()=>{let (stream,_)=result?;let service=service.clone();tokio::spawn(async move {if let Err(e)=connection(stream,service).await {eprintln!("client disconnected: {e}");}});},
-            _=tokio::signal::ctrl_c()=>break,
-        _=terminate.recv()=>break,
-        _=service.lifecycle.shutdown.notified()=>break,
+            result=listener.accept()=>{
+                match result {
+                    Ok(stream) => {
+                        let service=service.clone();
+                        clients.spawn(async move {if let Err(e)=connection(stream,service).await {eprintln!("client disconnected: {e}");}});
+                    }
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset) => {
+                        eprintln!("IPC connection rejected: {error}");
+                    }
+                    Err(error) => break Err(error.into()),
+                }
+            },
+            _=clients.join_next(), if !clients.is_empty()=>{},
+            _=shutdown.recv()=>break Ok(()),
+            _=service.lifecycle.shutdown.notified()=>break Ok(()),
         }
+    };
+    // Fence requests on existing connections as well as new accepts. If an
+    // in-flight dispatch will not yield, cancel its connection before fencing.
+    if let Ok(mut admission) =
+        tokio::time::timeout(Duration::from_secs(2), service.lifecycle.draining.write()).await
+    {
+        *admission = true;
+    } else {
+        clients.shutdown().await;
+        *service.lifecycle.draining.write().await = true;
     }
     service
         .terminals
         .lock()
         .map_err(|_| anyhow::anyhow!("终端锁异常"))?
         .close_all();
-    let controls: Vec<_> = service
-        .runs
-        .lock()
-        .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
-        .values()
-        .map(|run| run.control.clone())
-        .collect();
-    for control in controls {
-        let _ = control
-            .send(Control::Cancel {
-                reply: None,
-                only_if_idle: false,
-            })
-            .await;
-    }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    std::fs::remove_file(socket)?;
-    Ok(())
+    let (cleanup, ()) = tokio::join!(
+        runtime::shutdown(&service.runs),
+        tokio::time::sleep(Duration::from_secs(3))
+    );
+    clients.shutdown().await;
+    drop(listener);
+    cleanup?;
+    accept_result
 }
-async fn connection(stream: UnixStream, service: Service) -> Result<()> {
+async fn connection(stream: Stream, service: Service) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_FRAME));
     let mut ready = false;
@@ -369,7 +412,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 .try_acquire()
                 .context("权限选项正在加载，请稍后重试")?;
             Response::AgentPermissions {
-                modes: agents::permission_modes(&agent, &s.agent_binary).await?,
+                modes: agents::permission_modes(&agent, s.executable()?).await?,
             }
         }
         Request::AgentCommands { agent, project_id } => {
@@ -387,7 +430,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 .map_err(|_| anyhow::anyhow!("Provider 配置锁异常"))?
                 .selected_config(&agent, None)?;
             Response::AgentCommands {
-                commands: runtime::commands(&s.agent_binary, &agent, &project.path, &config)
+                commands: runtime::commands(s.executable()?, &agent, &project.path, &config)
                     .await?,
             }
         }
@@ -657,7 +700,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             runtime::open(
                 s.database.clone(),
                 s.runs.clone(),
-                s.agent_binary.clone(),
+                s.executable()?.to_owned(),
                 session,
                 path,
                 config,
@@ -738,7 +781,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                     .command_probes
                     .try_acquire()
                     .context("权限能力正在加载，请稍后重试")?;
-                if !agents::permission_modes(&agent_id, &s.agent_binary)
+                if !agents::permission_modes(&agent_id, s.executable()?)
                     .await?
                     .iter()
                     .any(|item| &item.id == mode)
@@ -756,7 +799,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             runtime::submit(
                 s.database.clone(),
                 s.runs.clone(),
-                s.agent_binary.clone(),
+                s.executable()?.to_owned(),
                 session,
                 path,
                 runtime::SendTurn {
@@ -894,7 +937,9 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             runtime::queue_action(
                 s.database.clone(),
                 s.runs.clone(),
-                s.agent_binary.clone(),
+                s.agent_binary
+                    .clone()
+                    .context("Agent CLI 不可用，请检查主机")?,
                 session,
                 path,
                 action,
@@ -1317,6 +1362,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 bail!("来源路径无效");
             }
             let requested = if Path::new(&path).is_absolute() {
+                latte_work_platform::paths::absolute(Path::new(&path))?;
                 std::path::PathBuf::from(&path)
             } else {
                 files::resolve(Path::new(&p.path), &path)?

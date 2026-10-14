@@ -1,0 +1,240 @@
+use super::*;
+use std::{
+    io::Read,
+    os::windows::io::AsHandle,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+// Independent .NET ACL inspection, only on disposable test directories. No
+// PowerShell ACL repair or subprocesses are used by production security code.
+fn inspect(script: &str, path: &Path, target: &Path) -> String {
+    let mut child = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("LATTE_SECURITY_TEST_PATH", path)
+        .env("LATTE_SECURITY_TEST_TARGET", target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("security fixture timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .take(16_384)
+        .read_to_string(&mut out)
+        .unwrap();
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .take(16_384)
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(status.success(), "security fixture: {err}");
+    out.trim().to_owned()
+}
+
+fn sddl(path: &Path) -> String {
+    inspect(
+        "$ErrorActionPreference='Stop'; [IO.Directory]::GetAccessControl($env:LATTE_SECURITY_TEST_PATH).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner)",
+        path,
+        path,
+    )
+}
+
+#[test]
+fn private_leaf_inherits_nothing_and_pins_until_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("control");
+    let before = sddl(root.path());
+    let user = current_user_sid().unwrap();
+    let guard = ControlDirectory::create_or_validate(&path).unwrap();
+    assert!(guard.path().is_dir());
+    assert_eq!(sddl(&path), format!("O:{user}D:P(A;OICI;FA;;;{user})"));
+    // This regression distinguishes the ordinary parent (previously passed by
+    // mistake) from the new leaf whose DACL must contain SE_DACL_PROTECTED.
+    assert_eq!(sddl(root.path()), before);
+    assert!(std::fs::rename(&path, root.path().join("moved")).is_err());
+    assert!(std::fs::remove_dir(&path).is_err());
+    drop(guard);
+    let reopened = ControlDirectory::create_or_validate(&path).unwrap();
+    assert_eq!(sddl(&path), format!("O:{user}D:P(A;OICI;FA;;;{user})"));
+    drop(reopened);
+    let reopened = ControlDirectory::open_verified(&path).unwrap();
+    drop(reopened);
+    std::fs::rename(&path, root.path().join("moved")).unwrap();
+}
+
+#[test]
+fn existing_broad_acl_is_rejected_without_repair() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("control");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("sentinel"), "unchanged").unwrap();
+    let before = sddl(&path);
+    for _ in 0..3 {
+        assert_eq!(
+            ControlDirectory::open_verified(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            ControlDirectory::create_or_validate(&path)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+    assert_eq!(sddl(&path), before);
+    assert_eq!(
+        std::fs::read_to_string(path.join("sentinel")).unwrap(),
+        "unchanged"
+    );
+    std::fs::rename(&path, root.path().join("moved")).unwrap(); // error paths released handles
+}
+
+#[test]
+fn non_exact_acls_are_rejected_without_repair() {
+    let root = tempfile::tempdir().unwrap();
+    let user = current_user_sid().unwrap();
+    let script = r#"$ErrorActionPreference='Stop'
+$acl = [Security.AccessControl.DirectorySecurity]::new()
+$acl.SetSecurityDescriptorSddlForm($env:LATTE_SECURITY_TEST_TARGET, [Security.AccessControl.AccessControlSections]::Access)
+[IO.Directory]::SetAccessControl($env:LATTE_SECURITY_TEST_PATH, $acl)
+"#;
+    // Empty, extra user, wrong flags, wrong rights, inherit-only, and deny ACEs.
+    let descriptors = [
+        format!("O:{user}D:P"),
+        format!("O:{user}D:NO_ACCESS_CONTROL"),
+        format!("O:{user}D:(A;OICI;FA;;;{user})"),
+        format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FR;;;WD)"),
+        format!("O:{user}D:P(A;;FA;;;{user})"),
+        format!("O:{user}D:P(A;OICI;FR;;;{user})"),
+        format!("O:{user}D:P(A;OICIIO;FA;;;{user})"),
+        format!("O:{user}D:P(D;;FW;;;WD)(A;OICI;FA;;;{user})"),
+    ];
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let path = root.path().join(format!("control-{index}"));
+        let guard = ControlDirectory::create_or_validate(&path).unwrap();
+        drop(guard);
+        inspect(script, &path, Path::new(descriptor));
+        let before = sddl(&path);
+        assert!(
+            ControlDirectory::open_verified(&path).is_err(),
+            "accepted {descriptor}"
+        );
+        assert!(
+            ControlDirectory::create_or_validate(&path).is_err(),
+            "repaired {descriptor}"
+        );
+        assert_eq!(sddl(&path), before);
+        // Fixture-only restore, so even the deny/empty-DACL case can be cleaned.
+        inspect(
+            script,
+            &path,
+            Path::new(&format!("O:{user}D:P(A;OICI;FA;;;{user})")),
+        );
+    }
+}
+
+#[test]
+fn junction_leaf_and_ancestor_are_rejected_without_touching_target() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let junction = root.path().join("junction");
+    inspect(
+        "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:LATTE_SECURITY_TEST_PATH -Target $env:LATTE_SECURITY_TEST_TARGET | Out-Null",
+        &junction,
+        &target,
+    );
+    let before = sddl(&target);
+    for path in [&junction, &junction.join("control")] {
+        assert_eq!(
+            ControlDirectory::create_or_validate(path)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            ControlDirectory::open_verified(path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+    assert_eq!(sddl(&target), before);
+    assert!(!target.join("control").exists());
+    std::fs::remove_dir(&junction).unwrap();
+}
+
+#[test]
+fn missing_and_ambiguous_paths_fail_without_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    assert_eq!(
+        ControlDirectory::open_verified(&missing)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(ControlDirectory::create_or_validate(&missing.join("control")).is_err());
+    assert!(!missing.exists());
+    for path in [
+        "relative-control",
+        r"C:\",
+        r"C:control",
+        r"\control",
+        r"\\server\share\control",
+        r"\\.\pipe\control",
+        r"C:\x\..\control",
+        r"C:\x\.\control",
+        r"C:\x\control.",
+        r"C:\x\control ",
+        r"C:\x\control:stream",
+        r"C:\x\NUL",
+        r"C:\x\COM1.txt",
+        r"C:\x\LPT¹",
+        "C:\\x\\bad\0name",
+    ] {
+        assert_eq!(
+            ControlDirectory::create_or_validate(Path::new(path))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn native_unicode_and_extended_length_paths_work() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("a".repeat(150));
+    std::fs::create_dir(&parent).unwrap();
+    let path = parent.join(format!("控制目录-{}", "b".repeat(150)));
+    let guard = ControlDirectory::create_or_validate(&path).unwrap();
+    assert!(guard.path().is_dir());
+    let second = ControlDirectory::open_verified(guard.path()).unwrap();
+    assert_eq!(second.path(), guard.path());
+}
+
+#[test]
+fn file_handle_cannot_be_used_as_peer_identity() {
+    let file = tempfile::tempfile().unwrap();
+    assert!(verify_pipe_peer(file.as_handle()).is_err());
+}

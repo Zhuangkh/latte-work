@@ -58,8 +58,8 @@ jobs:
           toolchain: 1.97.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --exclude latte-work-desktop --all-targets --locked
-      - run: cargo clippy --workspace --exclude latte-work-desktop --all-targets --locked -- -D warnings
+      - run: cargo check --workspace --exclude latte-work-desktop --all-targets --features latte-work-server/test-fixture --locked
+      - run: cargo clippy --workspace --exclude latte-work-desktop --all-targets --features latte-work-server/test-fixture --locked -- -D warnings
 
   unit-tests:
     name: UT host (${{ matrix.label }})
@@ -99,10 +99,10 @@ jobs:
         with:
           toolchain: 1.97.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p latte-work-server --test e2e --locked -- --test-threads=1
+      - run: cargo test -p latte-work-server --features test-fixture --test e2e --test native --test native_upgrade --test stdio_bridge --locked -- --test-threads=1
 
   portable-windows:
-    name: Portable Rust (Windows)
+    name: Host core and portable Rust (Windows)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -112,9 +112,10 @@ jobs:
           toolchain: 1.97.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p latte-work-protocol -p latte-work-client --all-targets --locked
-      - run: cargo clippy -p latte-work-protocol -p latte-work-client --all-targets --locked -- -D warnings
-      - run: cargo test -p latte-work-protocol -p latte-work-client --lib --bins --locked
+      - run: cargo check -p latte-work-windows-security -p latte-work-platform -p latte-work-config -p latte-work-protocol -p latte-work-client -p latte-work-server --features latte-work-server/test-fixture --all-targets --locked
+      - run: cargo clippy -p latte-work-windows-security -p latte-work-platform -p latte-work-config -p latte-work-protocol -p latte-work-client -p latte-work-server --features latte-work-server/test-fixture --all-targets --locked -- -D warnings
+      - run: ./scripts/test-windows-host.ps1
+        shell: pwsh
 
   frontend:
     name: Frontend UT and build (${{ matrix.label }})

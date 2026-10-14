@@ -1,12 +1,12 @@
 //! App-owned paste staging. Completed files remain available to saved prompts;
 //! only incomplete, expired transfers are discarded automatically.
 use anyhow::{Context, Result, bail};
+use latte_work_platform::fs::PrivateDir;
 use latte_work_protocol::FileEntry;
 use std::{
     collections::HashMap,
     io::Write,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
@@ -21,24 +21,18 @@ struct Pending {
     touched: Instant,
 }
 pub struct Attachments {
-    root: PathBuf,
+    root: PrivateDir,
     pending: HashMap<String, Pending>,
 }
 impl Attachments {
     pub fn new(state: &Path) -> Result<Self> {
-        let root = state.join("paste-tmp");
-        std::fs::create_dir_all(&root)?;
-        if root.symlink_metadata()?.file_type().is_symlink() {
-            bail!("附件目录不能是符号链接");
-        }
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         Ok(Self {
-            root: root.canonicalize()?,
+            root: PrivateDir::prepare(&state.join("paste-tmp"))?,
             pending: HashMap::new(),
         })
     }
     pub fn is_completed(&self, path: &Path) -> bool {
-        path.parent() == Some(self.root.as_path())
+        path.parent() == Some(self.root.path())
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                 n.len() > 37
                     && n.as_bytes()[36] == b'-'
@@ -61,11 +55,12 @@ impl Attachments {
         {
             bail!("附件文件名无效");
         }
+        latte_work_platform::paths::file_name(&name).context("附件文件名无效")?;
         if self.pending.len() >= 8 {
             bail!("正在处理的附件过多，请稍后重试");
         }
         let mut used = 0u64;
-        for (i, entry) in self.root.read_dir()?.enumerate() {
+        for (i, entry) in self.root.path().read_dir()?.enumerate() {
             if i >= 4096 {
                 bail!("附件临时目录已满");
             }
@@ -82,7 +77,7 @@ impl Attachments {
         self.pending.insert(
             id.clone(),
             Pending {
-                file: NamedTempFile::new_in(&self.root)?,
+                file: self.root.tempfile("attachment-", ".tmp")?,
                 name,
                 size,
                 written: 0,
@@ -116,7 +111,7 @@ impl Attachments {
         }
         let p = self.pending.remove(id).context("附件上传已失效")?;
         p.file.as_file().sync_all()?;
-        let path = self.root.join(format!("{id}-{}", p.name));
+        let path = self.root.path().join(format!("{id}-{}", p.name));
         p.file.persist_noclobber(&path)?;
         Ok(FileEntry {
             name: p.name,
@@ -148,8 +143,9 @@ mod tests {
         drop(store);
         let store = Attachments::new(root.path()).unwrap();
         assert!(Path::new(&file.path).is_file());
-        assert_eq!(store.root.read_dir().unwrap().count(), 1);
+        assert_eq!(store.root.path().read_dir().unwrap().count(), 1);
     }
+    #[cfg(unix)]
     #[test]
     fn refuses_a_symlinked_cache_root() {
         let root = tempfile::tempdir().unwrap();
@@ -173,15 +169,13 @@ mod tests {
         assert!(store.chunk(&id, 0, &[1]).is_err());
         let entry = store.finish(&id).unwrap();
         assert_eq!(std::fs::read(&entry.path).unwrap(), [1, 2, 3]);
-        assert_eq!(
-            std::fs::metadata(&entry.path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        latte_work_platform::fs::verify_private_file(&std::fs::File::open(&entry.path).unwrap())
+            .unwrap();
         assert!(Path::new(&entry.path).starts_with(root.path().canonicalize().unwrap()));
         assert!(store.finish(&id).is_err());
         let aborted = store.begin("cancel.txt".into(), 1).unwrap();
         store.abort(&aborted);
         assert!(store.chunk(&aborted, 0, &[1]).is_err());
-        assert_eq!(store.root.read_dir().unwrap().count(), 1);
+        assert_eq!(store.root.path().read_dir().unwrap().count(), 1);
     }
 }

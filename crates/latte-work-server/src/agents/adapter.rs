@@ -104,7 +104,7 @@ pub trait AgentAdapter: Send {
     /// Prepare launch resources; may retain resume/config context for later protocol steps.
     fn command(
         &mut self,
-        binary: &str,
+        binary: &std::path::Path,
         cwd: &str,
         resume: Option<&str>,
         config: &LaunchConfig,

@@ -1,6 +1,7 @@
 //! Protocol adapters translate native agent messages; they do not own storage or UI.
 mod adapter;
 mod claude;
+mod claude_binary;
 mod claude_models;
 mod claude_sessions;
 mod claude_skills;
@@ -101,7 +102,7 @@ pub fn create(agent: &str) -> Result<Box<dyn AgentAdapter>> {
 }
 
 /// The registry currently contains one implementation. Discovery stays implementation-owned.
-pub async fn discover() -> (String, latte_work_protocol::AgentInfo) {
+pub async fn discover() -> (Option<std::path::PathBuf>, latte_work_protocol::AgentInfo) {
     claude::discover().await
 }
 
@@ -132,7 +133,7 @@ pub fn effort_levels(agent: &str, model: Option<&str>) -> &'static [latte_work_p
 /// Probe the selected host's executable; unknown adapters never inherit another policy.
 pub async fn permission_modes(
     agent: &str,
-    binary: &str,
+    binary: &std::path::Path,
 ) -> Result<Vec<latte_work_protocol::AgentPermissionMode>> {
     match agent {
         "claude" => claude::permission_modes(binary).await,

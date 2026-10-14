@@ -2,15 +2,16 @@
 pub mod discovery;
 mod validation;
 use anyhow::{Context, Result, bail};
+use latte_work_platform::lock::FileLock;
 use latte_work_protocol::{
     AgentProviderBinding, Provider, ProviderDraft, ProviderSnapshot, Response,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -53,7 +54,7 @@ impl Default for Config {
 pub struct ProviderStore {
     path: PathBuf,
     config: Config,
-    _lock: File,
+    _lock: FileLock,
 }
 fn regular(path: &Path) -> Result<bool> {
     match path.symlink_metadata() {
@@ -108,21 +109,21 @@ impl ProviderStore {
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         let lock_path = directory.join("providers.lock");
         regular(&lock_path)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let lock = options.open(lock_path)?;
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
+        let lock = loop {
+            match FileLock::try_acquire(&lock_path) {
+                Ok(guard) => break guard,
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
-                Err(_) => bail!("Provider 配置正被其他窗口使用，请重试"),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    bail!("Provider 配置正被其他窗口使用，请重试")
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).context("无法获取 Provider 配置锁");
+                }
             }
-        }
+        };
         let path = directory.join("providers.json");
         let exists = regular(&path)?;
         let config = if exists {

@@ -1,5 +1,7 @@
 //! Final-binary tests: real daemon, real socket/bridge, deterministic Claude process.
+#![cfg(unix)]
 use latte_work_client::Client;
+use latte_work_platform::ipc::{self, Endpoint};
 use latte_work_protocol::{EventKind, Request, Response, Status, VERSION};
 use nix::{
     sys::signal::{Signal, kill},
@@ -38,11 +40,7 @@ impl Host {
             .spawn()
             .unwrap();
         let host = Self { directory, process };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !host.directory.path().join("control.sock").exists() {
-            assert!(Instant::now() < deadline, "server readiness timeout");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_ready(host.directory.path(), Duration::from_secs(10)).await;
         host
     }
     async fn client(&self) -> Client {
@@ -65,6 +63,55 @@ impl Drop for Host {
         let _ = self.process.wait();
     }
 }
+/// Readiness requires a protocol response, not merely an OS listener created before probes finish.
+async fn wait_ready(path: &Path, timeout: Duration) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(timeout, async {
+        loop {
+            let attempt = async {
+                let endpoint = Endpoint::open(path)?;
+                let mut stream = endpoint.connect(Duration::from_secs(1)).await?;
+                stream
+                    .write_all(
+                        format!("{{\"method\":\"hello\",\"version\":{VERSION}}}\n").as_bytes(),
+                    )
+                    .await?;
+                let mut bytes = Vec::new();
+                loop {
+                    let byte = stream.read_u8().await?;
+                    if byte == b'\n' {
+                        break;
+                    }
+                    assert!(bytes.len() < 64 * 1024, "readiness response too large");
+                    bytes.push(byte);
+                }
+                let response: Response = serde_json::from_slice(&bytes).unwrap();
+                assert!(
+                    matches!(
+                        response,
+                        Response::Hello {
+                            version: VERSION,
+                            ..
+                        }
+                    ),
+                    "{response:?}"
+                );
+                Ok::<(), std::io::Error>(())
+            }
+            .await;
+            match attempt {
+                Ok(()) => break,
+                Err(error) if ipc::daemon_absent(&error) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                Err(error) => panic!("readiness failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("server readiness timeout");
+}
+
 async fn ask(c: &mut Client, r: Request) -> Response {
     c.request(r).await.unwrap()
 }
@@ -688,11 +735,7 @@ async fn provider_catalog_local_binding_and_remote_sync_use_host_protocol() {
         .spawn()
         .unwrap();
     let local = Host { directory, process };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !local.directory.path().join("control.sock").exists() {
-        assert!(Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_ready(local.directory.path(), Duration::from_secs(10)).await;
     let mut c = local.client().await;
     let draft = ProviderDraft {
         id: None,
@@ -2352,11 +2395,7 @@ async fn terminal_daemon_shutdown_cleans_up_and_restart_never_replays() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !host.directory.path().join("control.sock").exists() {
-        assert!(Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
+    wait_ready(host.directory.path(), Duration::from_secs(5)).await;
     let mut client = host.client().await;
     assert!(
         matches!(ask(&mut client,Request::Terminals {project_id}).await,Response::Terminals {terminals} if terminals.is_empty())
@@ -2414,7 +2453,9 @@ async fn completed_turn_is_unread_until_acknowledged_across_clients() {
 async fn lifecycle(path: &Path, request: serde_json::Value) -> serde_json::Value {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut stream = tokio::net::UnixStream::connect(path.join("control.sock"))
+        let mut stream = Endpoint::open(path)
+            .unwrap()
+            .connect(Duration::from_secs(3))
             .await
             .unwrap();
         stream
@@ -2581,8 +2622,17 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
     .await;
     drop((a, b));
     assert_eq!(stop["kind"], "upgrade_ready");
+    let endpoint = Endpoint::open(&dir).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while dir.join("control.sock").exists() {
+    loop {
+        match endpoint.try_lock_server() {
+            Ok(guard) => {
+                drop(guard);
+                break;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(error) => panic!("server lock failed: {error}"),
+        }
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -2626,9 +2676,10 @@ async fn upgrade_legacy_daemon_returns_actionable_error_without_stopping_it() {
     assert!(error.contains("旧版本机后台"), "{error}");
     assert!(error.contains("仅重启桌面应用不会停止后台"));
     let listener = old.await.unwrap();
-    assert!(directory.path().join("control.sock").exists());
     assert!(
-        tokio::net::UnixStream::connect(directory.path().join("control.sock"))
+        Endpoint::open(directory.path())
+            .unwrap()
+            .connect(Duration::from_secs(1))
             .await
             .is_ok()
     );
