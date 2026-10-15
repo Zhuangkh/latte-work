@@ -12,6 +12,7 @@ import { useState } from "react";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 const mocks = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("./api", () => ({ request: mocks.request, message: String }));
+HTMLElement.prototype.scrollIntoView = vi.fn();
 afterEach(() => {
   cleanup();
   localStorage.clear();
@@ -310,7 +311,9 @@ it("keeps the Git file list available after a failed diff preview", async () => 
     };
   });
   render(<Harness tab="diff" />);
-  await screen.findByRole("button", { name: /file.txt/ });
+  await within(
+    screen.getByRole("complementary", { name: "变更文件" }),
+  ).findByRole("button", { name: /file.txt/ });
   fireEvent.click(await screen.findByRole("button", { name: /^状态提示（/ }));
   expect(
     screen.getByRole("dialog", { name: "状态提示" }).textContent,
@@ -324,8 +327,18 @@ it("keeps the Git file list available after a failed diff preview", async () => 
       scope: "branch",
     }),
   );
-  fireEvent.click(screen.getByRole("button", { name: /new.txt/ }));
-  expect(screen.getByRole("button", { name: /file.txt/ })).toBeTruthy();
+  fireEvent.click(
+    within(screen.getByRole("complementary", { name: "变更文件" })).getByRole(
+      "button",
+      { name: /new.txt/ },
+    ),
+  );
+  expect(
+    within(screen.getByRole("complementary", { name: "变更文件" })).getByRole(
+      "button",
+      { name: /file.txt/ },
+    ),
+  ).toBeTruthy();
   await waitFor(() =>
     expect(mocks.request).toHaveBeenLastCalledWith(
       "local",

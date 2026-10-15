@@ -52,6 +52,15 @@ pub async fn initialize() -> Option<String> {
     }
 }
 
+/// Resolve a native storage setting from the same environment used by the agent.
+pub fn variable(name: &str) -> Option<OsString> {
+    ENVIRONMENT
+        .get()
+        .and_then(|env| env.get(std::ffi::OsStr::new(name)))
+        .cloned()
+        .or_else(|| std::env::var_os(name))
+}
+
 pub fn command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(binary);
     if let Some(env) = ENVIRONMENT.get() {

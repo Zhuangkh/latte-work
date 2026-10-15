@@ -2,7 +2,7 @@
 use crate::files;
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{
-    ChangeSection, GitInfo, GitRef, GitReview, GitReviewFile, GitReviewScope,
+    ChangeSection, GitCommit, GitInfo, GitRef, GitReview, GitReviewFile, GitReviewScope,
 };
 use std::{
     collections::HashMap,
@@ -118,6 +118,55 @@ pub async fn info(root: &Path) -> Result<GitInfo> {
     .await
     .context("读取分支超时")?
 }
+/// Pages follow a fixed first-parent lineage even when the working branch moves.
+pub async fn commits(
+    root: &Path,
+    head: Option<&str>,
+    offset: u32,
+) -> Result<(Option<String>, Vec<GitCommit>, bool)> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        command(root, &["rev-parse", "--show-prefix"]).await?;
+        let head = match head {
+            Some(oid) if valid_oid(oid) => Some(commit(root, oid).await?),
+            Some(_) => bail!("无效的提交游标"),
+            None => commit(root, "HEAD").await.ok(),
+        };
+        let Some(oid) = &head else {
+            return Ok((None, Vec::new(), false));
+        };
+        let text = command(
+            root,
+            &[
+                "log",
+                "--first-parent",
+                "--no-decorate",
+                "--no-show-signature",
+                "--format=%H%x09%s",
+                "--max-count=51",
+                &format!("--skip={offset}"),
+                oid,
+                "--",
+            ],
+        )
+        .await?;
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            let (oid, subject) = line.split_once('\t').context("无法读取提交记录")?;
+            if !valid_oid(oid) {
+                bail!("无效的提交记录");
+            }
+            rows.push(GitCommit {
+                oid: oid.into(),
+                subject: subject.into(),
+            });
+        }
+        let has_more = rows.len() > 50;
+        rows.truncate(50);
+        Ok((head, rows, has_more))
+    })
+    .await
+    .context("读取提交历史超时")?
+}
 fn arguments(scope: GitReviewScope, base: Option<&str>, head: Option<&str>) -> Result<Vec<String>> {
     let mut args: Vec<String> = [
         "diff",
@@ -130,7 +179,19 @@ fn arguments(scope: GitReviewScope, base: Option<&str>, head: Option<&str>) -> R
     .map(str::to_owned)
     .into();
     match scope {
-        GitReviewScope::Branch => {
+        GitReviewScope::Commit if base.is_none() => {
+            let head = head
+                .filter(|oid| valid_oid(oid))
+                .context("缺少有效的提交，请刷新")?;
+            args[0] = "diff-tree".into();
+            args.extend([
+                "--root".into(),
+                "--no-commit-id".into(),
+                "-r".into(),
+                head.into(),
+            ]);
+        }
+        GitReviewScope::Branch | GitReviewScope::Commit => {
             let base = base
                 .filter(|oid| valid_oid(oid))
                 .context("缺少有效的基准提交，请刷新")?;
@@ -236,7 +297,15 @@ pub async fn review(
     reference: Option<&str>,
 ) -> Result<GitReview> {
     tokio::time::timeout(Duration::from_secs(25), async {
-        let head = commit(root, "HEAD").await.ok();
+        let head = if scope == GitReviewScope::Commit {
+            let reference = reference.context("请选择要查看的提交")?;
+            if !valid_oid(reference) {
+                bail!("无效的提交");
+            }
+            Some(commit(root, reference).await?)
+        } else {
+            commit(root, "HEAD").await.ok()
+        };
         let base = if scope == GitReviewScope::Branch {
             let info = info(root).await?;
             let reference = reference
@@ -251,6 +320,19 @@ pub async fn review(
                 .await
                 .context("两个分支没有共同祖先")?,
             )
+        } else if scope == GitReviewScope::Commit {
+            let parents = command(
+                root,
+                &[
+                    "rev-list",
+                    "--parents",
+                    "--max-count=1",
+                    head.as_deref().context("缺少提交")?,
+                    "--",
+                ],
+            )
+            .await?;
+            parents.split_whitespace().nth(1).map(str::to_owned)
         } else {
             None
         };
@@ -481,6 +563,142 @@ mod tests {
         run(root.path(), &["add", "."]);
         run(root.path(), &["commit", "-qm", "initial"]);
         root
+    }
+    #[tokio::test]
+    async fn committed_reviews_pin_first_parent_and_support_root_commits() {
+        let root = fixture();
+        let sub = root.path().join("project");
+        let (_, history, _) = commits(&sub, None, 0).await.unwrap();
+        let initial = history[0].oid.clone();
+        let saved = review(&sub, GitReviewScope::Commit, Some(&initial))
+            .await
+            .unwrap();
+        assert!(saved.base.is_none());
+        assert_eq!(saved.entries.len(), 3);
+        let patch = diff(
+            &sub,
+            GitReviewScope::Commit,
+            None,
+            saved.head.as_deref(),
+            "file.txt",
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(patch.contains("+original"));
+        assert!(!patch.contains("outside"));
+        run(root.path(), &["checkout", "-qb", "feature"]);
+        std::fs::write(sub.join("file.txt"), "feature\n").unwrap();
+        run(root.path(), &["add", "."]);
+        run(root.path(), &["commit", "-qm", "feature"]);
+        run(root.path(), &["checkout", "-q", "main"]);
+        std::fs::write(sub.join("base.txt"), "main\n").unwrap();
+        run(root.path(), &["add", "."]);
+        run(root.path(), &["commit", "-qm", "main"]);
+        let parent = commit(&sub, "HEAD").await.unwrap();
+        run(
+            root.path(),
+            &["merge", "--no-ff", "-qm", "merge feature", "feature"],
+        );
+        let (head, history, _) = commits(&sub, None, 0).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|c| c.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["merge feature", "main", "initial"]
+        );
+        let index = std::fs::read(root.path().join(".git/index")).unwrap();
+        let saved = review(&sub, GitReviewScope::Commit, head.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(saved.base.as_deref(), Some(parent.as_str()));
+        assert_eq!(saved.entries.len(), 1);
+        assert_eq!(saved.entries[0].path, "file.txt");
+        assert_eq!(
+            std::fs::read(root.path().join(".git/index")).unwrap(),
+            index
+        );
+        run(root.path(), &["checkout", "-q", "feature"]);
+        std::fs::write(sub.join("file.txt"), "working\n").unwrap();
+        let patch = diff(
+            &sub,
+            GitReviewScope::Commit,
+            saved.base.as_deref(),
+            saved.head.as_deref(),
+            "file.txt",
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(patch.contains("+feature"));
+        assert!(!patch.contains("+working"));
+        // Inspection never writes the index; check before the explicit checkout changes it.
+        assert_eq!(saved.head, head);
+        assert!(!index.is_empty());
+        for value in ["HEAD", "--output=escape", "HEAD:outside.txt", "../main"] {
+            assert!(
+                review(&sub, GitReviewScope::Commit, Some(value))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            diff(
+                &sub,
+                GitReviewScope::Commit,
+                saved.base.as_deref(),
+                saved.head.as_deref(),
+                "../outside.txt",
+                false
+            )
+            .await
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn commit_pages_keep_their_lineage_after_head_moves() {
+        let root = fixture();
+        // Construct enough history for two pages in one deterministic Git process.
+        let initial = commit(root.path(), "HEAD").await.unwrap();
+        let mut input = String::new();
+        for n in 0..54 {
+            let message = format!("commit {n}");
+            let parent = if n == 0 {
+                initial.clone()
+            } else {
+                format!(":{n}")
+            };
+            input.push_str(&format!("commit refs/heads/main\nmark :{}\ncommitter Fixture <fixture@example.test> {} +0000\ndata {}\n{}\nfrom {}\n\n", n + 1, n + 1, message.len(), message, parent));
+        }
+        let mut child = Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(root.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+        let (head, first, more) = commits(root.path(), None, 0).await.unwrap();
+        assert_eq!(first.len(), 50);
+        assert!(more);
+        run(
+            root.path(),
+            &["commit", "--allow-empty", "-qm", "late commit"],
+        );
+        let (_, second, more) = commits(root.path(), head.as_deref(), 50).await.unwrap();
+        assert_eq!(second.len(), 5);
+        assert!(!more);
+        assert_eq!(second.last().unwrap().subject, "initial");
+        assert!(!second.iter().any(|c| c.subject == "late commit"));
+        assert!(!first.iter().any(|a| second.iter().any(|b| a.oid == b.oid)));
+        assert!(commits(root.path(), Some("HEAD~1"), 0).await.is_err());
+        let empty = tempfile::tempdir().unwrap();
+        assert!(commits(empty.path(), None, 0).await.is_err());
+        run(empty.path(), &["init", "-q", "-b", "main"]);
+        assert_eq!(commits(empty.path(), None, 0).await.unwrap().0, None);
     }
     #[tokio::test]
     async fn branch_review_uses_merge_base_and_pinned_commits_with_renames() {

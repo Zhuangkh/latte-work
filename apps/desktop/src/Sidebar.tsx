@@ -3,7 +3,6 @@ import {
   Plus,
   Folder,
   FolderOpen,
-  Globe2,
   CirclePause,
   CircleAlert,
   CircleHelp,
@@ -28,6 +27,7 @@ import { useRecentSessions } from "./useRecentSessions";
 import { useStatusIssues, type StatusIssue } from "./statusNotices";
 import { ProjectActions } from "./ProjectActions";
 import { RemoteProjectIcon } from "./RemoteProjectIcon";
+import { RemoteGlobeIcon } from "./RemoteGlobeIcon";
 import type { HostedProject } from "./projectCatalog";
 import { message, request } from "./api";
 import { statusNames } from "./Conversation";
@@ -157,13 +157,17 @@ export function Sidebar({
       : (state.isHostConnected?.(id) ?? (id === hostId && connected))
         ? "connected"
         : "connecting");
+  const selectedIsPinned = state.pinned.some(
+    (s) =>
+      s.hostId === hostId && s.project_id === projectId && s.id === sessionId,
+  );
   useEffect(() => {
-    if (!projectId || sections.recent) return;
+    if (!projectId || sections.recent || selectedIsPinned) return;
     const key = `${hostId}:${projectId}`;
     setExpandedProjects((old) =>
       old[key] === undefined ? { ...old, [key]: true } : old,
     );
-  }, [hostId, projectId, sections.recent]);
+  }, [hostId, projectId, sections.recent, selectedIsPinned]);
   const recent = useRecentSessions(
     hosts
       .filter((host) => connectionStatus(host.id) === "connected")
@@ -365,7 +369,7 @@ export function Sidebar({
           aria-label={s.title}
           aria-description={`${sourceProject?.name ?? "项目"} · ${sourceHost?.name ?? s.hostId} · ${statusNames[s.status]}${liveState === "closed" ? "" : ` · ${liveLabel}`}`}
           onClick={() => {
-            if (list !== "recent")
+            if (list === "project")
               setExpandedProjects((old) => ({
                 ...old,
                 [`${s.hostId}:${s.project_id}`]: true,
@@ -393,9 +397,6 @@ export function Sidebar({
               </small>
             )}
           </span>
-          {list === "recent" && s.hostId !== "local" && (
-            <Globe2 size={12} className="recent-remote" aria-label="远程对话" />
-          )}
           <span className="row-status">
             {loadingLabel ? (
               <span
@@ -445,6 +446,8 @@ export function Sidebar({
                 aria-label="未读"
                 title="未读"
               />
+            ) : list === "recent" && s.hostId !== "local" ? (
+              <RemoteGlobeIcon className="recent-remote" />
             ) : null}
           </span>
         </button>
@@ -661,8 +664,11 @@ export function Sidebar({
               !loadingProjects[key] &&
               !projectErrors[key] &&
               noSessions;
-            const running = projectSessions.some((s) => s.status === "running");
-            const waiting = projectSessions.some((s) => s.status === "waiting");
+            const running = listedSessions.some((s) => s.status === "running");
+            const waiting = listedSessions.some((s) => s.status === "waiting");
+            const unreadCompleted = listedSessions.some(
+              (s) => s.status === "completed" && s.unread,
+            );
             const toggle = () => {
               setExpandedProjects((old) => ({ ...old, [key]: !expanded }));
               if (!expanded && !selected) void loadProjectSessions(p);
@@ -721,7 +727,11 @@ export function Sidebar({
                     >
                       <span className="project-folder">
                         {p.hostId !== "local" ? (
-                          <RemoteProjectIcon />
+                          <RemoteProjectIcon
+                            state={connectionState}
+                            label={`${projectHost} ${connectionLabel}`}
+                            title={`远程项目 · ${projectHost} · ${connectionLabel}${hostErrors[p.hostId] ? `：${hostErrors[p.hostId]}` : ""}`}
+                          />
                         ) : expanded ? (
                           <FolderOpen size={15} />
                         ) : (
@@ -734,13 +744,6 @@ export function Sidebar({
                           <span className="project-host-name">
                             {projectHost}
                           </span>
-                          <span
-                            className="project-connection-state"
-                            data-state={connectionState}
-                            role="img"
-                            aria-label={`${projectHost} ${connectionLabel}`}
-                            title={`${projectHost} · ${connectionLabel}${hostErrors[p.hostId] ? `：${hostErrors[p.hostId]}` : ""}`}
-                          />
                         </small>
                       )}
                       <span className="row-status">
@@ -762,6 +765,13 @@ export function Sidebar({
                               size={14}
                               role="img"
                               aria-label="项目中有对话等待确认"
+                            />
+                          ) : unreadCompleted ? (
+                            <span
+                              className="unread-dot project-activity"
+                              role="img"
+                              aria-label="项目中有未读完成回复"
+                              title="有已完成对话尚未阅读"
                             />
                           ) : null)}
                       </span>

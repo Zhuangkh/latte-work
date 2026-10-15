@@ -32,6 +32,11 @@ impl Store {
         CREATE INDEX IF NOT EXISTS subagents_session ON subagents(session_id,active,at);
         CREATE INDEX IF NOT EXISTS subagents_native ON subagents(session_id,native_id);
         CREATE INDEX IF NOT EXISTS subagents_tool ON subagents(session_id,tool_use_id);
+        CREATE TABLE IF NOT EXISTS subagent_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, task_id TEXT NOT NULL, at REAL NOT NULL, data TEXT NOT NULL, truncated INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
+        CREATE INDEX IF NOT EXISTS subagent_events_task ON subagent_events(session_id,task_id,seq);
+        CREATE TABLE IF NOT EXISTS subagent_history(session_id TEXT NOT NULL,task_id TEXT NOT NULL,source TEXT NOT NULL,seq REAL NOT NULL,at REAL NOT NULL,data TEXT NOT NULL,PRIMARY KEY(session_id,task_id,source,seq),FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
+        CREATE TABLE IF NOT EXISTS subagent_history_sources(session_id TEXT NOT NULL,task_id TEXT NOT NULL,cursor TEXT NOT NULL,PRIMARY KEY(session_id,task_id),FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
+        CREATE TABLE IF NOT EXISTS subagent_native_transcripts(session_id TEXT NOT NULL,task_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(session_id,task_id),FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
         CREATE INDEX IF NOT EXISTS events_session ON events(session_id,seq);
         CREATE INDEX IF NOT EXISTS events_recent_activity ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('user','text','tool','tool_result','approval','approval_resolved','subagent');
         CREATE TABLE IF NOT EXISTS turn_changes(session_id TEXT NOT NULL REFERENCES sessions(id), request_id TEXT NOT NULL REFERENCES requests(id), baseline TEXT, data TEXT, PRIMARY KEY(session_id,request_id));
@@ -326,11 +331,36 @@ impl Store {
             .map(|s| Ok(serde_json::from_str(&s)?))
             .collect()
     }
-    pub fn rename_session(&self, id: &str, title: &str) -> Result<Session> {
+    pub fn sync_live_native_title(&self, id: &str, title: &str) -> Result<Session> {
+        self.sync_native_title(id, title, false)
+    }
+    pub fn sync_native_title(&self, id: &str, title: &str, custom: bool) -> Result<Session> {
+        let mut session = self.session(id)?;
+        if title.trim().is_empty()
+            || title.chars().count() > 200
+            || title.chars().any(char::is_control)
+        {
+            return Ok(session);
+        }
+        if session.custom_title && !custom {
+            return Ok(session);
+        }
+        if session.title != title || (custom && !session.custom_title) {
+            session.title = title.into();
+            session.custom_title |= custom;
+            self.save(&session)?;
+        }
+        Ok(session)
+    }
+    pub fn validate_session_title(title: &str) -> Result<&str> {
         let title = title.trim();
         if title.is_empty() || title.chars().count() > 100 || title.chars().any(char::is_control) {
             bail!("会话名称不能为空、超过 100 个字符或包含控制字符");
         }
+        Ok(title)
+    }
+    pub fn rename_session(&self, id: &str, title: &str) -> Result<Session> {
+        let title = Self::validate_session_title(title)?;
         let mut session = self.session(id)?;
         session.title = title.into();
         session.custom_title = true;
@@ -407,6 +437,266 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+    pub fn subagent_event(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+        event: EventKind,
+    ) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        let task_id: String = tx.query_row("SELECT id FROM subagents WHERE session_id=?1 AND tool_use_id=?2 ORDER BY at DESC LIMIT 1", params![session_id, tool_use_id], |row| row.get(0)).optional()?.context("子智能体输出无法关联到原生任务")?;
+        // Keep the full redacted stream separately from the legacy bounded snapshot.
+        let seq: f64 = tx.query_row("SELECT COALESCE(MAX(seq),0)+1 FROM subagent_history WHERE session_id=?1 AND task_id=?2 AND source='stream'",params![session_id,task_id],|row| row.get(0))?;
+        tx.execute("INSERT INTO subagent_history(session_id,task_id,source,seq,at,data) VALUES (?1,?2,'stream',?3,?4,?5)",params![session_id,task_id,seq,now(),serde_json::to_string(&event)?])?;
+        if let EventKind::ToolResult { id, .. } = &event {
+            let tool:Option<String>=tx.query_row("SELECT data FROM subagent_history WHERE session_id=?1 AND task_id=?2 AND source='stream' AND json_extract(data,'$.kind')='tool' AND json_extract(data,'$.id')=?3 ORDER BY seq DESC LIMIT 1",params![session_id,task_id,id],|r|r.get(0)).optional()?;
+            if let Some(tool) = tool
+                && let Some(text) =
+                    crate::agents::confirmed_child_report(&serde_json::from_str(&tool)?, &event)
+            {
+                tx.execute("INSERT INTO subagent_history(session_id,task_id,source,seq,at,data) VALUES (?1,?2,'stream',?3,?4,?5)",params![session_id,task_id,seq+1.0,now(),serde_json::to_string(&EventKind::Text{text})?])?;
+            }
+        }
+        let (mut event, mut truncated) = bounded_subagent_event(event)?;
+        if let EventKind::Text { text } = &event {
+            let previous: Option<(i64, String, bool)> = tx.query_row("SELECT seq,data,truncated FROM subagent_events WHERE session_id=?1 AND task_id=?2 ORDER BY seq DESC LIMIT 1", params![session_id, task_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
+            if let Some((seq, data, partial)) = previous
+                && let EventKind::Text { text: mut joined } = serde_json::from_str(&data)?
+            {
+                if !partial {
+                    joined.push_str(text);
+                }
+                let bounded = bounded_subagent_event(EventKind::Text { text: joined })?;
+                event = bounded.0;
+                truncated |= partial || bounded.1;
+                tx.execute(
+                    "UPDATE subagent_events SET at=?2,data=?3,truncated=?4 WHERE seq=?1",
+                    params![seq, now(), serde_json::to_string(&event)?, truncated],
+                )?;
+                tx.commit()?;
+                return Ok(());
+            }
+        }
+        tx.execute("INSERT INTO subagent_events(session_id,task_id,at,data,truncated) VALUES (?1,?2,?3,?4,?5)", params![session_id, task_id, now(), serde_json::to_string(&event)?, truncated])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn subagent(&self, session_id: &str, task_id: &str) -> Result<Subagent> {
+        self.session(session_id)?;
+        let data: String = self
+            .db
+            .query_row(
+                "SELECT data FROM subagents WHERE session_id=?1 AND id=?2",
+                params![session_id, task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("此对话没有对应的子智能体")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+    pub fn native_subagent(&self, session_id: &str, native_id: &str) -> Result<Subagent> {
+        let data: String = self.db.query_row("SELECT data FROM subagents WHERE session_id=?1 AND (native_id=?2 OR id=?2) ORDER BY at DESC LIMIT 1", params![session_id,native_id], |row| row.get(0)).optional()?.context("子智能体原生记录不存在")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+    /// Bind historical native reads to the accepted request before this child
+    /// started. Only its digest is stored; credential snapshots stay ephemeral.
+    pub fn child_provider_fingerprint(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<Option<String>>> {
+        let task = self.subagent(session_id, task_id)?;
+        let Some(started) = task.started_at else {
+            return Ok(None);
+        };
+        self.db.query_row("SELECT r.provider_fingerprint FROM requests r JOIN events e ON e.session_id=r.session_id AND json_extract(e.data,'$.request_id')=r.id WHERE r.session_id=?1 AND json_extract(e.data,'$.kind')='user' AND e.at<=?2 ORDER BY e.seq DESC LIMIT 1",params![session_id,started],|row|row.get(0)).optional().map_err(Into::into)
+    }
+    pub fn child_history_cursor(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<crate::agents::ChildHistoryCursor> {
+        self.subagent(session_id, task_id)?;
+        let data: Option<String> = self
+            .db
+            .query_row(
+                "SELECT cursor FROM subagent_history_sources WHERE session_id=?1 AND task_id=?2",
+                params![session_id, task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        data.map(|s| serde_json::from_str(&s).map_err(Into::into))
+            .transpose()
+            .map(|c| c.unwrap_or_default())
+    }
+    pub fn cache_child_history(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        page: &crate::agents::ChildHistoryPage,
+    ) -> Result<()> {
+        self.subagent(session_id, task_id)?;
+        let tx = self.db.unchecked_transaction()?;
+        for e in &page.events {
+            if e.session_id != session_id {
+                bail!("子智能体过程会话身份不匹配");
+            }
+            tx.execute("INSERT INTO subagent_history(session_id,task_id,source,seq,at,data) VALUES (?1,?2,'native',?3,?4,?5) ON CONFLICT(session_id,task_id,source,seq) DO NOTHING",params![session_id,task_id,e.seq,e.at,serde_json::to_string(&e.event)?])?;
+        }
+        tx.execute("INSERT INTO subagent_history_sources(session_id,task_id,cursor) VALUES (?1,?2,?3) ON CONFLICT(session_id,task_id) DO UPDATE SET cursor=excluded.cursor WHERE json_extract(subagent_history_sources.cursor,'$.offset')<=json_extract(excluded.cursor,'$.offset')",params![session_id,task_id,serde_json::to_string(&page.cursor)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn subagent_history(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        after: Option<f64>,
+        requested_source: Option<&str>,
+        source_has_more: bool,
+    ) -> Result<latte_work_protocol::Response> {
+        self.subagent(session_id, task_id)?;
+        if after.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            bail!("子智能体事件游标无效");
+        }
+        let native:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM subagent_history_sources WHERE session_id=?1 AND task_id=?2) AND EXISTS(SELECT 1 FROM subagent_history WHERE session_id=?1 AND task_id=?2 AND source='native')",params![session_id,task_id],|r|r.get(0))?;
+        let stream:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM subagent_history WHERE session_id=?1 AND task_id=?2 AND source='stream')",params![session_id,task_id],|r|r.get(0))?;
+        if !native && !stream {
+            // Pre-upgrade snapshots are already redacted, but discarded fields
+            // cannot be recovered if the owning native context is unavailable.
+            let snapshot = self.subagent_transcript(session_id, task_id)?;
+            let (events, incomplete) = crate::agents::normalize_child_transcript(
+                &self.session(session_id)?.agent,
+                snapshot,
+            )?;
+            let after = if requested_source == Some("legacy") {
+                after
+            } else {
+                None
+            };
+            let mut page: Vec<Event> = events
+                .into_iter()
+                .filter(|e| e.seq > after.unwrap_or(-1.0))
+                .take(129)
+                .collect();
+            let has_more = page.len() > 128;
+            page.truncate(128);
+            let after = page.last().map(|e| e.seq).or(after);
+            return Ok(latte_work_protocol::Response::SubagentHistory {
+                events: page,
+                has_more,
+                after,
+                source_has_more: false,
+                incomplete,
+                source: "legacy".into(),
+            });
+        }
+        let source = if native { "native" } else { "stream" };
+        let after = if requested_source == Some(source) {
+            after
+        } else {
+            None
+        };
+        let mut statement=self.db.prepare("SELECT seq,at,data FROM subagent_history WHERE session_id=?1 AND task_id=?2 AND source=?3 AND seq>?4 ORDER BY seq ASC LIMIT 129")?;
+        let mut rows =
+            statement.query(params![session_id, task_id, source, after.unwrap_or(-1.0)])?;
+        let (mut events, mut bytes, mut has_more) = (Vec::new(), 0, false);
+        while let Some(row) = rows.next()? {
+            let data: String = row.get(2)?;
+            let size = data.len() + session_id.len() + 128;
+            if events.len() == 128 || (bytes + size > 256 * 1024 && !events.is_empty()) {
+                has_more = true;
+                break;
+            }
+            if size > latte_work_protocol::MAX_FRAME - 4096 {
+                bail!("单条子智能体事件超出传输范围，内容未截断");
+            }
+            bytes += size;
+            events.push(Event {
+                seq: row.get(0)?,
+                session_id: session_id.into(),
+                at: row.get(1)?,
+                event: serde_json::from_str(&data)?,
+            });
+        }
+        let after = events.last().map(|e| e.seq).or(after);
+        let cursor = self.child_history_cursor(session_id, task_id)?;
+        let incomplete = native
+            && ((cursor.has_more && !source_has_more)
+                || (cursor.pending_tail && !self.subagent(session_id, task_id)?.status.active()));
+        Ok(latte_work_protocol::Response::SubagentHistory {
+            events,
+            has_more,
+            after,
+            source_has_more,
+            incomplete,
+            source: source.into(),
+        })
+    }
+    pub fn cache_subagent_transcript(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        transcript: &crate::agents::ChildTranscript,
+    ) -> Result<()> {
+        self.subagent(session_id, task_id)?;
+        if transcript.0.iter().any(|e| e.session_id != session_id) {
+            bail!("子智能体过程会话身份不匹配");
+        }
+        let data = serde_json::to_string(transcript)?;
+        if data.len() > 512 * 1024 || transcript.0.len() > 500 {
+            bail!("子智能体过程超出缓存范围");
+        }
+        self.db.execute("INSERT INTO subagent_native_transcripts(session_id,task_id,data) VALUES (?1,?2,?3) ON CONFLICT(session_id,task_id) DO UPDATE SET data=excluded.data", params![session_id,task_id,data])?;
+        Ok(())
+    }
+    /// Bounded child snapshot; streaming fragments are coalesced on write.
+    pub fn subagent_transcript(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(Vec<Event>, bool)> {
+        self.session(session_id)?;
+        let cached: Option<String> = self
+            .db
+            .query_row(
+                "SELECT data FROM subagent_native_transcripts WHERE session_id=?1 AND task_id=?2",
+                params![session_id, task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(cached) = cached {
+            return Ok(serde_json::from_str(&cached)?);
+        }
+        let exists: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM subagents WHERE session_id=?1 AND id=?2)",
+            params![session_id, task_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            bail!("此对话没有对应的子智能体");
+        }
+        let mut statement = self.db.prepare("SELECT seq,at,data,truncated FROM subagent_events WHERE session_id=?1 AND task_id=?2 ORDER BY seq DESC LIMIT 501")?;
+        let mut rows = statement.query(params![session_id, task_id])?;
+        let (mut events, mut bytes, mut truncated) = (Vec::new(), 0, false);
+        while let Some(row) = rows.next()? {
+            let data: String = row.get(2)?;
+            if events.len() == 500 || bytes + data.len() + 128 > 256 * 1024 {
+                truncated = true;
+                break;
+            }
+            bytes += data.len() + 128;
+            truncated |= row.get::<_, bool>(3)?;
+            events.push(Event {
+                seq: row.get::<_, i64>(0)? as f64,
+                session_id: session_id.into(),
+                at: row.get(1)?,
+                event: serde_json::from_str(&data)?,
+            });
+        }
+        events.reverse();
+        Ok((events, truncated))
     }
     pub fn event(&self, id: &str, mut event: EventKind) -> Result<()> {
         let at = now();
@@ -909,6 +1199,55 @@ fn flush_history_text(events: &mut [Event], fragments: &mut Vec<String>) {
         *text = fragments.drain(..).rev().collect();
     }
 }
+pub(crate) fn bounded_subagent_event(mut event: EventKind) -> Result<(EventKind, bool)> {
+    fn clip(text: &mut String, limit: usize) -> bool {
+        if text.len() <= limit {
+            return false;
+        }
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n…（内容已截断）");
+        true
+    }
+    fn value(value: &mut serde_json::Value) -> Result<bool> {
+        let mut encoded = serde_json::to_string(value)?;
+        if encoded.len() <= 32 * 1024 {
+            return Ok(false);
+        }
+        clip(&mut encoded, 16 * 1024);
+        *value = serde_json::Value::String(encoded);
+        Ok(true)
+    }
+    let truncated = match &mut event {
+        EventKind::Text { text } | EventKind::Notice { text } => {
+            if serde_json::to_string(text)?.len() > 32 * 1024 {
+                clip(text, 16 * 1024);
+                true
+            } else {
+                false
+            }
+        }
+        EventKind::Tool { id, name, input } => {
+            if id.len() > 256 {
+                bail!("子智能体工具标识过长");
+            }
+            clip(name, 256) | value(input)?
+        }
+        EventKind::ToolResult { id, content, .. } => {
+            if id.len() > 256 {
+                bail!("子智能体工具标识过长");
+            }
+            value(content)?
+        }
+        EventKind::Progress { .. } => false,
+        _ => bail!("不支持的子智能体过程事件"),
+    };
+    Ok((event, truncated))
+}
+
 fn index_event(tx: &rusqlite::Transaction<'_>, session: &str, event: &EventKind) -> Result<()> {
     if let EventKind::Tool { id, name, .. } = event {
         return index_tool(tx, session, id, name);
@@ -969,6 +1308,287 @@ fn index_source(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_generated_titles_preserve_manual_names() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("titles.db")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        assert_eq!(
+            store
+                .sync_live_native_title(&session.id, "Generated")
+                .unwrap()
+                .title,
+            "Generated"
+        );
+        store.rename_session(&session.id, "Manual").unwrap();
+        let current = store
+            .sync_live_native_title(&session.id, "Later generated")
+            .unwrap();
+        assert_eq!(current.title, "Manual");
+        assert!(current.custom_title);
+        assert_eq!(
+            store
+                .sync_native_title(&session.id, "New manual", true)
+                .unwrap()
+                .title,
+            "New manual"
+        );
+    }
+    #[test]
+    fn subagent_transcripts_coalesce_streams_keep_aliases_and_survive_restart() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("children.db");
+        let store = Store::open(&path).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        for (native, tool) in [
+            ("tool:first", "first"),
+            ("native-first", "first"),
+            ("tool:second", "second"),
+        ] {
+            store
+                .event(
+                    &session.id,
+                    EventKind::Subagent {
+                        update: SubagentUpdate {
+                            id: native.into(),
+                            tool_use_id: Some(tool.into()),
+                            title: None,
+                            status: Some(SubagentStatus::Running),
+                            summary: None,
+                            last_tool: None,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let parent_count = store.events(&session.id, 0.0).unwrap().0.len();
+        for (tool, text) in [("first", "一"), ("second", "other"), ("first", "二")] {
+            store
+                .subagent_event(&session.id, tool, EventKind::Text { text: text.into() })
+                .unwrap();
+        }
+        let (first, truncated) = store
+            .subagent_transcript(&session.id, "tool:first")
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(first.len(), 1);
+        assert!(matches!(&first[0].event, EventKind::Text { text } if text == "一二"));
+        let second = store
+            .subagent_transcript(&session.id, "tool:second")
+            .unwrap()
+            .0;
+        assert!(matches!(&second[0].event, EventKind::Text { text } if text == "other"));
+        assert_eq!(
+            store.events(&session.id, 0.0).unwrap().0.len(),
+            parent_count
+        );
+        let other = store
+            .create_session(session.project_id.clone(), "claude".into())
+            .unwrap();
+        assert!(store.subagent_transcript(&other.id, "tool:first").is_err());
+        assert!(
+            store
+                .subagent_event(
+                    &other.id,
+                    "first",
+                    EventKind::Text {
+                        text: "wrong session".into()
+                    }
+                )
+                .is_err()
+        );
+        drop(store);
+        let restored = Store::open(&path).unwrap();
+        assert_eq!(
+            restored
+                .subagent_transcript(&session.id, "tool:first")
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        assert_eq!(
+            restored.subagents(&session.id).unwrap().0[0].status,
+            SubagentStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn full_child_stream_history_pages_without_losing_records_or_long_fields() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("history.db")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        store
+            .event(
+                &session.id,
+                EventKind::Subagent {
+                    update: SubagentUpdate {
+                        id: "child".into(),
+                        tool_use_id: Some("p".into()),
+                        title: None,
+                        status: Some(SubagentStatus::Running),
+                        summary: None,
+                        last_tool: None,
+                    },
+                },
+            )
+            .unwrap();
+        for i in 0..600 {
+            store
+                .subagent_event(
+                    &session.id,
+                    "p",
+                    EventKind::Tool {
+                        id: format!("tool-{i}"),
+                        name: "Read".into(),
+                        input: serde_json::json!({"text":"参数".repeat(100)}),
+                    },
+                )
+                .unwrap();
+        }
+        let report = "中文完整报告".repeat(20_000);
+        store
+            .subagent_event(
+                &session.id,
+                "p",
+                EventKind::Tool {
+                    id: "report".into(),
+                    name: "SubagentHandback".into(),
+                    input: serde_json::json!({"message":report}),
+                },
+            )
+            .unwrap();
+        store
+            .subagent_event(
+                &session.id,
+                "p",
+                EventKind::ToolResult {
+                    id: "report".into(),
+                    content: serde_json::json!("{\"success\":true}"),
+                    is_error: false,
+                },
+            )
+            .unwrap();
+        let mut after = None;
+        let mut found = Vec::new();
+        loop {
+            let response = store
+                .subagent_history(&session.id, "child", after, Some("stream"), false)
+                .unwrap();
+            assert!(serde_json::to_vec(&response).unwrap().len() < latte_work_protocol::MAX_FRAME);
+            let latte_work_protocol::Response::SubagentHistory {
+                events,
+                has_more,
+                after: next,
+                incomplete,
+                ..
+            } = response
+            else {
+                panic!("history");
+            };
+            assert!(!incomplete);
+            assert!(next > after);
+            found.extend(events);
+            after = next;
+            if !has_more {
+                break;
+            }
+        }
+        assert_eq!(found.len(), 603);
+        assert!(matches!(&found[600].event,EventKind::Tool{input,..} if input["message"]==report));
+        assert!(matches!(&found[602].event,EventKind::Text{text} if text==&report));
+        assert!(
+            store
+                .subagent_history(&session.id, "other", None, None, false)
+                .is_err()
+        );
+        assert!(
+            store
+                .subagent_history(&session.id, "child", Some(f64::NAN), None, false)
+                .is_err()
+        );
+        drop(store);
+        let reopened = Store::open(&dir.path().join("history.db")).unwrap();
+        assert!(
+            matches!(reopened.subagent_history(&session.id,"child",after,Some("stream"),false).unwrap(),latte_work_protocol::Response::SubagentHistory{events,has_more:false,..} if events.is_empty())
+        );
+    }
+
+    #[test]
+    fn subagent_transcripts_bound_content_and_records_without_inventing_results() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("children.db")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        store
+            .event(
+                &session.id,
+                EventKind::Subagent {
+                    update: SubagentUpdate {
+                        id: "child".into(),
+                        tool_use_id: Some("p".into()),
+                        title: None,
+                        status: Some(SubagentStatus::Running),
+                        summary: None,
+                        last_tool: None,
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .subagent_event(
+                &session.id,
+                "p",
+                EventKind::Text {
+                    text: "中".repeat(100_000),
+                },
+            )
+            .unwrap();
+        let (events, partial) = store.subagent_transcript(&session.id, "child").unwrap();
+        assert!(partial);
+        assert!(serde_json::to_vec(&events).unwrap().len() < 128 * 1024);
+        for i in 0..501 {
+            store
+                .subagent_event(
+                    &session.id,
+                    "p",
+                    EventKind::Tool {
+                        id: format!("t{i}"),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    },
+                )
+                .unwrap();
+        }
+        let (events, partial) = store.subagent_transcript(&session.id, "child").unwrap();
+        assert!(partial);
+        assert_eq!(events.len(), 500);
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e.event, EventKind::Tool { .. }))
+        );
+        assert!(
+            store
+                .subagent_event(
+                    &session.id,
+                    "p",
+                    EventKind::State {
+                        status: Status::Completed,
+                        message: None
+                    }
+                )
+                .is_err()
+        );
+    }
+
     #[test]
     fn recent_history_pages_all_visible_projects_and_ignores_read_metadata() {
         use super::*;

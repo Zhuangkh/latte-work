@@ -131,6 +131,16 @@ The existing send request ID, persistence, resume, cancellation and approval flo
 shared by native commands. Terminal-only commands absent from the native SDK catalog
 are not synthesized. Agent command effects and configuration scope remain native;
 Latte's explicit model/effort selections continue to apply on each launched turn.
+App-owned `/agents` (and listing aliases), `/model` and `/effort` are resolved before
+native command discovery or turn admission. The latter two open the existing model
+selector or effort submenu; they never change native configuration via a CLI command.
+These names are reserved across all Agents to keep one App navigation contract;
+unsupported selections report their capability error rather than forwarding the
+reserved name to a different native CLI.
+Arguments are retained in the draft with a menu-selection notice. A disabled/unready
+selector reports its reason without clearing the draft or stopping a running turn.
+Namespaced project commands remain native. The workbench send boundary also rejects
+model/effort commands if a caller bypasses composer navigation.
 
 The `@` picker reuses the server's bounded, canonical project-file listing for local
 and SSH hosts. It attaches relative path references for the Agent to read, not file
@@ -162,8 +172,13 @@ final-binary `effort_is_applied_on_launch_resume_and_reset` test.
 
 The composer requests `agent_permissions` from the execution host. Each adapter
 owns discovery, labels and launch mapping. Claude probes the installed CLI's
-`--help` (5-second / 128 KiB limits, shared probe concurrency limit); only known,
-advertised modes are offered. Account, model and managed-policy eligibility is
+`--help`; when a flag or its choices are hidden, an invalid-value `--permission-mode`
+probe with `--help` reads the CLI parser's own allowed choices without starting a
+session or sending a prompt. Each subprocess has 5-second / 128 KiB combined
+stdout/stderr limits and shares the probe concurrency limit. Only known modes
+explicitly listed by the installed CLI are offered; help omission or an exit code
+alone never implies support. See the [CLI reference](https://code.claude.com/docs/en/cli-reference),
+which notes that `--help` does not list every supported flag. Account, model and managed-policy eligibility is
 still enforced by the native Agent; rejection is surfaced, never replaced by a
 different mode. Unsupported adapters fail explicitly.
 
@@ -457,12 +472,64 @@ Child tools update child activity rather than the main-agent transcript/status.
 A main result does not finish its background children. Explicit process close
 marks children stopped only after process-group cleanup; process failure or daemon
 restart marks unfinished children unknown, including after a completed main turn.
+Live text streaming tracks at most 512 child IDs. On overflow, existing streams
+continue and new child streams wait for complete assistant messages/native history
+instead of failing the parent. Skipped streams never restart midway through their
+text; admission resets only at a new turn with no unfinished children or streams.
 Transport reconnect neither starts children nor replays their prompts.
 
 The conversation summary opens a closeable Subagents workspace tab, grouped by
 active, completed and other states. Selecting a task opens a separate named tab,
 keyed by stable child ID; repeated selection reuses it and leaves the list intact.
-The child tab shows its result, latest tool and duration without implementation IDs.
+The child tab reads dedicated `subagent_history` forward pages. Full redacted
+stdout events and native child records persist separately from parent events,
+joined by the task's stable ID. The legacy `subagent_transcript` bounded snapshot
+remains available for old clients, but its limits do not govern the child UI.
+History pages contain at most 128 events / roughly 256 KiB; a larger individual
+event remains intact within the protocol frame limit. The client reads successive
+pages while visible, including after completion, and joins the complete final
+answer before marking it final or folding the process. Hiding a tab stops further
+page reads; reopening or reconnecting resumes from persisted records without
+executing an Agent or replaying a prompt. Cursor progress is validated.
+Claude filters child text from parent stdout, so the owning Runtime also indexes
+its native JSONL from the beginning in forward pages. Paths derive only from the
+registered cwd, parent UUID and native child ID; output_file paths are ignored.
+Each scan reads about 512 KiB of complete records, individually bounded by the 2 MiB protocol frame with reserved envelope space;
+oversized or malformed records fail explicitly instead of being silently clipped
+or skipped. No-follow regular-file checks reject symlink directories and changed
+file identities. Every accepted record verifies parent/child/sidechain identity;
+hidden thinking blocks remain excluded. Partial last lines are retried after the
+producer appends a newline. SQLite persists the file cursor and redacted pending
+handback messages, so confirmations can cross page boundaries. A capture cannot
+regress a newer persisted cursor. Terminal notifications also index full pages
+under a three-second total budget before the original context can be replaced;
+subsequent visible reads continue an unfinished capture. After a runtime closes,
+the desktop can supply the same ephemeral Provider snapshot through the native
+client bridge. Recovery compares its digest with the accepted parent request
+before the child started; unknown or changed contexts only serve redacted caches.
+Matching historical reads index the original file without opening an Agent or
+replaying any request. Only a digest enters the durable request ledger.
+Successful native `SubagentHandback` delivery promotes its full `message` only
+after the matching result explicitly confirms success. Tool fields and final
+prose have no legacy 16 / 32 / 128 KiB clipping. Source credentials are redacted
+before storage. Pre-upgrade snapshots are still usable without execution; if
+fields were already discarded and the owning original record cannot be read,
+the UI explicitly marks missing source evidence instead of a display-size limit.
+Native reads have a three-second deadline and a shared two-reader limit; stopped
+runtimes serve persisted records or recover native pages only with a verified
+historical redaction context, without opening or replaying an Agent. No untrusted transcript paths are read. The visible child list refreshes independently of parent
+events, and active child transcripts use the same 650 ms polling gap as the main
+conversation. Reads are serialized; metadata revisions coalesce into one queued
+refresh without invalidating an in-flight read. Completion queues a final read
+and stops periodic polling. Hiding a tab stops its periodic reads; showing it
+refreshes immediately. Host/session/child/connection changes fence late responses,
+and recorded evidence survives read failures and reconnects. Successful completion folds the process by default
+and keeps the final native output visible; failed/unknown children retain their
+process evidence. The detail uses the main conversation layout, tool rows and
+reported-phase status row without a composer; scrolling up pauses following and
+offers the shared return-to-latest control. Tools without a result remain unconfirmed, never successful.
+Old histories without captured child events keep their native summary. Both the
+local client and remote host need the additive transcript request to use this view.
 Hiding or closing a child tab never stops execution. Child result envelopes cannot
 finish the parent turn. Trailing empty/duplicate success results while idle are
 ignored; result-only autonomous replies and actual failures remain visible.
@@ -471,12 +538,19 @@ The topbar Task Overview popover links to changes and subagents. The Sources
 section and source tabs are currently removed from the workspace UI. The source
 inventory and scoped preview APIs described below remain available on the host;
 Composer references continue to use their existing add and send flow.
-For advertised Claude `/agents`, `/list-agents` and `/tasks` commands, the adapter supplies an
-optional presentation hint. Selection fills the draft only. Bare `/agents`,
-`/list-agents` and `/tasks` submissions are desktop navigation: they open the local
-Subagents tab without dispatching a Claude command, creating a conversation or
-writing a user event. They clear only the command text and preserve references.
-Explicit command arguments still use native dispatch and its presentation hint.
+The desktop owns a single `/agents` (子智能体) navigation entry for every Agent.
+Native commands carrying the `subagents` presentation hint, and the reserved
+`/agents`, `/list-agents`, `/tasks` and `/subagents` aliases, collapse into this
+entry instead of exposing duplicate native wizard/list controls. The built-in
+entry remains usable if native catalog discovery fails. Selection fills the
+draft; submission opens the current conversation's Subagents tab without sending
+to the Agent, creating a conversation or writing a user event. Bare navigation
+clears only command text and preserves references. Arguments never reach the
+Agent: the panel opens with an explicit unsupported-arguments notice while the
+draft and references remain intact. Navigation works during active tasks and
+while disconnected; it never stops the Agent or changes its lifecycle state.
+Adapter-specific pasted navigation commands are routed after metadata discovery,
+with late results fenced by the current composer context.
 Unsupported commands are not added to the catalog. These controls observe native
 execution; individual child steering/stopping is not synthesized.
 
@@ -487,7 +561,8 @@ Native UI and actual model-driven Claude delegation remain separate evidence.
 `python3 scripts/smoke-subagents.py` uses the installed real Claude CLI with a
 disposable localhost Anthropic model fixture. It verifies actual foreground and
 background Agent execution, child Read isolation, terminal notifications,
-reconnect snapshots and advertised native listing commands without paid API calls.
+reconnect snapshots and native listing-command metadata without paid API calls.
+It never dispatches listing commands into the conversation used for UI checks.
 It does not verify a live model's delegation decisions. `--pause-for-ui` prints
 an isolated state directory and bounded release/finish markers for native UI checks.
 SDK lifecycle reference: [native task types](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py).
@@ -498,7 +573,10 @@ SDK lifecycle reference: [native task types](https://github.com/anthropics/claud
 Before the first accepted agent request spawns, the server stores a durable file
 baseline in the task database. The request is persisted first. Git-visible files
 (including tracked and untracked dirty files) are read without changing the index,
-refs or user files. Baselines are limited to 1,000 files, 512 KiB per file, 8 MiB
+refs or user files. Non-Git projects use a bounded recursive file inventory, skipping
+`.git`, `node_modules`, `target` and `.DS_Store` and refusing symlink traversal.
+This inventory visits at most 5,000 entries; edits, creations and deletions use the
+same saved before/after bytes and do not require Git repository metadata. Baselines are limited to 1,000 files, 512 KiB per file, 8 MiB
 total and 12 seconds. Unknown, oversized and symlink entries are explicitly partial;
 old tasks without a baseline never retroactively infer one. Task totals/diffs compare
 this baseline with the current worktree, regardless of staging or later commits.
@@ -506,6 +584,16 @@ This is temporal attribution: other writers in a shared directory can appear in
 these net changes. The UI provides separate task and workspace views.
 
 Explicit user reference manifests and actual native tool calls are indexed durably.
+The compact Composer manifest and legacy expanded manifest are both recognized;
+the compact form preserves paths/types and necessary attachment names/kinds while
+omitting repeated MIME and formatting metadata. Saved requests still contain the
+exact prompt dispatched to the Agent. The transcript extracts only valid complete
+App manifests for attachment presentation; arbitrary/malformed prose stays visible.
+Composer image chips and transcript thumbnails share an in-App image dialog and
+the existing host-scoped preview reader. No new preview protocol or filesystem
+permission is added. Visible image reads share a two-reader/64-waiter bound;
+hidden/off-screen readers stop starting chunks and release object URLs. The image
+dialog traps/restores focus, closes on scope changes and uses sniffed raster MIME.
 Tool-use IDs deduplicate calls, including child calls. MCP tool names identify
 connector groups; installed-but-unused connectors are never fabricated. Source
 inventories return at most 128 entries with a truncation flag.
@@ -592,3 +680,54 @@ Browser preference lives in `latte-work.link-target.v1` local storage (default
 created lazily when selected. Native IDs are per-mounted-pane, so first-send draft
 migration does not collide with a retained draft surface. Focused tests cover link
 routing, preference write failure, unsafe URL restoration and surface lifecycle.
+
+## Native session titles
+
+Agent-generated titles are host metadata, not UI-generated summaries. Claude's
+`session_title_changed` updates the saved Session without creating a turn.
+Manual Rename uses the running session's native `rename_session` control request
+and commits the displayed title only after acknowledgement. Rejection preserves
+the old title; timeout stays unconfirmed and does not replay the request. Closed
+sessions use the official SDK's append-only `custom-title` metadata format and
+read back the result; no Agent is launched and no user prompt is sent. Before a
+native session exists, the requested title is passed with `--name` at creation.
+
+Native metadata reads use the same host shell environment as execution, validate
+the exact native UUID, reject escaping/symlink session files, and read bounded
+64 KiB head/tail windows. Custom native titles take priority over generated titles.
+Metadata reads of closed sessions refresh sidebar/history titles; live sessions
+follow native events so stale transcript flushes cannot overwrite a rename.
+Closed-file reads are debounced per session/native identity for two seconds across
+all clients, with at most 2,048 entries. Repeated polls reuse the current database
+projection. External native renames appear at the next eligible metadata read;
+read results apply only if the native identity, title and custom-title state still
+match the original snapshot and no actor has opened in the meantime.
+These semantics are shared by local and SSH hosts. Unsupported native live rename
+returns an error instead of silently renaming only the Latte record.
+
+The unified change page uses an additive `git_commits` metadata read (50 first-parent
+commits per page). The returned head SHA pins subsequent offset pages; no fetch or
+Git mutation occurs. `GitReviewScope::Commit` compares a selected full commit SHA
+with its first parent, or the empty tree for a root commit. File reads use the
+resolved base/head from the summary, the same literal project path boundary and
+external-diff/textconv restrictions as branch review. Local and SSH use the same
+handler; older remote servers report unsupported history and need an update.
+Focused checks: `git_review::tests` and the final-binary
+`git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect` test.
+
+## Agent questions
+
+`AskUserQuestion` is translated inside the Claude adapter into generic `question`
+events, independently of tool approvals. It requires user input even in
+`bypassPermissions`: [native SDK user input](https://code.claude.com/docs/en/agent-sdk/user-input).
+The additive `answer_question` request submits selected option indices and optional
+free text, or null for an explicit skip. Answers are checked against the active
+session's single-use question ID before consumption; invalid or cross-session
+responses do not stop execution or consume the question. Original native questions
+are retained only in the actor; the adapter returns them with the answers mapping
+through `updatedInput`. Persisted question/resolution events are redacted, do not
+create a user turn and are not automatically replayed after a transport failure.
+Questions and approvals share the existing 32-interaction and process time bounds.
+Old servers cannot accept structured answers; the client offers an explicit update
+message and optional skip, never an empty approval. Focused final-binary check:
+`user_questions_are_not_permissions_and_answers_are_bound_single_use_and_persisted`.

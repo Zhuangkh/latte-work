@@ -78,6 +78,72 @@ it.each(["running", "waiting", "failed", "unknown"] as Status[])(
     ).toEqual([]);
   },
 );
+it("folds streamed progress when a turn completes", () => {
+  const rows = events(user("q"), text("progress"), tool, result, text("final"));
+  const content = (rows: Event[]) => (
+    <TurnTranscript events={rows}>
+      {(item) => (
+        <p key={item.key}>{item.type === "assistant" ? item.text : "record"}</p>
+      )}
+    </TurnTranscript>
+  );
+  const view = render(content(rows));
+  expect(screen.getByText("progress")).toBeTruthy();
+  view.rerender(
+    content([
+      ...rows,
+      ...events(state("completed")).map((e) => ({ ...e, seq: rows.length })),
+    ]),
+  );
+  expect(screen.queryByText("progress")).toBeNull();
+  expect(screen.getByText("final").closest("details")).toBeNull();
+  expect(screen.getByText("用时 0秒").closest("details")!.open).toBe(false);
+});
+it.each(["completion", "session"])(
+  "resets expansion for a new %s but preserves it for the same result",
+  (change) => {
+    const rows = events(
+      user("q"),
+      text("progress"),
+      tool,
+      result,
+      text("final"),
+      state("completed"),
+    );
+    const content = (rows: Event[]) => (
+      <TurnTranscript events={rows}>
+        {(item) => (
+          <p key={item.key}>
+            {item.type === "assistant" ? item.text : "record"}
+          </p>
+        )}
+      </TurnTranscript>
+    );
+    const view = render(content(rows));
+    const details = screen.getByText("用时 0秒").closest("details")!;
+    details.open = true;
+    fireEvent(details, new window.Event("toggle"));
+    view.rerender(content([...rows]));
+    expect(screen.getByText("progress")).toBeTruthy();
+    expect(details.open).toBe(true);
+    const next =
+      change === "session"
+        ? rows.map((e) => ({ ...e, session_id: "other" }))
+        : [
+            ...rows,
+            {
+              seq: rows.length,
+              session_id: "s",
+              at: rows.length,
+              event: state("completed"),
+            },
+          ];
+    view.rerender(content(next));
+    expect(screen.getByText("用时 0秒").closest("details")!.open).toBe(false);
+    expect(screen.queryByText("progress")).toBeNull();
+    expect(screen.getByText("final").closest("details")).toBeNull();
+  },
+);
 it("does not turn pre-tool commentary or incomplete history into a final answer", () => {
   expect(
     turnTranscript(
@@ -132,10 +198,10 @@ it("hides model metadata, preserves other notices and copies only the final answ
   expect(formatElapsed(-1)).toBe("执行过程");
 });
 it("keeps copy for a completed direct answer without a process", () => {
-  render(
-    <TurnTranscript
-      events={events(user("q"), text("final"), state("completed"))}
-    >
+  const rows = events(user("q"), text("final"), state("completed"));
+  rows[2].at = Date.parse("2026-10-13T08:35:00Z");
+  const view = render(
+    <TurnTranscript events={rows}>
       {(item) => (
         <span key={item.key}>
           {item.type === "assistant" ? item.text : null}
@@ -144,6 +210,31 @@ it("keeps copy for a completed direct answer without a process", () => {
     </TurnTranscript>,
   );
   expect(screen.getByRole("button", { name: "复制回复" })).toBeTruthy();
+  expect(view.container.querySelector("time")!.dateTime).toBe(
+    "2026-10-13T08:35:00.000Z",
+  );
+  view.rerender(
+    <TurnTranscript
+      events={[
+        ...rows,
+        {
+          seq: 3,
+          session_id: "s",
+          at: Date.parse("2026-10-14T08:35:00Z"),
+          event: { kind: "notice", text: "later metadata" },
+        },
+      ]}
+    >
+      {(item) => (
+        <span key={item.key}>
+          {item.type === "assistant" ? item.text : null}
+        </span>
+      )}
+    </TurnTranscript>,
+  );
+  expect(view.container.querySelector("time")!.dateTime).toBe(
+    "2026-10-13T08:35:00.000Z",
+  );
 });
 it("does not treat text before an approval-backed tool as a final answer", () => {
   const turns = turnTranscript(

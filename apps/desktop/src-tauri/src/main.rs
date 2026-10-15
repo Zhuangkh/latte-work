@@ -598,7 +598,10 @@ async fn host_request(
     }
     let response = if matches!(
         request,
-        Request::Models { .. } | Request::Send { .. } | Request::OpenAgentSession { .. }
+        Request::Models { .. }
+            | Request::Send { .. }
+            | Request::OpenAgentSession { .. }
+            | Request::SubagentHistory { .. }
     ) {
         let provider_host = host_id.clone();
         latte_work_client::request_with_app_provider(&client, request, |agent| async move {

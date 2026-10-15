@@ -4,11 +4,16 @@ use latte_work_protocol::{EventKind, FileEntry, SourceKind, TaskSource};
 use std::{path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 const MARKER: &str = "\n文件引用（相对路径基于当前项目根目录；绝对路径位于当前执行主机。仅引用路径，按当前权限读取）：\n";
+const COMPACT_MARKER: &str = "\n引用（相对项目；绝对路径在当前主机，按现有权限读取）：\n";
 pub fn references(text: &str) -> Vec<TaskSource> {
-    let Some(index) = text.rfind(MARKER) else {
+    let Some((index, marker)) = [MARKER, COMPACT_MARKER]
+        .into_iter()
+        .filter_map(|marker| text.rfind(marker).map(|index| (index, marker)))
+        .max_by_key(|(index, _)| *index)
+    else {
         return vec![];
     };
-    let Ok(serde_json::Value::Array(refs)) = serde_json::from_str(&text[index + MARKER.len()..])
+    let Ok(serde_json::Value::Array(refs)) = serde_json::from_str(&text[index + marker.len()..])
     else {
         return vec![];
     };
@@ -193,6 +198,27 @@ mod tests {
         assert_eq!(tool.kind, SourceKind::Connector);
         assert_eq!(tool.id, "connector:lark_docs");
         assert_eq!(tool.tools, vec!["mcp__lark_docs__read"]);
+    }
+    #[test]
+    fn compact_manifests_preserve_paths_and_original_names_without_mime_metadata() {
+        let sources = references(&format!(
+            "read{COMPACT_MARKER}{}",
+            serde_json::json!([
+                {"path":"/private/cache/uuid-image.png","type":"file","name":"image.png","kind":"image"},
+                {"path":"src/中文 \"file\".rs","type":"file"},
+                {"path":"src","type":"directory"}
+            ])
+        ));
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].name, "image.png");
+        assert_eq!(
+            sources[0].path.as_deref(),
+            Some("/private/cache/uuid-image.png")
+        );
+        assert_eq!(sources[0].mime_type, None);
+        assert_eq!(sources[1].name, "中文 \"file\".rs");
+        assert_eq!(sources[2].kind, SourceKind::Directory);
+        assert!(references(&format!("read{COMPACT_MARKER}[] trailing prose")).is_empty());
     }
     #[tokio::test]
     async fn preview_chunks_and_sniffs_content_without_rendering_html_or_svg() {

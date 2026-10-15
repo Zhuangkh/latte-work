@@ -1,6 +1,4 @@
 import { TurnChangesCard } from "./TurnChangesCard";
-import { SubagentSummary } from "./SubagentsPanel";
-import type { SubagentsState } from "./useSubagents";
 import { UserMessage } from "./UserMessage";
 import { WorkingStatus } from "./WorkingStatus";
 import {
@@ -10,6 +8,7 @@ import {
 import { modelSelectionScope } from "./modelSelectionScope";
 import { executionStatus } from "./executionStatus";
 import { hasRepeatedOutput } from "./repeatedOutput";
+import { QuestionCard } from "./QuestionCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { activityTranscript } from "./activity";
 import { ComposerAction } from "./ComposerAction";
@@ -31,21 +30,21 @@ import { Composer } from "./Composer";
 import { useAgentPreferences } from "./useAgentPreferences";
 import { PermissionPicker } from "./PermissionPicker";
 import { UsageIndicator } from "./UsageIndicator";
-import { ModelPicker } from "./ModelPicker";
+import { ModelPicker, type ModelPickerHandle } from "./ModelPicker";
 import { TaskProjectPicker } from "./TaskProjectPicker";
-import { TurnTranscript } from "./TurnTranscript";
+import { TurnTranscript, turnTranscript } from "./TurnTranscript";
+import { TurnNavigator, turnNavigationEntries } from "./TurnNavigator";
 import { ToolGroup, ToolRow } from "./ToolActivity";
 export const statusNames = {
   ready: "就绪",
   running: "执行中",
-  waiting: "等待审批",
+  waiting: "等待你的回应",
   completed: "已完成",
   failed: "执行失败",
   stopped: "已停止",
   unknown: "状态待确认",
 };
 interface Props {
-  subagents?: SubagentsState;
   openSubagents?: () => void;
   openTurnChanges?: (changes: TurnChanges, path?: string) => void;
   drafts: DraftStore;
@@ -86,9 +85,12 @@ interface Props {
   ) => Promise<boolean>;
   cancel: () => void | Promise<boolean>;
   approve: (id: string, allow: boolean) => Promise<void>;
+  answerQuestion?: (
+    id: string,
+    answers: import("./protocol").QuestionAnswer[] | null,
+  ) => Promise<void>;
 }
 export function Conversation({
-  subagents,
   openSubagents,
   openTurnChanges,
   drafts,
@@ -123,12 +125,14 @@ export function Conversation({
   send,
   cancel,
   approve,
+  answerQuestion,
 }: Props) {
   const draftKey = session ? JSON.stringify([hostId, session.id]) : "new-task";
   const draft = useDraft(drafts, draftKey);
   const text = draft.text;
   const setText = (text: string) => drafts.update(draftKey, { text });
   const root = useRef<HTMLElement>(null);
+  const modelPicker = useRef<ModelPickerHandle>(null);
   const [sending, setSending] = useState(false);
   const previousDraftKey = useRef(draftKey);
   const migrated = useRef<string | null>(null);
@@ -210,9 +214,29 @@ export function Conversation({
     connected &&
     (liveSessionState === "opening" || liveSessionState === "restoring");
   const [away, setAway] = useState(false);
+  const turns = useMemo(() => turnTranscript(events), [events]);
+  const turnEntries = useMemo(() => turnNavigationEntries(turns), [turns]);
+  const showTurnNavigation =
+    !preparingHistory &&
+    (turnEntries.length > 1 || (hasEarlierHistory && turnEntries.length > 0));
   const [stopping, setStopping] = useState(false);
   const stopGeneration = useRef(0);
   const active = session && ["running", "waiting"].includes(session.status);
+  const pendingQuestions = useMemo(
+    () =>
+      session && active && !session.archived && !preparingHistory
+        ? activityTranscript(
+            events.filter((event) => event.session_id === session.id),
+          ).flatMap((item) =>
+            item.type === "event" &&
+            item.value.kind === "question" &&
+            !item.resolved
+              ? [item.value]
+              : [],
+          )
+        : [],
+    [events, session, active, preparingHistory],
+  );
   const pendingApprovals = useMemo(
     () =>
       session && active && !session.archived && !preparingHistory
@@ -398,6 +422,30 @@ export function Conversation({
       setApproving((current) => (current === submission ? null : current));
     }
   }
+  async function answer(
+    id: string,
+    answers: import("./protocol").QuestionAnswer[] | null,
+  ) {
+    const key = JSON.stringify([draftKey, id]);
+    if (
+      !answerQuestion ||
+      !connected ||
+      stopping ||
+      submittingApproval ||
+      approvalSubmissions.current.has(key) ||
+      !pendingQuestions.some((question) => question.request_id === id)
+    )
+      return;
+    const submission = { scope: draftKey, id };
+    approvalSubmissions.current.add(key);
+    setApproving(submission);
+    try {
+      await answerQuestion(id, answers);
+    } finally {
+      approvalSubmissions.current.delete(key);
+      setApproving((current) => (current === submission ? null : current));
+    }
+  }
   const hostName = hosts.find((host) => host.id === hostId)?.name ?? "主机";
   useStatusIssues([
     {
@@ -443,7 +491,10 @@ export function Conversation({
       ref={root}
       data-preparing={!connected && (connecting || !connectionError)}
     >
-      <div className="conversation-history">
+      <div
+        className="conversation-history"
+        data-turn-navigation={showTurnNavigation}
+      >
         <div
           className={`conversation-scroll${events.length === 0 ? " empty" : ""}`}
           ref={scroller}
@@ -513,13 +564,19 @@ export function Conversation({
                   </button>
                 </div>
               )}
-              {subagents && openSubagents && (
-                <SubagentSummary state={subagents} open={openSubagents} />
-              )}
-              <TurnTranscript events={events}>
+              <TurnTranscript events={events} turns={turns}>
                 {(item) =>
                   item.type === "user" ? (
-                    <UserMessage key={item.key} text={item.text} at={item.at} />
+                    <UserMessage
+                      key={item.key}
+                      text={item.text}
+                      at={item.at}
+                      hostId={hostId}
+                      projectId={projectId}
+                      sessionId={session?.id}
+                      connected={connected}
+                      active={!settingsOpen && !preparingHistory}
+                    />
                   ) : item.type === "assistant" ? (
                     <article
                       className="assistant-message markdown"
@@ -550,6 +607,19 @@ export function Conversation({
                             }
                             changes={v.changes}
                             open={(path) => openTurnChanges(v.changes, path)}
+                          />
+                        );
+                      if (v.kind === "question")
+                        return (
+                          <QuestionCard
+                            key={item.key}
+                            request={v}
+                            resolved={item.resolved}
+                            answers={
+                              item.type === "event" ? item.answers : undefined
+                            }
+                            record
+                            onAnswer={() => {}}
                           />
                         );
                       if (v.kind === "approval")
@@ -597,6 +667,34 @@ export function Conversation({
             </div>
           )}
         </div>
+        {showTurnNavigation && (
+          <TurnNavigator
+            key={positionScope}
+            entries={turnEntries}
+            scroller={scroller}
+            onNavigate={(top) => {
+              follow.current = false;
+              setAway(true);
+              positions.set(positionScope, { top, follow: false });
+              scroller.current?.scrollTo({ top });
+            }}
+            hasEarlierHistory={hasEarlierHistory}
+            earlierHistoryLoading={earlierHistoryLoading}
+            onLoadEarlier={
+              loadEarlierHistory
+                ? () => {
+                    follow.current = false;
+                    setAway(true);
+                    positions.set(positionScope, {
+                      top: scroller.current?.scrollTop ?? 0,
+                      follow: false,
+                    });
+                    void loadEarlierHistory();
+                  }
+                : undefined
+            }
+          />
+        )}
       </div>
       <div className="composer-wrap">
         <div className="composer-context">
@@ -650,6 +748,29 @@ export function Conversation({
             <span>{agentName}</span>
           </span>
         </div>
+        {pendingQuestions.length > 0 && (
+          <section
+            className="approval-dock question-dock"
+            aria-label="待回答问题"
+          >
+            {pendingQuestions.map((question) => (
+              <QuestionCard
+                key={JSON.stringify([draftKey, question.request_id])}
+                request={question}
+                disabled={
+                  !connected ||
+                  stopping ||
+                  !!submittingApproval ||
+                  !answerQuestion
+                }
+                busy={submittingApproval === question.request_id}
+                onAnswer={(answers) =>
+                  void answer(question.request_id, answers)
+                }
+              />
+            ))}
+          </section>
+        )}
         {pendingApprovals.length > 0 && (
           <section className="approval-dock" aria-label="待审批操作">
             {pendingApprovals.length > 1 && (
@@ -686,6 +807,10 @@ export function Conversation({
           onChange={setText}
           onSubmit={submit}
           onOpenSubagents={openSubagents}
+          onOpenModelSettings={(target) =>
+            modelPicker.current?.openMenu(target) ??
+            (modelPicker.current ? null : "无法打开模型设置。")
+          }
           placeholder={
             !connected
               ? connecting || !connectionError
@@ -697,7 +822,7 @@ export function Conversation({
                   ? "描述任务，@ 添加引用，/ 调用 Agent 命令…"
                   : "先添加或选择一个项目"
           }
-          toolbar={(submit, hasContent) => (
+          toolbar={(submit, hasContent, localNavigation) => (
             <>
               <PermissionPicker
                 key={JSON.stringify([hostId, agentId])}
@@ -718,6 +843,7 @@ export function Conversation({
                 hidden={settingsOpen}
               />
               <ModelPicker
+                ref={modelPicker}
                 onReadyChange={setModelReadiness}
                 hostId={hostId}
                 projectId={projectId}
@@ -734,24 +860,35 @@ export function Conversation({
                 }
               />
               <ComposerAction
-                active={!!active}
+                active={!!active && !localNavigation}
+                label={
+                  localNavigation === "subagents"
+                    ? "打开子智能体"
+                    : localNavigation === "model"
+                      ? "选择模型"
+                      : localNavigation === "effort"
+                        ? "思考强度"
+                        : undefined
+                }
                 sending={sending}
                 disabled={
-                  active
-                    ? !connected
-                    : !!session?.archived ||
-                      !modelReady ||
-                      liveSessionState === "opening" ||
-                      liveSessionState === "restoring" ||
-                      liveSessionState === "error" ||
-                      liveSessionState === "unknown" ||
-                      !hasContent ||
-                      !projectName ||
-                      !connected ||
-                      !available ||
-                      sending
+                  localNavigation
+                    ? !!session?.archived || !projectName || sending
+                    : active
+                      ? !connected
+                      : !!session?.archived ||
+                        !modelReady ||
+                        liveSessionState === "opening" ||
+                        liveSessionState === "restoring" ||
+                        liveSessionState === "error" ||
+                        liveSessionState === "unknown" ||
+                        !hasContent ||
+                        !projectName ||
+                        !connected ||
+                        !available ||
+                        sending
                 }
-                onClick={active ? stop : submit}
+                onClick={active && !localNavigation ? stop : submit}
               />
             </>
           )}

@@ -743,6 +743,110 @@ it("keeps the reading anchor when older history is prepended without concealing 
   expect(el.getAttribute("aria-busy")).toBe("false");
 });
 
+it("pauses follow when jumping to a turn and removes the old rail during a conversation switch", async () => {
+  const p = props();
+  const positions = new Map<string, { top: number; follow: boolean }>();
+  const rows: Event[] = [
+    {
+      seq: 1,
+      at: 0,
+      session_id: "a",
+      event: { kind: "user", text: "较早问题", request_id: "one" },
+    },
+    {
+      seq: 2,
+      at: 1000,
+      session_id: "a",
+      event: { kind: "text", text: "较早回复" },
+    },
+    {
+      seq: 3,
+      at: 2000,
+      session_id: "a",
+      event: { kind: "state", status: "completed", message: null },
+    },
+    {
+      seq: 4,
+      at: 3000,
+      session_id: "a",
+      event: { kind: "user", text: "正在处理的问题", request_id: "two" },
+    },
+    {
+      seq: 5,
+      at: 4000,
+      session_id: "a",
+      event: { kind: "text", text: "最新过程" },
+    },
+  ];
+  const view = render(
+    <Conversation
+      {...p}
+      session={session("a")}
+      events={rows}
+      readingScope="a"
+      readingPositions={positions}
+    />,
+  );
+  const el = view.container.querySelector<HTMLDivElement>(
+    ".conversation-scroll",
+  )!;
+  Object.defineProperties(el, {
+    scrollHeight: { configurable: true, value: 1500 },
+    clientHeight: { configurable: true, value: 400 },
+  });
+  await waitFor(() =>
+    expect(screen.getByRole("navigation", { name: "对话轮次" })).toBeTruthy(),
+  );
+  const first = view.container.querySelector<HTMLElement>(
+    '[data-turn-key="a:1"]',
+  )!;
+  first.getBoundingClientRect = () => new DOMRect(0, -el.scrollTop, 500, 500);
+  el.getBoundingClientRect = () => new DOMRect(0, 0, 500, 400);
+  const scrollTo = vi
+    .spyOn(el, "scrollTo")
+    .mockImplementation((options?: ScrollToOptions | number) => {
+      if (typeof options === "object") el.scrollTop = options.top ?? 0;
+    });
+  fireEvent.click(screen.getByRole("button", { name: "跳转到：较早问题" }));
+  expect(positions.get("a")).toEqual({ top: 0, follow: false });
+  expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+  scrollTo.mockClear();
+  view.rerender(
+    <Conversation
+      {...p}
+      session={session("a")}
+      events={[
+        ...rows,
+        {
+          seq: 6,
+          at: 5000,
+          session_id: "a",
+          event: { kind: "text", text: "继续输出" },
+        },
+      ]}
+      readingScope="a"
+      readingPositions={positions}
+    />,
+  );
+  expect(scrollTo).not.toHaveBeenCalled();
+  fireEvent.mouseEnter(
+    screen.getByRole("button", { name: "跳转到：较早问题" }),
+  );
+  expect(screen.getByRole("tooltip")).toBeTruthy();
+  view.rerender(
+    <Conversation
+      {...p}
+      session={session("b")}
+      events={rows}
+      historyLoading
+      readingScope="b"
+      readingPositions={positions}
+    />,
+  );
+  expect(screen.queryByRole("navigation", { name: "对话轮次" })).toBeNull();
+  expect(screen.queryByRole("tooltip")).toBeNull();
+});
+
 it("opens the subagent panel instead of sending a chat message for list-agents", async () => {
   const state = props();
   const openSubagents = vi.fn();
@@ -758,4 +862,165 @@ it("opens the subagent panel instead of sending a chat message for list-agents",
   expect(openSubagents).toHaveBeenCalledOnce();
   expect(state.send).not.toHaveBeenCalled();
   expect(input().value).toBe("");
+});
+
+it.each(["running", "waiting", "completed"] as const)(
+  "opens local navigation during %s without sending or stopping the agent",
+  (status) => {
+    const state = props();
+    const openSubagents = vi.fn();
+    render(
+      <Conversation
+        {...state}
+        session={{ ...session("s"), status }}
+        openSubagents={openSubagents}
+      />,
+    );
+    fireEvent.change(input(), { target: { value: "/agents " } });
+    const button = screen.getByRole("button", { name: "打开子智能体" });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(button);
+    expect(openSubagents).toHaveBeenCalledOnce();
+    expect(state.send).not.toHaveBeenCalled();
+    expect(state.cancel).not.toHaveBeenCalled();
+    expect(input().value).toBe("");
+  },
+);
+
+it("opens the local panel even without a connected available agent", () => {
+  const state = props();
+  const openSubagents = vi.fn();
+  render(
+    <Conversation
+      {...state}
+      connected={false}
+      available={false}
+      agentSessionState="unknown"
+      session={session("s")}
+      openSubagents={openSubagents}
+    />,
+  );
+  fireEvent.change(input(), { target: { value: "/list-agents " } });
+  const button = screen.getByRole("button", { name: "打开子智能体" });
+  expect((button as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(button);
+  expect(openSubagents).toHaveBeenCalledOnce();
+  expect(state.send).not.toHaveBeenCalled();
+  expect(state.cancel).not.toHaveBeenCalled();
+});
+
+it("keeps a pending send disabled when polling reports running, then sends the next turn once", async () => {
+  const p = props();
+  let finish!: (value: boolean) => void;
+  p.send.mockImplementationOnce(
+    () =>
+      new Promise<boolean>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const view = render(<Conversation {...p} session={session("s")} />);
+  fireEvent.change(input(), { target: { value: "first" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+  view.rerender(
+    <Conversation {...p} session={{ ...session("s"), status: "running" }} />,
+  );
+  const pending = screen.getByRole("button", {
+    name: "正在发送任务",
+  }) as HTMLButtonElement;
+  expect(pending.disabled).toBe(true);
+  fireEvent.click(pending);
+  expect(p.cancel).not.toHaveBeenCalled();
+  expect(p.send).toHaveBeenCalledTimes(1);
+  await act(async () => finish(true));
+  view.rerender(
+    <Conversation {...p} session={{ ...session("s"), status: "completed" }} />,
+  );
+  fireEvent.change(input(), { target: { value: "second" } });
+  await act(async () =>
+    fireEvent.click(screen.getByRole("button", { name: "发送任务" })),
+  );
+  expect(p.send).toHaveBeenCalledTimes(2);
+  expect(p.send).toHaveBeenLastCalledWith(
+    "second",
+    null,
+    null,
+    null,
+    undefined,
+  );
+  expect(input().value).toBe("");
+});
+it("renders a question directly, submits once for its session and preserves panel navigation without a child summary card", async () => {
+  const p = props();
+  const answerQuestion = vi.fn();
+  let finish!: () => void;
+  answerQuestion.mockImplementation(
+    () =>
+      new Promise<void>((done) => {
+        finish = done;
+      }),
+  );
+  const question: Event = {
+    seq: 2,
+    at: 1,
+    session_id: "s",
+    event: {
+      kind: "question",
+      request_id: "question",
+      tool_use_id: null,
+      questions: [
+        {
+          id: "q0",
+          text: "选择输出格式",
+          header: "格式",
+          multi_select: false,
+          options: [
+            { label: "摘要", description: "简短" },
+            { label: "全文", description: "完整" },
+          ],
+        },
+      ],
+    },
+  };
+  const events: Event[] = [
+    {
+      seq: 1,
+      at: 0,
+      session_id: "s",
+      event: { kind: "user", text: "评估项目", request_id: "send" },
+    },
+    question,
+  ];
+  const openSubagents = vi.fn();
+  const view = render(
+    <Conversation
+      {...p}
+      session={{ ...session("s"), status: "waiting" }}
+      events={events}
+      answerQuestion={answerQuestion}
+      openSubagents={openSubagents}
+    />,
+  );
+  expect(screen.getByText("等待你的回答")).toBeTruthy();
+  expect(screen.queryByText(/是否允许/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "查看子智能体" })).toBeNull();
+  fireEvent.click(await screen.findByRole("radio", { name: /全文/ }));
+  fireEvent.click(screen.getByRole("button", { name: "提交回答" }));
+  fireEvent.click(screen.getByRole("button", { name: "正在提交…" }));
+  expect(answerQuestion).toHaveBeenCalledOnce();
+  expect(answerQuestion).toHaveBeenCalledWith("question", [
+    { question_id: "q0", option_indices: [1], text: null },
+  ]);
+  expect(p.approve).not.toHaveBeenCalled();
+  expect(p.send).not.toHaveBeenCalled();
+  view.rerender(
+    <Conversation
+      {...p}
+      session={{ ...session("other"), status: "running" }}
+      events={events}
+      answerQuestion={answerQuestion}
+      openSubagents={openSubagents}
+    />,
+  );
+  await act(async () => finish());
+  expect(screen.queryByRole("form", { name: "待回答问题" })).toBeNull();
 });

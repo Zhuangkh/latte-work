@@ -1,10 +1,21 @@
-import { useEffect, useState } from "react";
+import {
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type Ref,
+} from "react";
 import { request, message } from "./api";
 import { modelOptions } from "./modelOptions";
 import { modelSelectionScope } from "./modelSelectionScope";
-import { ModelSelector } from "./ModelSelector";
+import { ModelSelector, type ModelSelectorHandle } from "./ModelSelector";
 import type { Effort, Response } from "./protocol";
 import { useStatusIssues } from "./statusNotices";
+
+export interface ModelPickerHandle {
+  /** Null means opened; an error preserves the command draft. */
+  openMenu: (target: "model" | "effort") => string | null;
+}
 
 type Catalog = Extract<Response, { kind: "models" }>;
 export function ModelPicker({
@@ -20,6 +31,7 @@ export function ModelPicker({
   onEffortInvalid,
   disabled,
   onReadyChange,
+  ref,
 }: {
   hostId: string;
   projectId?: string;
@@ -33,7 +45,9 @@ export function ModelPicker({
   onEffortInvalid?: () => void;
   disabled: boolean;
   onReadyChange?: (state: { scope: string; ready: boolean }) => void;
+  ref?: Ref<ModelPickerHandle>;
 }) {
+  const selector = useRef<ModelSelectorHandle>(null);
   const scope = JSON.stringify([hostId, projectId, agent, value]);
   const [loaded, setCatalog] = useState<{ scope: string; catalog: Catalog }>();
   const catalog = loaded?.scope === scope ? loaded.catalog : undefined;
@@ -106,6 +120,20 @@ export function ModelPicker({
   useEffect(() => {
     onReadyChange?.({ scope: readyScope, ready });
   }, [readyScope, ready, onReadyChange]);
+  useImperativeHandle(
+    ref,
+    () => ({
+      openMenu(target) {
+        if (disabled) return "当前无法调整模型或思考强度，请在任务结束后选择。";
+        if (!connected) return "主机未连接，请连接后选择模型或思考强度。";
+        if (settingsOpen || !catalog) return "模型设置尚未就绪，请稍后重试。";
+        if (target === "effort" && !catalog?.effort_levels.length)
+          return "当前 Agent 或模型不支持调整思考强度。";
+        return selector.current?.openMenu(target) ? null : "无法打开模型设置。";
+      },
+    }),
+    [disabled, connected, settingsOpen, catalog],
+  );
   const options = modelOptions(
     catalog?.models ?? [],
     catalog?.model_labels,
@@ -123,6 +151,7 @@ export function ModelPicker({
   return (
     <div className="model-picker">
       <ModelSelector
+        ref={selector}
         value={providerFallback ?? value ?? ""}
         options={options}
         onChange={(id) => onChange(id || null)}

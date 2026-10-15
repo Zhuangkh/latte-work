@@ -61,6 +61,10 @@
   --color-stop-hover: #535353;
   --color-on-stop: #eeeeee;
   --color-brand: #f1f1f1;
+  --color-code-keyword: #cda4d7;
+  --color-code-string: #c4c998;
+  --color-code-number: #a7c6be;
+  --color-code-type: #dfbc85;
   --color-success: #75c99a;
   --color-warning: #e4b66a;
   --color-danger: #ef9090;

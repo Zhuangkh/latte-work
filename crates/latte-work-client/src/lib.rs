@@ -314,7 +314,9 @@ where
 {
     let agent = match &request {
         Request::Models { agent, .. } => agent.clone(),
-        Request::Send { session_id, .. } | Request::OpenAgentSession { session_id, .. } => {
+        Request::Send { session_id, .. }
+        | Request::OpenAgentSession { session_id, .. }
+        | Request::SubagentHistory { session_id, .. } => {
             match target
                 .lock()
                 .await
@@ -341,6 +343,7 @@ async fn request_with_snapshot(
 ) -> Result<Response> {
     let is_send = matches!(&request, Request::Send { .. });
     let is_open = matches!(&request, Request::OpenAgentSession { .. });
+    let is_history = matches!(&request, Request::SubagentHistory { .. });
     let request = match request {
         Request::Models {
             agent,
@@ -381,6 +384,23 @@ async fn request_with_snapshot(
                     .unwrap_or(latte_work_protocol::TurnProvider::Cli),
             ),
         },
+        Request::SubagentHistory {
+            session_id,
+            task_id,
+            after,
+            source,
+            ..
+        } => Request::SubagentHistory {
+            session_id,
+            task_id,
+            after,
+            source,
+            provider: Some(
+                snapshot
+                    .map(latte_work_protocol::TurnProvider::Snapshot)
+                    .unwrap_or(latte_work_protocol::TurnProvider::Cli),
+            ),
+        },
         _ => unreachable!(),
     };
     let response = target.lock().await.request(request).await?;
@@ -388,6 +408,7 @@ async fn request_with_snapshot(
         Response::Models { .. } if !is_send => Ok(response),
         Response::Accepted { .. } if is_send => Ok(response),
         Response::Ok if is_open => Ok(response),
+        Response::SubagentHistory { .. } if is_history => Ok(response),
         Response::Error { .. } => Ok(response),
         _ => bail!("远程执行响应格式不匹配"),
     }

@@ -1,29 +1,64 @@
 import { CopyButton } from "./MessageContent";
+import { MessageTimestamp } from "./MessageTimestamp";
+import { useMemo } from "react";
+import { FileText, Folder } from "lucide-react";
+import { AttachmentImage } from "./AttachmentImage";
+import { referenceKind, referenceMessage } from "./referenceMessage";
 
-export function UserMessage({ text, at }: { text: string; at: number }) {
-  const sent = new Date(at);
-  const valid = Number.isFinite(sent.getTime());
-  const label = valid
-    ? new Intl.DateTimeFormat("zh-CN", { weekday: "long" }).format(sent) +
-      new Intl.DateTimeFormat("zh-CN", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hourCycle: "h23",
-      }).format(sent)
-    : null;
+export function UserMessage({
+  text,
+  at,
+  hostId = "local",
+  projectId,
+  sessionId,
+  connected = false,
+  active = true,
+}: {
+  text: string;
+  at: number;
+  hostId?: string;
+  projectId?: string;
+  sessionId?: string;
+  connected?: boolean;
+  active?: boolean;
+}) {
+  const content = useMemo(() => referenceMessage(text), [text]);
   return (
     <div className="user-message-group">
-      <div className="user-message">{text}</div>
+      {content.references.length > 0 && (
+        <div className="user-message-attachments" aria-label="消息附件">
+          {content.references.map((reference, index) =>
+            !reference.directory && referenceKind(reference) === "image" ? (
+              <AttachmentImage
+                key={`${reference.path}:${index}`}
+                reference={reference}
+                variant="thumbnail"
+                hostId={hostId}
+                projectId={projectId}
+                sessionId={sessionId}
+                connected={connected}
+                active={active}
+              />
+            ) : (
+              <span
+                key={`${reference.path}:${index}`}
+                className="user-file-reference"
+                title={reference.path}
+              >
+                {reference.directory ? (
+                  <Folder size={16} />
+                ) : (
+                  <FileText size={16} />
+                )}
+                <span>{reference.name}</span>
+              </span>
+            ),
+          )}
+        </div>
+      )}
+      {content.text && <div className="user-message">{content.text}</div>}
       <div className="user-message-meta">
-        {valid && (
-          <time
-            dateTime={sent.toISOString()}
-            title={sent.toLocaleString("zh-CN", { hour12: false })}
-            aria-label={`发送时间：${label}`}
-          >
-            {label}
-          </time>
-        )}
+        <MessageTimestamp at={at} label="发送时间" />
         <CopyButton text={text} label="复制消息" iconOnly />
       </div>
     </div>

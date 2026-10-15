@@ -182,3 +182,59 @@ it("selects conversation when the last resource closes in merged mode", () => {
     current: "",
   });
 });
+it("reuses a single review tab for historical turns and the overview, and migrates old duplicate tabs", async () => {
+  const { openTurnChanges, openWorkspaceResource, readWorkspace } =
+    await import("./workspaceState");
+  const key = crypto.randomUUID();
+  openTurnChanges(key, "session", "r1", 1, "one.ts");
+  openTurnChanges(key, "session", "r2", 2, "two.ts");
+  expect(readWorkspace(key).tabs).toEqual([
+    {
+      id: "diff",
+      kind: "diff",
+      requestId: "r2",
+      snapshotSessionId: "session",
+      snapshotAt: 2,
+      file: "two.ts",
+    },
+  ]);
+  openWorkspaceResource(key, "diff");
+  expect(readWorkspace(key).tabs).toEqual([{ id: "diff", kind: "diff" }]);
+  const restored = crypto.randomUUID();
+  localStorage.setItem(
+    "latte-work.conversation-workspace.v1:" + restored,
+    JSON.stringify({
+      tabs: [
+        { id: "diff", kind: "diff" },
+        {
+          id: "turnChanges:r1",
+          kind: "turnChanges",
+          requestId: "r1",
+          sessionId: "session",
+          title: "Old",
+        },
+        {
+          id: "turnChanges:r2",
+          kind: "turnChanges",
+          requestId: "r2",
+          sessionId: "session",
+          title: "Selected",
+          file: "two.ts",
+        },
+      ],
+      current: "turnChanges:r2",
+    }),
+  );
+  expect(readWorkspace(restored)).toMatchObject({
+    current: "diff",
+    tabs: [
+      {
+        id: "diff",
+        kind: "diff",
+        requestId: "r2",
+        snapshotSessionId: "session",
+        file: "two.ts",
+      },
+    ],
+  });
+});

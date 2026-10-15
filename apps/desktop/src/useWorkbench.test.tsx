@@ -1050,74 +1050,61 @@ it("assembles a split final reply before revealing history without reading unrel
   ).toHaveLength(2);
 });
 
-it("preserves native subagent commands with explicit arguments and opens their UI after successful send", async () => {
-  const previous = mocks.request.getMockImplementation()!;
-  mocks.request.mockImplementation(async (host, request: Request) =>
-    request.method === "send"
-      ? { kind: "accepted", duplicate: false }
-      : previous(host, request),
-  );
+it.each([
+  "/agents inspect",
+  "/list-agents all",
+  "/tasks 参数",
+  "/agents\n请继续检查",
+])(
+  "opens local navigation for %s without admitting a turn or discarding arguments",
+  async (text) => {
+    const hook = renderHook(useWorkbench);
+    await act(async () => {});
+    const before = hook.result.current.workspaceId;
+    mocks.request.mockClear();
+    let accepted = true;
+    await act(async () => {
+      accepted = await hook.result.current.send(
+        text,
+        null,
+        null,
+        null,
+        "subagents",
+      );
+    });
+    expect(accepted).toBe(false);
+    expect(hook.result.current.sessionId).toBe("");
+    expect(hook.result.current.workspaceId).toBe(before);
+    expect(hook.result.current.workspace).toMatchObject({
+      visible: true,
+      current: "subagents",
+    });
+    expect(hook.result.current.error).toContain("此命令不接受参数");
+    expect(mocks.request).not.toHaveBeenCalled();
+  },
+);
+
+it("treats adapter-provided UI hints as local navigation before any session creation", async () => {
   const hook = renderHook(useWorkbench);
   await act(async () => {});
-  await act(async () =>
-    hook.result.current.openSession({ ...session(), hostId: "local" }),
-  );
-  act(() =>
-    updateWorkspace(hook.result.current.workspaceId, {
-      tabs: [],
-      current: "",
-      visible: false,
-    }),
-  );
-  expect(hook.result.current.workspace.visible).toBe(false);
-  await act(async () =>
-    hook.result.current.send("/agents inspect", null, null, null, "subagents"),
-  );
-  expect(hook.result.current.workspace).toMatchObject({
-    visible: true,
-    current: "subagents",
-    conversationActive: false,
+  mocks.request.mockClear();
+  await act(async () => {
+    expect(
+      await hook.result.current.send(
+        "/native-list",
+        null,
+        null,
+        null,
+        "subagents",
+      ),
+    ).toBe(true);
   });
+  expect(hook.result.current.sessionId).toBe("");
+  expect(hook.result.current.workspace.current).toBe("subagents");
+  expect(mocks.request).not.toHaveBeenCalled();
 });
 
-it("opens the persisted new conversation for a command with arguments, and leaves failed sends closed", async () => {
-  const previous = mocks.request.getMockImplementation()!;
-  const id = crypto.randomUUID();
-  mocks.request.mockImplementation(async (host, request: Request) => {
-    if (request.method === "create_session")
-      return { kind: "session", session: { ...session(), id } };
-    if (request.method === "send")
-      return { kind: "accepted", duplicate: false };
-    return previous(host, request);
-  });
-  const hook = renderHook(useWorkbench);
-  await act(async () => {});
-  await act(async () =>
-    hook.result.current.send("/agents inspect", null, null, null, "subagents"),
-  );
-  expect(hook.result.current.sessionId).toBe(id);
-  expect(hook.result.current.workspace).toMatchObject({
-    visible: true,
-    current: "subagents",
-  });
-  act(() =>
-    updateWorkspace(hook.result.current.workspaceId, {
-      tabs: [],
-      current: "",
-      visible: false,
-    }),
-  );
-  mocks.request.mockImplementation(async (host, request: Request) => {
-    if (request.method === "send") throw new Error("native command failed");
-    return previous(host, request);
-  });
-  await act(async () =>
-    hook.result.current.send("/agents inspect", null, null, null, "subagents"),
-  );
-  expect(hook.result.current.workspace.visible).toBe(false);
-});
-
-it.each(["/list-agents", "/agents", "/tasks"])(
+it.each(["/list-agents", "/agents", "/tasks", "/subagents"])(
   "opens %s without creating a conversation or sending an agent request",
   async (command) => {
     const hook = renderHook(useWorkbench);
@@ -1155,3 +1142,20 @@ it("keeps the selected conversation and its status unchanged when opening the lo
   expect(hook.result.current.workspace.current).toBe("subagents");
   expect(mocks.request).not.toHaveBeenCalled();
 });
+
+it.each(["/model", "/effort high"])(
+  "guards %s before session persistence even if a caller bypasses the composer",
+  async (text) => {
+    const hook = renderHook(useWorkbench);
+    await act(async () => {});
+    mocks.request.mockClear();
+    await act(async () => {
+      expect(await hook.result.current.send(text, null, null, null)).toBe(
+        false,
+      );
+    });
+    expect(hook.result.current.sessionId).toBe("");
+    expect(hook.result.current.error).toContain("模型菜单");
+    expect(mocks.request).not.toHaveBeenCalled();
+  },
+);

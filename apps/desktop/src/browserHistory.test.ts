@@ -27,7 +27,8 @@ it("bounds persisted visits, updates titles, and rejects non-web entries", () =>
   clearBrowserHistory();
   updateBrowserVisitTitle("https://example.com/509", "Late page title");
   expect(readBrowserHistory()).toEqual([]);
-});
+  // The 510 full persistence cycles exercise the bound, not a latency budget.
+}, 20_000);
 it("retains saved records and unrelated settings when storage writes fail", () => {
   recordBrowserVisit("https://example.com");
   localStorage.setItem("latte-work.link-target.v1", "system");

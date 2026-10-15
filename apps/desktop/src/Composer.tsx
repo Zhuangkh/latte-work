@@ -10,7 +10,6 @@ import {
   ArrowLeft,
   ChevronRight,
   FileText,
-  Image,
   FileVideo,
   Folder,
   Plus,
@@ -22,7 +21,13 @@ import type { AgentSlashCommand, FileEntry } from "./protocol";
 import {
   commandTitle,
   composerTrigger,
-  isSubagentPanelCommand,
+  appCommandAction,
+  type AppCommandAction,
+  hasCommandArguments,
+  isNativeSubagentCommand,
+  subagentPanelAliases,
+  subagentPanelArgumentNotice,
+  unifiedComposerCommands,
   referencePrompt,
   type ComposerTrigger,
 } from "./composerActions";
@@ -35,6 +40,8 @@ import {
   storePastedFile,
   type ComposerReference,
 } from "./pasteAttachments";
+import { AttachmentImage } from "./AttachmentImage";
+import { referenceKind } from "./referenceMessage";
 
 interface Props {
   referenceState?: { scope: string; entries: ComposerReference[] };
@@ -55,7 +62,12 @@ interface Props {
   placeholder: string;
   onSubmit: (prompt: string, uiAction?: "subagents") => Promise<boolean>;
   onOpenSubagents?: () => void;
-  toolbar: (submit: () => void, hasContent: boolean) => ReactNode;
+  onOpenModelSettings?: (target: "model" | "effort") => string | null;
+  toolbar: (
+    submit: () => void,
+    hasContent: boolean,
+    localNavigation: AppCommandAction | null,
+  ) => ReactNode;
 }
 type Option = {
   id: string;
@@ -312,18 +324,24 @@ export function Composer(props: Props) {
     replaceTrigger(`/${name} `);
     close();
   }
+  const panelAliases = [
+    ...subagentPanelAliases,
+    ...commands.filter(isNativeSubagentCommand).map((command) => command.name),
+  ];
+  const localNavigation = appCommandAction(value, commands);
   const options: Option[] =
     mode === "commands"
-      ? commands
+      ? unifiedComposerCommands(commands)
           .filter((item) =>
-            `${item.name} ${commandTitle(item, agent)} ${item.description}`
+            `${item.name} ${commandTitle(item, agent)} ${item.description} ${item.ui_action === "subagents" ? panelAliases.join(" ") : ""}`
               .toLowerCase()
               .includes(query.toLowerCase()),
           )
           .sort(
             (a, b) =>
               Number(b.name.toLowerCase() === query.toLowerCase()) -
-              Number(a.name.toLowerCase() === query.toLowerCase()),
+                Number(a.name.toLowerCase() === query.toLowerCase()) ||
+              Number(!!b.ui_action) - Number(!!a.ui_action),
           )
           .map((item) => ({
             id: item.name,
@@ -495,13 +513,8 @@ export function Composer(props: Props) {
   }
   async function submit() {
     if (disabled || sending || submitting.current || pasteBusy.current) return;
-    if (isSubagentPanelCommand(value, agent)) {
-      close();
-      if (props.onOpenSubagents) {
-        props.onOpenSubagents();
-        onChange("");
-        setNotice("");
-      } else setNotice("无法打开子智能体面板");
+    if (localNavigation) {
+      openAppCommand(localNavigation);
       return;
     }
     if (value.trimStart().startsWith("/") && attached.length) {
@@ -534,11 +547,13 @@ export function Composer(props: Props) {
         )
           return;
       }
-      const uiAction = catalog.find(
-        (command) => command.name === nativeCommand,
-      )?.ui_action;
+      const uiAction = appCommandAction(value, catalog);
+      if (uiAction) {
+        openAppCommand(uiAction);
+        return;
+      }
       const prompt = referencePrompt(value, attached);
-      if (await (uiAction ? onSubmit(prompt, uiAction) : onSubmit(prompt))) {
+      if (await onSubmit(prompt)) {
         if (!props.referenceState && currentScope.current === owner)
           setReferences({ scope: owner, entries: [] });
         setNotice("");
@@ -547,6 +562,34 @@ export function Composer(props: Props) {
       if (currentScope.current === owner) setNotice(message(cause));
     } finally {
       submitting.current = false;
+    }
+  }
+  function openAppCommand(action: AppCommandAction) {
+    close();
+    if (action === "subagents") {
+      if (!props.onOpenSubagents) {
+        setNotice("无法打开子智能体面板");
+        return;
+      }
+      props.onOpenSubagents();
+    } else {
+      const error =
+        props.onOpenModelSettings?.(action) ??
+        (props.onOpenModelSettings ? null : "无法打开模型设置");
+      if (error) {
+        setNotice(error);
+        return;
+      }
+    }
+    if (hasCommandArguments(value))
+      setNotice(
+        action === "subagents"
+          ? subagentPanelArgumentNotice
+          : `已打开${action === "model" ? "模型" : "思考强度"}菜单；请在菜单中选择，输入内容已保留。`,
+      );
+    else {
+      onChange("");
+      setNotice("");
     }
   }
   function keys(event: React.KeyboardEvent) {
@@ -808,20 +851,33 @@ export function Composer(props: Props) {
         <div className="composer-references" aria-label="已添加项目引用">
           {attached.map((entry) => (
             <span key={entry.path} title={entry.path}>
-              {entry.directory ? (
-                <Folder size={14} />
-              ) : entry.attachmentKind === "image" ? (
-                <Image size={14} />
-              ) : entry.attachmentKind === "video" ? (
-                <FileVideo size={14} />
+              {!entry.directory && referenceKind(entry) === "image" ? (
+                <AttachmentImage
+                  reference={entry}
+                  variant="chip"
+                  hostId={hostId}
+                  projectId={projectId}
+                  sessionId={sessionId}
+                  connected={connected}
+                  active={!hidden}
+                  onOpen={close}
+                />
               ) : (
-                <FileText size={14} />
+                <>
+                  {entry.directory ? (
+                    <Folder size={14} />
+                  ) : entry.attachmentKind === "video" ? (
+                    <FileVideo size={14} />
+                  ) : (
+                    <FileText size={14} />
+                  )}
+                  <span>
+                    {entry.attachmentKind && !entry.directory
+                      ? `${attachmentLabels[entry.attachmentKind]} · ${entry.name}`
+                      : entry.path}
+                  </span>
+                </>
               )}
-              <span>
-                {entry.attachmentKind && !entry.directory
-                  ? `${attachmentLabels[entry.attachmentKind]} · ${entry.name}`
-                  : entry.path}
-              </span>
               <button
                 disabled={sending || pasting}
                 aria-label={`移除引用 ${entry.path}`}
@@ -927,6 +983,7 @@ export function Composer(props: Props) {
         {toolbar(
           () => void submit(),
           !pasting && (!!value.trim() || !!attached.length),
+          localNavigation,
         )}
       </div>
     </div>

@@ -10,6 +10,9 @@ export type WorkspaceTab = {
   | {
       id: string;
       kind: "files" | "diff" | "subagents";
+      requestId?: string;
+      snapshotSessionId?: string;
+      snapshotAt?: number | null;
       path?: string;
       file?: string;
     }
@@ -91,14 +94,21 @@ export function readWorkspace(key: string): WorkspaceState {
     const saved = JSON.parse(serialized ?? "null");
     if (saved && Array.isArray(saved.tabs)) {
       const ids = new Set<string>();
-      const tabs: WorkspaceTab[] = saved.tabs.filter((tab: WorkspaceTab) => {
+      let tabs: WorkspaceTab[] = saved.tabs.filter((tab: WorkspaceTab) => {
         if (!tab || typeof tab.id !== "string" || ids.has(tab.id)) return false;
         const valid =
           tab.kind === "files" ||
           tab.kind === "diff" ||
           tab.kind === "subagents"
             ? (tab.path === undefined || typeof tab.path === "string") &&
-              (tab.file === undefined || typeof tab.file === "string")
+              (tab.file === undefined || typeof tab.file === "string") &&
+              (tab.kind !== "diff" ||
+                tab.requestId === undefined ||
+                (typeof tab.requestId === "string" &&
+                  !!tab.requestId &&
+                  tab.requestId.length <= 256 &&
+                  typeof tab.snapshotSessionId === "string" &&
+                  !!tab.snapshotSessionId))
             : tab.kind === "browser"
               ? !!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
                   tab.id,
@@ -125,6 +135,34 @@ export function readWorkspace(key: string): WorkspaceState {
         if (valid) ids.add(tab.id);
         return valid;
       });
+      const reviewTabs = tabs.filter(
+        (tab) => tab.kind === "diff" || tab.kind === "turnChanges",
+      );
+      const review =
+        reviewTabs.find((tab) => tab.id === saved.current) ?? reviewTabs.at(-1);
+      if (review && reviewTabs.some((tab) => tab.kind === "turnChanges")) {
+        const unified: WorkspaceTab =
+          review.kind === "turnChanges"
+            ? {
+                id: "diff",
+                kind: "diff",
+                requestId: review.requestId,
+                snapshotSessionId: review.sessionId,
+                file: review.file,
+                hostId: review.hostId,
+                project: review.project,
+              }
+            : { ...review, id: "diff" };
+        tabs = tabs.flatMap((tab) =>
+          tab === reviewTabs[0]
+            ? [unified]
+            : reviewTabs.includes(tab)
+              ? []
+              : [tab],
+        );
+        if (reviewTabs.some((tab) => tab.id === saved.current))
+          saved.current = "diff";
+      }
       state = {
         tabs,
         current: tabs.some((t) => t.id === saved.current)
@@ -226,7 +264,11 @@ export function openWorkspaceResource(
   updateWorkspace(workspaceId, (state) => ({
     tabs: state.tabs.some((tab) => tab.id === kind)
       ? state.tabs.map((tab) =>
-          tab.id === kind ? { ...tab, ...location } : tab,
+          tab.id === kind
+            ? kind === "diff"
+              ? { id: kind, kind, ...location }
+              : { ...tab, ...location }
+            : tab,
         )
       : [...state.tabs, { id: kind, kind, ...location }],
     current: kind,
@@ -242,21 +284,24 @@ export function openTurnChanges(
   at: number | null,
   file?: string,
 ) {
-  const id = `turnChanges:${requestId}`;
-  const title = at
-    ? `变更 · ${new Date(at).toLocaleTimeString("zh-CN", { hour12: false })}`
-    : "本轮变更";
-  updateWorkspace(workspaceId, (state) => ({
-    tabs: state.tabs.some((tab) => tab.id === id)
-      ? state.tabs.map((tab) => (tab.id === id ? { ...tab, file } : tab))
-      : [
-          ...state.tabs,
-          { id, kind: "turnChanges", requestId, sessionId, title, file },
-        ],
-    current: id,
-    visible: true,
-    conversationActive: false,
-  }));
+  updateWorkspace(workspaceId, (state) => {
+    const tab: WorkspaceTab = {
+      id: "diff",
+      kind: "diff",
+      requestId,
+      snapshotSessionId: sessionId,
+      snapshotAt: at,
+      file,
+    };
+    return {
+      tabs: state.tabs.some((item) => item.id === "diff")
+        ? state.tabs.map((item) => (item.id === "diff" ? tab : item))
+        : [...state.tabs, tab],
+      current: "diff",
+      visible: true,
+      conversationActive: false,
+    };
+  });
 }
 
 export function openBrowser(workspaceId: string, value = "", newTab = false) {

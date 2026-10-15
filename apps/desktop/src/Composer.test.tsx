@@ -11,6 +11,7 @@ import {
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
 import { composerTrigger } from "./composerActions";
+import { referenceMessage } from "./referenceMessage";
 const pasteMocks = vi.hoisted(() => ({
   paths: vi.fn(),
   importFile: vi.fn(),
@@ -27,6 +28,7 @@ const mocks = vi.hoisted(() => ({
   send: vi.fn(),
   choose: vi.fn(),
   openSubagents: vi.fn(),
+  openModelSettings: vi.fn(),
 }));
 vi.mock("./api", () => ({
   request: mocks.request,
@@ -36,14 +38,16 @@ vi.mock("./api", () => ({
 function Harness({
   hostId = "remote",
   projectId = "p",
+  agent = "claude",
 }: {
   hostId?: string;
   projectId?: string;
+  agent?: string;
 }) {
   const [text, setText] = useState("");
   return (
     <Composer
-      agent="claude"
+      agent={agent}
       hostId={hostId}
       projectId={projectId}
       connected
@@ -54,6 +58,7 @@ function Harness({
       onChange={setText}
       onSubmit={mocks.send}
       onOpenSubagents={mocks.openSubagents}
+      onOpenModelSettings={mocks.openModelSettings}
       placeholder="任务"
       toolbar={(submit, content) => (
         <button disabled={!content} onClick={submit}>
@@ -78,6 +83,7 @@ beforeEach(() => {
     return 0;
   });
   mocks.send.mockResolvedValue(false);
+  mocks.openModelSettings.mockReset().mockReturnValue(null);
   mocks.choose.mockReset().mockResolvedValue(null);
   mocks.request.mockImplementation(async (_host, request) =>
     request.method === "agent_commands"
@@ -159,7 +165,11 @@ it("adds a file with spaces at the caret, preserves surrounding text and retries
   );
   fireEvent.click(screen.getByText("发送"));
   await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
-  expect(mocks.send.mock.calls[0][0]).toContain('"path": "src/中文 file.ts"');
+  expect(referenceMessage(mocks.send.mock.calls[0][0]).references).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ path: "src/中文 file.ts" }),
+    ]),
+  );
   expect(screen.getByRole("button", { name: /移除引用/ })).toBeTruthy();
   mocks.send.mockResolvedValue(true);
   fireEvent.click(screen.getByText("发送"));
@@ -299,10 +309,12 @@ it("references a local file or folder chosen outside the project without sending
   expect(mocks.send).not.toHaveBeenCalled();
   fireEvent.click(screen.getByText("发送"));
   await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
-  expect(mocks.send.mock.calls[0][0]).toContain(
-    '"path": "/outside/中文 file.txt"',
+  expect(referenceMessage(mocks.send.mock.calls[0][0]).references).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ path: "/outside/中文 file.txt" }),
+    ]),
   );
-  expect(mocks.send.mock.calls[0][0]).toContain("绝对路径位于当前执行主机");
+  expect(mocks.send.mock.calls[0][0]).toContain("绝对路径在当前主机");
 });
 it("resolves remote paths on the selected host and never opens a local chooser", async () => {
   mocks.request.mockResolvedValue({
@@ -500,34 +512,94 @@ it("keeps pasted text authoritative when a clipboard manager restores older file
   expect(pasteMocks.importFile).not.toHaveBeenCalled();
 });
 
-it("passes a native subagent UI action with exact pasted command arguments, without sending on selection", async () => {
+it("shows one local subagent entry and hides native listing variants", async () => {
   mocks.request.mockResolvedValue({
     kind: "agent_commands",
     commands: [
       {
         name: "agents",
-        description: "Native agents",
+        display_name: "Manage native agents",
+        description: "Native wizard",
+        argument_hint: "",
+        ui_action: "subagents",
+      },
+      {
+        name: "list-agents",
+        description: "Native list",
+        argument_hint: "",
+        ui_action: "subagents",
+      },
+      {
+        name: "tasks",
+        description: "Native tasks",
+        argument_hint: "",
+        ui_action: "subagents",
+      },
+      {
+        name: "native-list",
+        description: "Other adapter's native list",
+        argument_hint: "",
+        ui_action: "subagents",
+      },
+      { name: "compact", description: "压缩上下文", argument_hint: "" },
+    ],
+  });
+  render(<Harness agent="another" />);
+  type("/");
+  await waitFor(() => expect(mocks.request).toHaveBeenCalled());
+  await screen.findByRole("option", { name: /压缩上下文/ });
+  expect(screen.getAllByRole("option")).toHaveLength(4);
+  expect(
+    screen.getByRole("option", { name: /子智能体/ }).textContent,
+  ).toContain("/agents");
+  expect(
+    screen.queryByRole("option", {
+      name: /list-agents|Native wizard|Native list|Native tasks/,
+    }),
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("option", { name: /子智能体/ }));
+  expect(mocks.openSubagents).not.toHaveBeenCalled();
+  expect(mocks.send).not.toHaveBeenCalled();
+  mocks.request.mockClear();
+  fireEvent.click(screen.getByText("发送"));
+  expect(mocks.openSubagents).toHaveBeenCalledOnce();
+  expect(mocks.request).not.toHaveBeenCalled();
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+
+it("keeps local navigation available when native command discovery fails", async () => {
+  mocks.request.mockRejectedValue(new Error("catalog unavailable"));
+  render(<Harness agent="another" />);
+  type("/");
+  await screen.findByText(/catalog unavailable/);
+  fireEvent.click(screen.getByRole("option", { name: /子智能体/ }));
+  mocks.request.mockClear();
+  fireEvent.click(screen.getByText("发送"));
+  expect(mocks.openSubagents).toHaveBeenCalledOnce();
+  expect(mocks.request).not.toHaveBeenCalled();
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+
+it("does not submit an adapter-specific navigation command discovered from pasted text", async () => {
+  mocks.request.mockResolvedValue({
+    kind: "agent_commands",
+    commands: [
+      {
+        name: "native-list",
+        description: "",
         argument_hint: "",
         ui_action: "subagents",
       },
     ],
   });
-  render(<Harness />);
-  type("/ag");
-  await screen.findByRole("option", { name: /agents/ });
-  fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-  expect(mocks.send).not.toHaveBeenCalled();
-  type("/agents 保留原生参数");
+  render(<Harness agent="another" />);
+  type("/native-list ");
   fireEvent.click(screen.getByText("发送"));
-  await waitFor(() =>
-    expect(mocks.send).toHaveBeenCalledWith(
-      "/agents 保留原生参数",
-      "subagents",
-    ),
-  );
+  await waitFor(() => expect(mocks.openSubagents).toHaveBeenCalledOnce());
+  expect(mocks.send).not.toHaveBeenCalled();
 });
 
-it("discovers a fully pasted native command and fences a late discovery after changing projects", async () => {
+it("fences a late discovery of adapter-specific navigation after changing projects", async () => {
   let finish!: (value: unknown) => void;
   mocks.request.mockImplementation(
     () =>
@@ -536,22 +608,16 @@ it("discovers a fully pasted native command and fences a late discovery after ch
       }),
   );
   const view = render(<Harness />);
-  type("/agents 参数");
+  type("/native-list ");
   fireEvent.click(screen.getByText("发送"));
-  await waitFor(() =>
-    expect(mocks.request).toHaveBeenCalledWith("remote", {
-      method: "agent_commands",
-      agent: "claude",
-      project_id: "p",
-    }),
-  );
+  await waitFor(() => expect(mocks.request).toHaveBeenCalled());
   view.rerender(<Harness projectId="other" />);
   await act(async () =>
     finish({
       kind: "agent_commands",
       commands: [
         {
-          name: "agents",
+          name: "native-list",
           description: "",
           argument_hint: "",
           ui_action: "subagents",
@@ -559,8 +625,30 @@ it("discovers a fully pasted native command and fences a late discovery after ch
       ],
     }),
   );
+  expect(mocks.openSubagents).not.toHaveBeenCalled();
   expect(mocks.send).not.toHaveBeenCalled();
 });
+
+it.each([
+  "/agents inspect",
+  "/list-agents all",
+  "/tasks 参数",
+  "/agents\n请继续检查",
+])(
+  "never forwards navigation parameters in %s, and preserves the draft",
+  async (command) => {
+    render(<Harness agent="another" />);
+    type(command);
+    fireEvent.click(screen.getByText("发送"));
+    expect(mocks.openSubagents).toHaveBeenCalledOnce();
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(mocks.request).not.toHaveBeenCalled();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      command,
+    );
+    expect(screen.getByText(/此命令不接受参数/)).toBeTruthy();
+  },
+);
 
 it("prioritizes the exact native command over matches in other command descriptions", async () => {
   mocks.request.mockResolvedValue({
@@ -585,7 +673,7 @@ it("prioritizes the exact native command over matches in other command descripti
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
-it.each(["/list-agents", "/agents", "/tasks"])(
+it.each(["/list-agents", "/agents", "/tasks", "/subagents"])(
   "routes %s directly to the local panel without discovery or submission",
   async (command) => {
     render(<Harness />);
@@ -598,7 +686,7 @@ it.each(["/list-agents", "/agents", "/tasks"])(
   },
 );
 
-it("opens the local panel after selecting list-agents from the native menu", async () => {
+it("maps a typed native alias to the single local menu entry", async () => {
   mocks.request.mockResolvedValue({
     kind: "agent_commands",
     commands: [
@@ -612,7 +700,7 @@ it("opens the local panel after selecting list-agents from the native menu", asy
   });
   render(<Harness />);
   type("/list-ag");
-  await screen.findByRole("option", { name: /list-agents/ });
+  await screen.findByRole("option", { name: /子智能体/ });
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
   expect(mocks.openSubagents).not.toHaveBeenCalled();
   expect(mocks.send).not.toHaveBeenCalled();
@@ -633,5 +721,156 @@ it("preserves attached references when a local panel command clears only its tex
   expect(mocks.send).not.toHaveBeenCalled();
   expect(
     screen.getByRole("button", { name: "移除引用 README.md" }),
+  ).toBeTruthy();
+});
+
+it.each(["model", "effort"] as const)(
+  "routes /%s to App settings without discovery or submission",
+  (target) => {
+    render(<Harness agent="another" />);
+    type(` /${target}  `);
+    fireEvent.click(screen.getByText("发送"));
+    expect(mocks.openModelSettings).toHaveBeenCalledWith(target);
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(mocks.request).not.toHaveBeenCalled();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  },
+);
+
+it.each(["/model opus", "/effort high", "/model\n检查项目"])(
+  "never dispatches App command parameters in %s",
+  (command) => {
+    render(<Harness />);
+    type(command);
+    fireEvent.click(screen.getByText("发送"));
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect(mocks.request).not.toHaveBeenCalled();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      command,
+    );
+    expect(screen.getByText(/请在菜单中选择/)).toBeTruthy();
+  },
+);
+
+it("preserves the draft when the App model settings are unavailable", () => {
+  mocks.openModelSettings.mockReturnValue("当前 Agent 不支持调整思考强度。");
+  render(<Harness />);
+  type("/effort ");
+  fireEvent.click(screen.getByText("发送"));
+  expect(screen.getByText(/不支持调整思考强度/)).toBeTruthy();
+  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+    "/effort ",
+  );
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+
+it("unifies native model and effort entries while retaining namespaced project commands", async () => {
+  mocks.request.mockResolvedValue({
+    kind: "agent_commands",
+    commands: [
+      { name: "model", description: "native model", argument_hint: "<id>" },
+      {
+        name: "effort",
+        description: "native effort",
+        argument_hint: "<level>",
+      },
+      {
+        name: "project:model",
+        description: "project model",
+        argument_hint: "",
+      },
+    ],
+  });
+  render(<Harness />);
+  type("/");
+  await screen.findByRole("option", { name: /project model/ });
+  expect(screen.getAllByRole("option")).toHaveLength(4);
+  expect(
+    screen.queryByRole("option", { name: /native model|native effort/ }),
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("option", { name: /选择模型/ }));
+  expect(mocks.openModelSettings).not.toHaveBeenCalled();
+  fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+  expect(mocks.openModelSettings).toHaveBeenCalledWith("model");
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+
+it("opens App settings when command discovery fails and preserves references", async () => {
+  render(<Harness />);
+  type("@README");
+  fireEvent.click(await screen.findByRole("option", { name: /README.md/ }));
+  mocks.request.mockRejectedValue(new Error("catalog unavailable"));
+  type("/effort");
+  await screen.findByText(/catalog unavailable/);
+  fireEvent.click(screen.getByRole("option", { name: /思考强度/ }));
+  mocks.request.mockClear();
+  fireEvent.click(screen.getByText("发送"));
+  expect(mocks.openModelSettings).toHaveBeenCalledWith("effort");
+  expect(mocks.send).not.toHaveBeenCalled();
+  expect(mocks.request).not.toHaveBeenCalled();
+  expect(
+    screen.getByRole("button", { name: "移除引用 README.md" }),
+  ).toBeTruthy();
+});
+
+it("opens an attached image without sending or removing the draft and restores its trigger on close", async () => {
+  URL.createObjectURL = vi.fn(() => "blob:composer");
+  URL.revokeObjectURL = vi.fn();
+  mocks.request.mockResolvedValue({
+    kind: "source_preview",
+    mime_type: "image/png",
+    data: [137, 80, 78, 71],
+    size: 4,
+    next: 4,
+    has_more: false,
+  });
+  render(
+    <Composer
+      agent="claude"
+      hostId="remote"
+      projectId="p"
+      connected
+      disabled={false}
+      sending={false}
+      hidden={false}
+      value="这张图呢"
+      onChange={vi.fn()}
+      onSubmit={mocks.send}
+      placeholder="任务"
+      toolbar={() => null}
+      referenceState={{
+        scope: "remote:p:claude",
+        entries: [
+          {
+            name: "image.png",
+            path: "/remote/image.png",
+            directory: false,
+            attachmentKind: "image",
+          },
+        ],
+      }}
+      onReferencesChange={vi.fn()}
+    />,
+  );
+  const trigger = screen.getByRole("button", { name: "预览图片 image.png" });
+  fireEvent.click(trigger);
+  await screen.findByRole("img", { name: "image.png" });
+  expect(mocks.request).toHaveBeenCalledWith(
+    "remote",
+    expect.objectContaining({
+      method: "preview_source",
+      project_id: "p",
+      path: "/remote/image.png",
+    }),
+  );
+  expect(mocks.send).not.toHaveBeenCalled();
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  expect(document.activeElement).toBe(trigger);
+  expect(
+    (screen.getByRole("textbox", { name: "任务输入" }) as HTMLTextAreaElement)
+      .value,
+  ).toBe("这张图呢");
+  expect(
+    screen.getByRole("button", { name: "移除引用 /remote/image.png" }),
   ).toBeTruthy();
 });

@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
-import { CopyButton } from "./MessageContent";
+import { ReplyActions } from "./ReplyActions";
 import type { Event } from "./protocol";
 import { activityTranscript, type ActivityItem } from "./activity";
 
@@ -65,13 +65,16 @@ export function turnTranscript(events: Event[]) {
       !items.some(
         (item) =>
           item.type === "event" &&
-          item.value.kind === "approval" &&
+          (item.value.kind === "approval" || item.value.kind === "question") &&
           !item.resolved,
       );
     return {
-      key: events[0].seq,
+      key: `${events[0].session_id}:${events[0].seq}`,
+      outcomeKey: end?.seq,
       user,
+      status: end?.event.kind === "state" ? end.event.status : undefined,
       finalKey: hasFinal ? lastAssistant?.key : undefined,
+      finalAt: hasFinal ? end?.at : undefined,
       stopped,
       elapsed,
       process: stopped
@@ -88,19 +91,30 @@ export function turnTranscript(events: Event[]) {
   });
 }
 
+export type TranscriptTurn = ReturnType<typeof turnTranscript>[number];
+
 export function TurnTranscript({
   events,
+  turns: suppliedTurns,
   children,
 }: {
   events: Event[];
+  turns?: TranscriptTurn[];
   children: (item: ActivityItem) => ReactNode;
 }) {
-  const turns = useMemo(() => turnTranscript(events), [events]);
+  const turns = useMemo(
+    () => suppliedTurns ?? turnTranscript(events),
+    [events, suppliedTurns],
+  );
   return turns.map((turn) => (
-    <div className="conversation-turn" key={turn.key}>
+    <div
+      className="conversation-turn"
+      key={turn.key}
+      data-turn-key={turn.user ? turn.key : undefined}
+    >
       {turn.user && children(turn.user)}
       {turn.process.length > 0 && (
-        <LazyProcess>
+        <ProcessDisclosure key={turn.outcomeKey}>
           <summary
             title={turn.stopped ? "已执行的文件改动不会撤销。" : undefined}
           >
@@ -112,7 +126,7 @@ export function TurnTranscript({
               {turn.process.map(children)}
             </div>
           )}
-        </LazyProcess>
+        </ProcessDisclosure>
       )}
       {turn.stopped && turn.process.length === 0 && (
         <div className="turn-stop-summary" title="已执行的文件改动不会撤销。">
@@ -123,9 +137,7 @@ export function TurnTranscript({
         <Fragment key={item.key}>
           {children(item)}
           {item.key === turn.finalKey && item.type === "assistant" && (
-            <div className="final-reply-actions">
-              <CopyButton text={item.text} label="复制回复" iconOnly />
-            </div>
+            <ReplyActions text={item.text} at={turn.finalAt} />
           )}
         </Fragment>
       ))}
@@ -133,7 +145,11 @@ export function TurnTranscript({
   ));
 }
 
-function LazyProcess({ children }: { children: [ReactNode, () => ReactNode] }) {
+export function ProcessDisclosure({
+  children,
+}: {
+  children: [ReactNode, () => ReactNode];
+}) {
   const [open, setOpen] = useState(false);
   return (
     <details

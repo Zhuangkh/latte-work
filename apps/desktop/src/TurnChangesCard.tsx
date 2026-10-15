@@ -63,8 +63,7 @@ export function TurnChangesCard({
       if (mounted.current) setBusy(false);
     }
   }
-  if (!summary.entries.length && !summary.truncated && !summary.unavailable)
-    return null;
+  if (!summary.entries.length) return null;
   return (
     <section className="turn-changes-card" aria-label="本轮文件变更">
       <header>
@@ -152,7 +151,7 @@ export function TurnChangesCard({
             [
               changes.interrupted && "本轮中断，保留已记录的修改",
               changes.background_pending &&
-                "后台任务仍在执行，此处记录主任务结束时的修改",
+                "采集快照时后台任务尚未结束，此处保留当时的修改",
               summary.truncated && "部分文件超出采集范围",
             ]
               .filter(Boolean)

@@ -1,8 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { native } from "./api";
 import type { FileEntry, Request, Response } from "./protocol";
+import { attachmentKind, type AttachmentKind } from "./attachmentKinds";
+export {
+  attachmentKind,
+  attachmentLabels,
+  type AttachmentKind,
+} from "./attachmentKinds";
 
-export type AttachmentKind = "image" | "video" | "file" | "text";
 export interface ComposerReference extends FileEntry {
   attachmentKind?: AttachmentKind;
   mimeType?: string;
@@ -12,25 +17,6 @@ export const MAX_PASTE_FILE = 64 * 1024 * 1024;
 export function isLongPaste(text: string) {
   return text.length > 8000 || text.split("\n").length > 200;
 }
-export function attachmentKind(name: string, mime = ""): AttachmentKind {
-  if (
-    mime.startsWith("image/") ||
-    /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|avif|svg)$/i.test(name)
-  )
-    return "image";
-  if (
-    mime.startsWith("video/") ||
-    /\.(mp4|mov|webm|mkv|avi|m4v|mpeg|mpg)$/i.test(name)
-  )
-    return "video";
-  return "file";
-}
-export const attachmentLabels: Record<AttachmentKind, string> = {
-  image: "图片",
-  video: "视频",
-  file: "文件",
-  text: "粘贴文本",
-};
 export async function clipboardFilePaths(): Promise<string[]> {
   return native ? invoke("clipboard_file_paths") : [];
 }

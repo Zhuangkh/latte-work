@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
-import { executionStatus } from "./executionStatus";
+import { executionStatus, subagentExecutionStatus } from "./executionStatus";
 import { transcript } from "./transcript";
-import type { Event, EventKind, Session } from "./protocol";
+import type { Event, EventKind, Session, Subagent } from "./protocol";
 const session = { id: "s", status: "running" } as Session;
 const events = (...values: EventKind[]): Event[] =>
   values.map((event, i) => ({ seq: i, at: 0, session_id: "s", event }));
@@ -77,4 +77,42 @@ it("prioritizes confirmation, stopping, disconnect and terminal states", () => {
   );
   for (const status of ["completed", "failed", "stopped", "unknown"] as const)
     expect(executionStatus({ ...session, status }, thinking, true)).toBeNull();
+});
+
+it("shares actual phase and tool status with subagent conversations while terminal and disconnected states remain explicit", () => {
+  const child = { id: "child", status: "running" } as Subagent;
+  expect(subagentExecutionStatus(child, "s", [], true)).toBe("等待响应…");
+  expect(
+    subagentExecutionStatus(
+      child,
+      "s",
+      events({ kind: "progress", phase: "thinking" }),
+      true,
+    ),
+  ).toBe("正在思考…");
+  expect(
+    subagentExecutionStatus(
+      child,
+      "s",
+      events({ kind: "tool", id: "read", name: "Read", input: {} }),
+      true,
+    ),
+  ).toBe("正在读取文件…");
+  expect(
+    subagentExecutionStatus(
+      child,
+      "s",
+      events({ kind: "text", text: "hello" }),
+      true,
+    ),
+  ).toBe("正在回复…");
+  expect(
+    subagentExecutionStatus({ ...child, status: "completed" }, "s", [], true),
+  ).toBeNull();
+  expect(
+    subagentExecutionStatus({ ...child, status: "paused" }, "s", [], true),
+  ).toBe("已暂停");
+  expect(
+    subagentExecutionStatus({ ...child, status: "unknown" }, "s", [], false),
+  ).toBe("连接已断开，状态待确认");
 });

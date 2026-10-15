@@ -76,7 +76,24 @@ export default function App() {
     interactionLocked: sidebarInteraction || statusOpen,
     toggle: toggleSidebar,
   });
-  const subagents = useSubagents(hostId, session?.id, connected, events);
+  const subagents = useSubagents(
+    hostId,
+    session?.id,
+    connected,
+    events,
+    workbench.hostConnectionVersions?.[hostId] ?? 0,
+    workbench.workspace.visible &&
+      !(
+        workbench.workspace.expanded && workbench.workspace.conversationActive
+      ) &&
+      !workbench.modal &&
+      !workbench.passwordPrompt &&
+      workbench.workspace.tabs.some(
+        (tab) =>
+          tab.id === workbench.workspace.current &&
+          (tab.kind === "subagents" || tab.kind === "subagent"),
+      ),
+  );
   const lastTurn = latestTurnChanges(events);
   const lastTurnVersion = lastTurn
     ? JSON.stringify([
@@ -263,7 +280,6 @@ export default function App() {
             </div>
           </header>
           <Conversation
-            subagents={subagents}
             openSubagents={showSubagents}
             openTurnChanges={(changes, path) => {
               if (session)
@@ -334,6 +350,19 @@ export default function App() {
               } catch (e) {
                 setError(message(e));
                 return false;
+              }
+            }}
+            answerQuestion={async (id, answers) => {
+              if (!session) return;
+              try {
+                await request(hostId, {
+                  method: "answer_question",
+                  session_id: session.id,
+                  request_id: id,
+                  answers,
+                });
+              } catch (e) {
+                setError(message(e));
               }
             }}
             approve={async (id, allow) => {

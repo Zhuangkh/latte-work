@@ -1,15 +1,22 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { parseDiff, splitDiff } from "./gitDiff";
+import { CodeSyntax } from "./CodeSyntax";
 export function ReviewDiff({
   content,
   split,
   wrap = false,
+  path,
 }: {
   content: string;
   split: boolean;
   wrap?: boolean;
+  path?: string;
 }) {
-  const parsed = useMemo(() => parseDiff(content), [content]);
+  const [displayed, showMore] = useState(4000);
+  const parsed = useMemo(
+    () => parseDiff(content, Number.POSITIVE_INFINITY),
+    [content],
+  );
   const lines = useMemo(
     () =>
       parsed.lines.some((line) => line.kind === "hunk")
@@ -21,12 +28,36 @@ export function ReviewDiff({
         : parsed.lines,
     [parsed.lines],
   );
-  const rows = useMemo(() => splitDiff(lines), [lines]);
+  const headings = useMemo(() => {
+    const labels = new Map<string, string>();
+    let previousOld = 0;
+    for (const line of lines) {
+      if (line.kind === "hunk") {
+        const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)/.exec(
+          line.text,
+        );
+        if (hunk) {
+          const unchanged = Math.max(0, Number(hunk[1]) - previousOld - 1);
+          labels.set(
+            line.text,
+            `${unchanged ? `${unchanged} 行未修改 · ` : ""}原文件第 ${hunk[1]} 行 · 新文件第 ${hunk[3]} 行${hunk[5] ? ` ·${hunk[5]}` : ""}`,
+          );
+        }
+      }
+      if (line.old !== null) previousOld = line.old;
+    }
+    return labels;
+  }, [lines]);
+  const shown = lines.slice(0, displayed);
+  const rows = useMemo(() => splitDiff(shown), [lines, displayed]);
+  function code(text: string) {
+    return <CodeSyntax text={text || " "} path={path} />;
+  }
+  function contextHeading(text: string) {
+    return headings.get(text) ?? text;
+  }
   return (
     <>
-      {parsed.truncated && (
-        <p className="panel-notice">仅显示前 4000 行差异，请缩小比较范围。</p>
-      )}
       <div
         className={`review-diff${split ? " split" : ""}${wrap ? " wrap" : ""}`}
         role="region"
@@ -40,7 +71,7 @@ export function ReviewDiff({
                   className={`review-diff-heading ${row.heading.kind}`}
                   key={i}
                 >
-                  <code>{row.heading.text}</code>
+                  <code>{contextHeading(row.heading.text)}</code>
                 </div>
               ) : (
                 <div className="review-split-row" key={i}>
@@ -48,32 +79,46 @@ export function ReviewDiff({
                     className={`review-diff-cell ${row.left?.kind ?? "blank"}`}
                   >
                     <span aria-hidden="true">{row.left?.old}</span>
-                    <code>{row.left?.text || " "}</code>
+                    <code>{code(row.left?.text ?? "")}</code>
                   </div>
                   <div
                     className={`review-diff-cell ${row.right?.kind ?? "blank"}`}
                   >
                     <span aria-hidden="true">{row.right?.next}</span>
-                    <code>{row.right?.text || " "}</code>
+                    <code>{code(row.right?.text ?? "")}</code>
                   </div>
                 </div>
               ),
             )
-          : lines.map((line, i) => (
+          : shown.map((line, i) => (
               <div className={`review-unified-row ${line.kind}`} key={i}>
-                <span aria-hidden="true">{line.old}</span>
-                <span aria-hidden="true">{line.next}</span>
+                <span
+                  aria-hidden="true"
+                  title={`原文件 ${line.old ?? "—"} · 新文件 ${line.next ?? "—"}`}
+                >
+                  {line.kind === "removed" ? line.old : (line.next ?? line.old)}
+                </span>
                 <code>
                   {line.kind === "added"
                     ? "+"
                     : line.kind === "removed"
                       ? "−"
                       : " "}
-                  {line.text || " "}
+                  {line.kind === "hunk"
+                    ? contextHeading(line.text)
+                    : code(line.text)}
                 </code>
               </div>
             ))}
       </div>
+      {displayed < lines.length && (
+        <button
+          className="review-show-more"
+          onClick={() => showMore((n) => n + 4000)}
+        >
+          显示更多差异（还有 {lines.length - displayed} 行）
+        </button>
+      )}
     </>
   );
 }

@@ -1,4 +1,10 @@
-import type { Event, ExecutionPhase, Session } from "./protocol";
+import type {
+  Event,
+  ExecutionPhase,
+  Session,
+  Subagent,
+  Status,
+} from "./protocol";
 
 /** Derive only from this turn's reported events; silence is never thinking. */
 export function executionStatus(
@@ -8,12 +14,58 @@ export function executionStatus(
   stopping = false,
 ): string | null {
   if (!session || !["running", "waiting"].includes(session.status)) return null;
+  return reportedExecutionStatus(
+    session.status,
+    session.id,
+    events,
+    connected,
+    stopping,
+  );
+}
+
+export function subagentExecutionStatus(
+  task: Subagent,
+  sessionId: string,
+  events: Event[],
+  connected: boolean,
+): string | null {
+  if (task.status === "unknown")
+    return connected ? "状态待确认" : "连接已断开，状态待确认";
+  if (task.status === "paused")
+    return connected ? "已暂停" : "连接已断开，状态待确认";
+  if (task.status !== "running") return null;
+  return reportedExecutionStatus("running", sessionId, events, connected);
+}
+
+function reportedExecutionStatus(
+  status: Status,
+  sessionId: string,
+  events: Event[],
+  connected: boolean,
+  stopping = false,
+) {
   if (!connected) return "连接已断开，状态待确认";
   if (stopping) return "正在停止…";
-  if (session.status === "waiting") return "等待你的确认";
+  if (status === "waiting") {
+    const questions = new Set<string>();
+    for (const { event } of events.filter(
+      (event) => event.session_id === sessionId,
+    )) {
+      if (
+        event.kind === "user" ||
+        (event.kind === "state" &&
+          !["running", "waiting"].includes(event.status))
+      )
+        questions.clear();
+      if (event.kind === "question") questions.add(event.request_id);
+      if (event.kind === "question_resolved")
+        questions.delete(event.request_id);
+    }
+    return questions.size ? "等待你的回答" : "等待你的确认";
+  }
   let phase: ExecutionPhase = "waiting";
   const pending = new Map<string, string>();
-  for (const { event } of events.filter((e) => e.session_id === session.id)) {
+  for (const { event } of events.filter((e) => e.session_id === sessionId)) {
     // Events may arrive across a navigation boundary.
     // Caller's session scope must match before consuming them.
     if (

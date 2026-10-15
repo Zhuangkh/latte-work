@@ -11,7 +11,12 @@ import {
   workspaceKey,
 } from "./workspaceState";
 import { useEffect, useRef, useState } from "react";
-import { isSubagentPanelCommand } from "./composerActions";
+import {
+  isSubagentPanelCommand,
+  appCommandAction,
+  hasCommandArguments,
+  subagentPanelArgumentNotice,
+} from "./composerActions";
 import {
   connect,
   disconnect,
@@ -33,6 +38,7 @@ import type {
   Response,
 } from "./protocol";
 import { appendEvents } from "./transcript";
+import { LIVE_POLL_MS } from "./usePollingSnapshot";
 import { HistoryCache } from "./historyCache";
 import {
   agentSessionKey,
@@ -657,7 +663,7 @@ export function useWorkbench() {
           replay = [];
           initialWindow = false;
           replaying = false;
-          timer = setTimeout(() => void poll(), 650);
+          timer = setTimeout(() => void poll(), LIVE_POLL_MS);
           return;
         }
         if (r.kind === "events") {
@@ -706,7 +712,7 @@ export function useWorkbench() {
           setSessions((previous) =>
             previous.map((s) => (s.id === r.session.id ? r.session : s)),
           );
-          timer = setTimeout(() => void poll(), r.has_more ? 0 : 650);
+          timer = setTimeout(() => void poll(), r.has_more ? 0 : LIVE_POLL_MS);
         }
       } catch (e) {
         if (!disposed && !(e instanceof HostConnectionError)) {
@@ -1026,12 +1032,19 @@ export function useWorkbench() {
     permission_mode: string | null,
     uiAction?: "subagents",
   ): Promise<boolean> {
-    if (
-      project &&
-      isSubagentPanelCommand(text, session?.agent ?? agent?.id ?? "claude")
-    ) {
+    if (project && (uiAction === "subagents" || isSubagentPanelCommand(text))) {
       openSubagents(workspaceId);
+      if (hasCommandArguments(text)) {
+        setError(subagentPanelArgumentNotice);
+        return false;
+      }
+      setError("");
       return true;
+    }
+    const appAction = appCommandAction(text);
+    if (appAction === "model" || appAction === "effort") {
+      setError("请通过输入区的模型菜单选择模型或思考强度。");
+      return false;
     }
     if (!connected || !text.trim() || sending.current) return false;
     sending.current = true;
@@ -1080,8 +1093,6 @@ export function useWorkbench() {
             : s,
         ),
       );
-      if (uiAction === "subagents" && selectedSessionId.current === target.id)
-        openSubagents(workspaceKey(target.id));
       setError("");
       return true;
     } catch (e) {

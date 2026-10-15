@@ -5,6 +5,7 @@ mod attachments;
 mod files;
 mod git_review;
 mod providers;
+mod questions;
 mod runtime;
 mod sources;
 mod store;
@@ -38,6 +39,7 @@ struct Service {
     terminals: terminal::SharedTerminals,
     database: Database,
     runs: Runs,
+    title_refresh: Arc<Mutex<runtime::TitleRefreshCache>>,
     command_probes: Arc<tokio::sync::Semaphore>,
     file_admission: Arc<tokio::sync::RwLock<()>>,
     agent_binary: String,
@@ -170,6 +172,7 @@ async fn serve(dir: &Path) -> Result<()> {
         providers: Arc::new(Mutex::new(providers::ProviderStore::open(dir)?)),
         database,
         runs: Arc::new(Mutex::new(HashMap::new())),
+        title_refresh: Arc::new(Mutex::new(runtime::TitleRefreshCache::default())),
         command_probes: Arc::new(tokio::sync::Semaphore::new(2)),
         file_admission: Arc::new(tokio::sync::RwLock::new(())),
         agent_binary,
@@ -305,6 +308,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             | Request::CreateTerminal { .. }
             | Request::WriteTerminal { .. }
             | Request::Approve { .. }
+            | Request::AnswerQuestion { .. }
     ) {
         Some(s.file_admission.read().await)
     } else {
@@ -568,9 +572,14 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             let (sessions, next) = db(&s.database, |d| d.recent_sessions(before.as_ref()))?;
             Response::RecentSessions { sessions, next }
         }
-        Request::RenameSession { session_id, title } => Response::Session {
-            session: db(&s.database, |d| d.rename_session(&session_id, &title))?,
-        },
+        Request::RenameSession { session_id, title } => {
+            let session = db(&s.database, |d| d.session(&session_id))?;
+            let project = db(&s.database, |d| d.project(&session.project_id))?;
+            Response::Session {
+                session: runtime::rename_title(&s.database, &s.runs, session, project.path, title)
+                    .await?,
+            }
+        }
         Request::PinSession { session_id, pinned } => Response::Session {
             session: db(&s.database, |d| d.pin_session(&session_id, pinned))?,
         },
@@ -741,6 +750,127 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             let (tasks, truncated) = d.subagents(&session_id)?;
             Ok(Response::Subagents { tasks, truncated })
         })?,
+        Request::SubagentHistory {
+            provider,
+            session_id,
+            task_id,
+            after,
+            source,
+        } => {
+            db(&s.database, |d| d.subagent(&session_id, &task_id))?;
+            let control = s
+                .runs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                .get(&session_id)
+                .map(|run| run.control.clone());
+            let mut source_has_more = false;
+            if let Some(control) = control {
+                let permit = agents::child_read_permit()?;
+                let (reply, receive) = oneshot::channel();
+                if control
+                    .send(Control::SubagentHistory {
+                        task_id: task_id.clone(),
+                        permit,
+                        reply,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    source_has_more = tokio::time::timeout(Duration::from_secs(10), receive)
+                        .await??
+                        .map_err(anyhow::Error::msg)?;
+                }
+            }
+            let cursor = db(&s.database, |d| {
+                d.child_history_cursor(&session_id, &task_id)
+            })?;
+            if !source_has_more && (cursor.identity.is_empty() || cursor.has_more) {
+                let fingerprint = providers::turn_fingerprint(provider.as_ref())?;
+                let accepted = db(&s.database, |d| {
+                    d.child_provider_fingerprint(&session_id, &task_id)
+                })?;
+                let session = db(&s.database, |d| d.session(&session_id))?;
+                let config = s
+                    .providers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Provider 配置锁异常"))?
+                    .turn_config(&session.agent, None, provider)?;
+                // A legacy request with no snapshot is only safe when it also
+                // used native defaults. A changed/unknown context serves cache.
+                if accepted == Some(fingerprint.clone())
+                    && (fingerprint.is_some() || config.provider.is_none())
+                    && let Some(parent) = session.native_id
+                {
+                    let (child, cwd) = db(&s.database, |d| {
+                        Ok((
+                            d.subagent(&session_id, &task_id)?,
+                            d.project(&session.project_id)?.path,
+                        ))
+                    })?;
+                    let permit = agents::child_read_permit()?;
+                    if let Some(page) = agents::child_history(
+                        std::path::PathBuf::from(cwd),
+                        parent,
+                        child.native_id,
+                        session_id.clone(),
+                        config,
+                        cursor,
+                        permit,
+                    )
+                    .await?
+                    {
+                        source_has_more = page.has_more;
+                        db(&s.database, |d| {
+                            d.cache_child_history(&session_id, &task_id, &page)
+                        })?;
+                    }
+                }
+            }
+            db(&s.database, |d| {
+                d.subagent_history(
+                    &session_id,
+                    &task_id,
+                    after,
+                    source.as_deref(),
+                    source_has_more,
+                )
+            })?
+        }
+        Request::SubagentTranscript {
+            session_id,
+            task_id,
+        } => {
+            db(&s.database, |d| d.subagent(&session_id, &task_id))?;
+            let control = s
+                .runs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                .get(&session_id)
+                .map(|run| run.control.clone());
+            if let Some(control) = control {
+                let permit = agents::child_read_permit()?;
+                let (reply, receive) = oneshot::channel();
+                if control
+                    .send(Control::SubagentTranscript {
+                        task_id: task_id.clone(),
+                        permit,
+                        reply,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    tokio::time::timeout(Duration::from_secs(10), receive)
+                        .await??
+                        .map_err(anyhow::Error::msg)?;
+                }
+            }
+            let (events, truncated) = db(&s.database, |d| {
+                let snapshot = d.subagent_transcript(&session_id, &task_id)?;
+                agents::normalize_child_transcript(&d.session(&session_id)?.agent, snapshot)
+            })?;
+            Response::SubagentTranscript { events, truncated }
+        }
         Request::Poll { session_id, after } => db(&s.database, |d| {
             let session = d.session(&session_id)?;
             let (events, has_more) = d.events(&session_id, after)?;
@@ -750,6 +880,31 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 has_more,
             })
         })?,
+        Request::AnswerQuestion {
+            session_id,
+            request_id,
+            answers,
+        } => {
+            let control = s
+                .runs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                .get(&session_id)
+                .map(|run| run.control.clone())
+                .context("此会话没有运行中的任务")?;
+            let (reply, receive) = oneshot::channel();
+            control
+                .send(Control::AnswerQuestion {
+                    id: request_id,
+                    answers,
+                    reply,
+                })
+                .await?;
+            tokio::time::timeout(Duration::from_secs(10), receive)
+                .await??
+                .map_err(anyhow::Error::msg)?;
+            Response::Ok
+        }
         Request::Approve {
             session_id,
             request_id,
@@ -1019,6 +1174,20 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 info: git_review::info(Path::new(&p.path)).await?,
             }
         }
+        Request::GitCommits {
+            project_id,
+            head,
+            offset,
+        } => {
+            let p = db(&s.database, |d| d.project(&project_id))?;
+            let (head, commits, has_more) =
+                git_review::commits(Path::new(&p.path), head.as_deref(), offset).await?;
+            Response::GitCommits {
+                head,
+                commits,
+                has_more,
+            }
+        }
         Request::GitReview {
             project_id,
             scope,
@@ -1069,6 +1238,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
     {
         s.lifecycle.forget(&resource)?;
     }
+    runtime::refresh_titles(&s.database, &s.runs, &s.title_refresh, &mut response).await?;
     runtime::project_session_state(&s.runs, &mut response)?;
     Ok(response)
 }

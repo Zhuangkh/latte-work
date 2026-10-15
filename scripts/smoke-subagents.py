@@ -92,7 +92,8 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
                     failures.append('background child was never released')
             reply = 'CHILD_BACKGROUND_OK' if child and background else 'CHILD_FOREGROUND_OK' if child else 'PARENT_OK'
             content = {'type': 'tool_use', 'id': 'call_child_read' if child else 'call_parent_background' if background else 'call_parent_foreground', 'name': tool, 'input': arguments} if tool else {'type': 'text', 'text': reply}
-            message = {'id': 'msg_fixture', 'type': 'message', 'role': 'assistant', 'model': body['model'], 'content': [content], 'stop_reason': 'tool_use' if tool else 'end_turn', 'stop_sequence': None, 'usage': {'input_tokens': 100, 'output_tokens': 20}}
+            contents = ([{'type': 'text', 'text': 'CHILD_PROCESS_PROGRESS'}, content] if child and tool else [content])
+            message = {'id': 'msg_fixture', 'type': 'message', 'role': 'assistant', 'model': body['model'], 'content': contents, 'stop_reason': 'tool_use' if tool else 'end_turn', 'stop_sequence': None, 'usage': {'input_tokens': 100, 'output_tokens': 20}}
             self.send_response(200)
             if not body.get('stream'):
                 self.send_header('Content-Type', 'application/json')
@@ -101,14 +102,18 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
                 return
             self.send_header('Content-Type', 'text/event-stream')
             self.end_headers()
-            events = [
-                {'type': 'message_start', 'message': {**message, 'content': [], 'stop_reason': None}},
-                {'type': 'content_block_start', 'index': 0, 'content_block': {**content, **({'input': {}} if tool else {'text': ''})}},
-                {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(arguments)} if tool else {'type': 'text_delta', 'text': reply}},
-                {'type': 'content_block_stop', 'index': 0},
+            events = [{'type': 'message_start', 'message': {**message, 'content': [], 'stop_reason': None}}]
+            for index, block in enumerate(contents):
+                is_tool = block['type'] == 'tool_use'
+                events.extend([
+                    {'type': 'content_block_start', 'index': index, 'content_block': {**block, **({'input': {}} if is_tool else {'text': ''})}},
+                    {'type': 'content_block_delta', 'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(block['input'])} if is_tool else {'type': 'text_delta', 'text': block['text']}},
+                    {'type': 'content_block_stop', 'index': index},
+                ])
+            events.extend([
                 {'type': 'message_delta', 'delta': {'stop_reason': message['stop_reason'], 'stop_sequence': None}, 'usage': message['usage']},
                 {'type': 'message_stop'},
-            ]
+            ])
             try:
                 for event in events:
                     self.wfile.write(('event: ' + event['type'] + '\ndata: ' + json.dumps(event) + '\n\n').encode())
@@ -147,6 +152,8 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
             return result
 
         rpc({'method': 'hello', 'version': 1})
+        modes = rpc({'method': 'agent_permissions', 'agent': 'claude'})['modes']
+        permission_mode = next(m['id'] for m in modes if m['id'] in ('manual', 'default'))
         draft = {'id': None, 'name': 'Subagent fixture', 'protocol': 'anthropic_messages', 'base_url': f'http://127.0.0.1:{httpd.server_port}', 'model': MODEL, 'models': [], 'auth': 'bearer', 'credential': KEY}
         provider_id = rpc({'method': 'save_provider', 'provider': draft})['providers'][0]['id']
         rpc({'method': 'bind_agent_provider', 'agent': 'claude', 'provider_id': provider_id, 'target': None})
@@ -171,16 +178,24 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
                 time.sleep(.1)
             raise TimeoutError({'status': result['session']['status'], 'tasks': tasks, 'requests': requests, 'failures': failures})
 
-        rpc({'method': 'send', 'session_id': sid, 'request_id': 'foreground', 'text': 'LW_PARENT_FOREGROUND', 'model': None, 'effort': None, 'permission_mode': None})
+        rpc({'method': 'send', 'session_id': sid, 'request_id': 'foreground', 'text': 'LW_PARENT_FOREGROUND', 'model': None, 'effort': None, 'permission_mode': permission_mode})
         result, tasks = poll_until(lambda result, tasks: result['session']['status'] == 'completed' and len(tasks) == 1 and tasks[0]['status'] == 'completed')
         assert 'CHILD_FOREGROUND_OK' in tasks[0]['summary'], tasks
         assert tasks[0]['last_tool'] == 'Read', tasks
         assert not any(e['event']['kind'] == 'tool' and e['event']['name'] == 'Read' for e in result['events']), 'child tools leaked into the main transcript'
         assert not any(e['event']['kind'] == 'text' and 'CHILD_FOREGROUND_OK' in e['event']['text'] for e in result['events']), 'child text leaked into the main transcript'
         assert any(r['child'] for r in requests), requests
+        child_process = rpc({'method': 'subagent_transcript', 'session_id': sid, 'task_id': tasks[0]['id']})
+        assert not child_process['truncated'], child_process
+        child_events = [e['event'] for e in child_process['events']]
+        assert any(e['kind'] == 'tool' and e['name'] == 'Read' for e in child_events), child_events
+        assert any(e['kind'] == 'tool_result' for e in child_events), child_events
+        assert any(e['kind'] == 'text' and 'CHILD_PROCESS_PROGRESS' in e['text'] for e in child_events), child_events
+        assert not any(e['event']['kind'] == 'text' and 'CHILD_PROCESS_PROGRESS' in e['event']['text'] for e in result['events']), result
         print(json.dumps({'foreground_native_agent': True, 'child_tool_isolated': True}), flush=True)
+        print(json.dumps({'native_child_process': True, 'child_events': len(child_events)}), flush=True)
 
-        rpc({'method': 'send', 'session_id': sid, 'request_id': 'background', 'text': 'LW_PARENT_BACKGROUND', 'model': None, 'effort': None, 'permission_mode': None})
+        rpc({'method': 'send', 'session_id': sid, 'request_id': 'background', 'text': 'LW_PARENT_BACKGROUND', 'model': None, 'effort': None, 'permission_mode': permission_mode})
         result, tasks = poll_until(lambda result, tasks: result['session']['status'] == 'completed' and len(tasks) == 2 and any(t['status'] == 'running' for t in tasks))
         wire.close()
         connection.close()
@@ -201,6 +216,8 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
         background_task = next(t for t in tasks if t['title'] == 'Native background child')
         assert 'CHILD_BACKGROUND_OK' in background_task['summary'], tasks
         assert background_task['native_id'] != 'tool:call_parent_background', tasks
+        background_process = rpc({'method': 'subagent_transcript', 'session_id': sid, 'task_id': background_task['id']})
+        assert any(e['event']['kind'] == 'text' and 'CHILD_PROCESS_PROGRESS' in e['event']['text'] for e in background_process['events']), background_process
         print(json.dumps({'background_terminal_notification': True, 'task_ids_merged': True}), flush=True)
         inventory = rpc({'method': 'sources', 'session_id': sid})
         reads = next(source for source in inventory['entries'] if source['id'] == 'tool:Read')
@@ -215,16 +232,14 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
             if command is None:
                 continue
             assert command.get('ui_action') == 'subagents', command
-            before = len(requests)
-            rpc({'method': 'send', 'session_id': sid, 'request_id': 'native-' + name, 'text': '/' + name, 'model': None, 'effort': None, 'permission_mode': None})
-            result, tasks = poll_until(lambda result, _tasks: result['session']['status'] == 'completed')
-            assert any(e['event']['kind'] == 'user' and e['event']['text'] == '/' + name for e in result['events'])
-            assert len(requests) == before, 'native command unexpectedly used the model fixture'
             verified_commands.append(name)
         assert verified_commands, 'no native subagent listing commands advertised'
         assert len(tasks) == 2 and not failures
+        history = rpc({'method': 'poll', 'session_id': sid, 'after': 0})['events']
+        prompts = [e['event']['text'] for e in history if e['event']['kind'] == 'user']
+        assert prompts == ['LW_PARENT_FOREGROUND', 'LW_PARENT_BACKGROUND'], prompts
         rpc({'method': 'close_agent_session', 'session_id': sid, 'only_if_idle': False})
-        print(json.dumps({'native_commands': verified_commands, 'native_catalog_hints': True, 'paid_model_calls': 0}), flush=True)
+        print(json.dumps({'native_catalog_commands': verified_commands, 'native_catalog_hints': True, 'user_prompts': len(prompts), 'listing_prompts': 0, 'paid_model_calls': 0}), flush=True)
         if args.pause_for_ui:
             deadline = time.monotonic() + 300
             while not (root / 'finish').exists():

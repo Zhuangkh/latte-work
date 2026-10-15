@@ -6,6 +6,7 @@ import {
   FilePenLine,
   Search,
   Wrench,
+  MessageCircleQuestion,
 } from "lucide-react";
 import type { Event } from "./protocol";
 import { toolLabel, type ToolActivity } from "./activity";
@@ -39,6 +40,45 @@ export function ApprovalCard({
     status: "waiting",
   });
   const kind = request.tool.toLowerCase();
+  if (kind === "askuserquestion") {
+    if (resolved || presentation === "record")
+      return (
+        <details className="activity-row question-result">
+          <summary>
+            <MessageCircleQuestion size={16} />
+            <span className="activity-label">提问（旧记录）</span>
+            <span className="activity-status">
+              {resolved ? "未保存结构化回答" : "需要更新服务"}
+            </span>
+            <ChevronRight size={14} className="activity-chevron" />
+          </summary>
+          <ApprovalOperation input={request.input} compact />
+        </details>
+      );
+    return (
+      <section
+        className="approval-card question-card"
+        aria-label="问题交互暂不可用"
+      >
+        <header>
+          <MessageCircleQuestion size={16} />
+          需要你的回答
+        </header>
+        <p>
+          当前主机服务尚不支持问题交互，请更新服务后使用。你也可以跳过这次问题，让模型继续。
+        </p>
+        <div className="approval-actions">
+          <button
+            className="secondary"
+            disabled={disabled || busy}
+            onClick={() => onDecision(false)}
+          >
+            {busy ? "正在提交…" : "跳过问题"}
+          </button>
+        </div>
+      </section>
+    );
+  }
   const [Icon, category] =
     kind === "bash"
       ? ([Terminal, "终端"] as const)

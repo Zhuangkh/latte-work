@@ -2,8 +2,94 @@
 mod adapter;
 mod claude;
 mod claude_models;
+mod claude_sessions;
 pub use adapter::{Action, AgentAdapter, AgentCommand, Input};
 use anyhow::{Result, bail};
+pub type ChildTranscript = (Vec<latte_work_protocol::Event>, bool);
+pub fn confirmed_child_report(
+    tool: &latte_work_protocol::EventKind,
+    result: &latte_work_protocol::EventKind,
+) -> Option<String> {
+    claude::confirmed_child_report(tool, result)
+}
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct ChildHistoryCursor {
+    pub offset: u64,
+    pub identity: String,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub pending_tail: bool,
+    pub handbacks: std::collections::HashMap<String, String>,
+}
+pub struct ChildHistoryPage {
+    pub events: Vec<latte_work_protocol::Event>,
+    pub cursor: ChildHistoryCursor,
+    pub has_more: bool,
+}
+pub async fn child_history(
+    cwd: std::path::PathBuf,
+    parent: String,
+    child: String,
+    session_id: String,
+    config: crate::providers::LaunchConfig,
+    cursor: ChildHistoryCursor,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Option<ChildHistoryPage>> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let Some(raw) = claude_sessions::read_child_page(&cwd, &parent, &child, cursor)? else {
+                return Ok(None);
+            };
+            claude::parse_child_history(raw, &parent, &child, &session_id, &config).map(Some)
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("读取子智能体过程超时"))??
+}
+pub fn normalize_child_transcript(
+    agent: &str,
+    snapshot: ChildTranscript,
+) -> Result<ChildTranscript> {
+    match agent {
+        "claude" => claude::normalize_child_transcript(snapshot),
+        _ => bail!("此 Agent 尚未实现子智能体过程：{agent}"),
+    }
+}
+pub fn child_read_permit() -> Result<tokio::sync::OwnedSemaphorePermit> {
+    static READS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    READS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("子智能体过程正在读取，请稍后重试"))
+}
+
+/// Read only a child owned by the caller's existing runtime/redaction context.
+pub async fn child_transcript(
+    cwd: std::path::PathBuf,
+    parent: String,
+    child: String,
+    session_id: String,
+    config: crate::providers::LaunchConfig,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Option<ChildTranscript>> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let Some(bytes) = claude_sessions::read_child(&cwd, &parent, &child)? else {
+                return Ok(None);
+            };
+            claude::parse_child_transcript(bytes, &parent, &child, &session_id, &config).map(Some)
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("读取子智能体过程超时"))??
+}
 
 /// Concrete adapters are constructed only here; unsupported IDs never fall back.
 pub fn create(agent: &str) -> Result<Box<dyn AgentAdapter>> {
@@ -61,6 +147,25 @@ pub fn model_labels(
     match agent {
         "claude" => claude_models::labels(project),
         _ => std::collections::BTreeMap::new(),
+    }
+}
+
+pub use claude_sessions::Title as NativeTitle;
+pub fn session_title(agent: &str, path: &std::path::Path, id: &str) -> Result<Option<NativeTitle>> {
+    match agent {
+        "claude" => claude_sessions::read(path, id),
+        _ => bail!("此 Agent 尚不支持读取会话标题"),
+    }
+}
+pub fn rename_saved_session(
+    agent: &str,
+    path: &std::path::Path,
+    id: &str,
+    title: &str,
+) -> Result<String> {
+    match agent {
+        "claude" => claude_sessions::rename(path, id, title),
+        _ => bail!("此 Agent 尚不支持修改会话标题"),
     }
 }
 

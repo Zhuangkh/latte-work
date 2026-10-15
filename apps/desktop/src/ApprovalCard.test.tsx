@@ -58,3 +58,17 @@ it("collapses resolved approvals without hiding an execution failure behind allo
   expect(screen.getByText("permission denied")).toBeTruthy();
   expect(screen.queryByRole("button")).toBeNull();
 });
+it("does not offer an empty allow response for an old-server user question", () => {
+  const decide = vi.fn();
+  render(
+    <ApprovalCard
+      request={{ ...request, tool: "AskUserQuestion" }}
+      onDecision={decide}
+    />,
+  );
+  expect(screen.getByText(/当前主机服务尚不支持问题交互/)).toBeTruthy();
+  expect(screen.queryByText(/是否允许/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "允许一次" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "跳过问题" }));
+  expect(decide).toHaveBeenCalledWith(false);
+});

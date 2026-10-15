@@ -96,6 +96,17 @@ export type EventKind =
   | { kind: "tool"; id: string; name: string; input: JsonValue }
   | { kind: "tool_result"; id: string; content: JsonValue; is_error: boolean }
   | {
+      kind: "question";
+      request_id: string;
+      tool_use_id: string | null;
+      questions: Array<UserQuestion>;
+    }
+  | {
+      kind: "question_resolved";
+      request_id: string;
+      answers: Array<QuestionAnswer> | null;
+    }
+  | {
       kind: "approval";
       request_id: string;
       tool_use_id?: string;
@@ -105,6 +116,19 @@ export type EventKind =
   | { kind: "approval_resolved"; request_id: string; allow: boolean }
   | { kind: "state"; status: Status; message: string | null }
   | { kind: "notice"; text: string };
+export type QuestionOption = { label: string; description: string };
+export type UserQuestion = {
+  id: string;
+  header: string;
+  text: string;
+  options: Array<QuestionOption>;
+  multi_select: boolean;
+};
+export type QuestionAnswer = {
+  question_id: string;
+  option_indices: Array<number>;
+  text: string | null;
+};
 export type Event = {
   seq: number;
   session_id: string;
@@ -119,8 +143,10 @@ export type GitChange = {
   section: ChangeSection;
   status: string;
 };
-export type GitReviewScope = "branch" | "worktree" | "unstaged" | "staged";
+export type GitReviewScope =
+  "branch" | "commit" | "worktree" | "unstaged" | "staged";
 export type GitRef = { name: string; full_name: string };
+export type GitCommit = { oid: string; subject: string };
 export type GitInfo = {
   branch: string | null;
   head: string | null;
@@ -339,6 +365,21 @@ export type Request =
   | { method: "history"; session_id: string; before: number | null }
   | { method: "poll"; session_id: string; after: number }
   | { method: "subagents"; session_id: string }
+  | { method: "subagent_transcript"; session_id: string; task_id: string }
+  | {
+      method: "subagent_history";
+      provider?: TurnProvider;
+      session_id: string;
+      task_id: string;
+      after: number | null;
+      source: string | null;
+    }
+  | {
+      method: "answer_question";
+      session_id: string;
+      request_id: string;
+      answers: Array<QuestionAnswer> | null;
+    }
   | {
       method: "approve";
       session_id: string;
@@ -361,6 +402,12 @@ export type Request =
   | { method: "diff"; project_id: string }
   | { method: "changes"; project_id: string }
   | { method: "git_info"; project_id: string }
+  | {
+      method: "git_commits";
+      project_id: string;
+      head: string | null;
+      offset: number;
+    }
   | {
       method: "git_review";
       project_id: string;
@@ -421,8 +468,24 @@ export type Response =
     }
   | { kind: "source_directory"; entries: Array<FileEntry>; truncated: boolean }
   | { kind: "subagents"; tasks: Array<Subagent>; truncated: boolean }
+  | { kind: "subagent_transcript"; events: Array<Event>; truncated: boolean }
+  | {
+      kind: "subagent_history";
+      events: Array<Event>;
+      has_more: boolean;
+      after: number | null;
+      source_has_more: boolean;
+      incomplete: boolean;
+      source: string;
+    }
   | { kind: "changes"; entries: Array<GitChange>; truncated: boolean }
   | { kind: "git_info"; info: GitInfo }
+  | {
+      kind: "git_commits";
+      head: string | null;
+      commits: Array<GitCommit>;
+      has_more: boolean;
+    }
   | { kind: "git_review"; review: GitReview }
   | { kind: "agent_permissions"; modes: Array<AgentPermissionMode> }
   | { kind: "agent_commands"; commands: Array<AgentSlashCommand> }

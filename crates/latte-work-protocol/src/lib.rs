@@ -197,6 +197,15 @@ pub enum EventKind {
         content: Value,
         is_error: bool,
     },
+    Question {
+        request_id: String,
+        tool_use_id: Option<String>,
+        questions: Vec<UserQuestion>,
+    },
+    QuestionResolved {
+        request_id: String,
+        answers: Option<Vec<QuestionAnswer>>,
+    },
     Approval {
         request_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,6 +529,24 @@ pub enum Request {
     Subagents {
         session_id: String,
     },
+    SubagentTranscript {
+        session_id: String,
+        task_id: String,
+    },
+    SubagentHistory {
+        #[serde(default)]
+        #[ts(optional)]
+        provider: Option<TurnProvider>,
+        session_id: String,
+        task_id: String,
+        after: Option<f64>,
+        source: Option<String>,
+    },
+    AnswerQuestion {
+        session_id: String,
+        request_id: String,
+        answers: Option<Vec<QuestionAnswer>>,
+    },
     Approve {
         session_id: String,
         request_id: String,
@@ -565,6 +592,11 @@ pub enum Request {
     },
     GitInfo {
         project_id: String,
+    },
+    GitCommits {
+        project_id: String,
+        head: Option<String>,
+        offset: u32,
     },
     GitReview {
         project_id: String,
@@ -627,6 +659,25 @@ pub enum ChangeSection {
     Untracked,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct UserQuestion {
+    pub id: String,
+    pub header: String,
+    pub text: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct QuestionAnswer {
+    pub question_id: String,
+    pub option_indices: Vec<u32>,
+    pub text: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct GitChange {
     pub path: String,
     pub previous_path: Option<String>,
@@ -638,6 +689,7 @@ pub struct GitChange {
 #[serde(rename_all = "snake_case")]
 pub enum GitReviewScope {
     Branch,
+    Commit,
     Worktree,
     Unstaged,
     Staged,
@@ -646,6 +698,11 @@ pub enum GitReviewScope {
 pub struct GitRef {
     pub name: String,
     pub full_name: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct GitCommit {
+    pub oid: String,
+    pub subject: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct GitInfo {
@@ -765,12 +822,29 @@ pub enum Response {
         tasks: Vec<Subagent>,
         truncated: bool,
     },
+    SubagentTranscript {
+        events: Vec<Event>,
+        truncated: bool,
+    },
+    SubagentHistory {
+        events: Vec<Event>,
+        has_more: bool,
+        after: Option<f64>,
+        source_has_more: bool,
+        incomplete: bool,
+        source: String,
+    },
     Changes {
         entries: Vec<GitChange>,
         truncated: bool,
     },
     GitInfo {
         info: GitInfo,
+    },
+    GitCommits {
+        head: Option<String>,
+        commits: Vec<GitCommit>,
+        has_more: bool,
     },
     GitReview {
         review: GitReview,

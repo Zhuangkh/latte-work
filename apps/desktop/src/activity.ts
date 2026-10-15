@@ -92,19 +92,30 @@ export function activityTranscript(events: Event[]): ActivityItem[] {
         });
       }
     } else {
-      if (value.kind === "approval" && value.tool_use_id) {
+      if (
+        (value.kind === "approval" || value.kind === "question") &&
+        value.tool_use_id
+      ) {
         const tool = pending.get(value.tool_use_id);
         if (tool) {
           attached.add(tool);
           rows.push({ ...item, approvalTool: tool });
           tool.status =
-            item.decision === "denied"
-              ? "denied"
-              : item.decision === "expired"
-                ? "expired"
-                : item.decision === "allowed"
-                  ? "pending"
-                  : "waiting";
+            value.kind === "question"
+              ? item.resolved
+                ? item.answers === null
+                  ? "denied"
+                  : item.answers === undefined
+                    ? "expired"
+                    : "pending"
+                : "waiting"
+              : item.decision === "denied"
+                ? "denied"
+                : item.decision === "expired"
+                  ? "expired"
+                  : item.decision === "allowed"
+                    ? "pending"
+                    : "waiting";
           continue;
         }
       }

@@ -17,10 +17,16 @@ pub enum Input<'a> {
     DiscoverCommands,
     /// Open the bidirectional session without sending a user prompt.
     Open,
+    RenameTitle {
+        id: &'a str,
+        title: &'a str,
+    },
     /// Interrupt the active turn while retaining the session's process.
     Interrupt,
     /// Start a turn. The first turn initializes; later turns reuse the same transport.
-    Start { prompt: &'a str },
+    Start {
+        prompt: &'a str,
+    },
     /// One complete line without its delimiter. Only the adapter interprets its payload.
     Message(&'a str),
     /// Delivered only after Runtime validates and consumes a pending public approval ID.
@@ -29,9 +35,17 @@ pub enum Input<'a> {
         input: Value,
         allow: bool,
     },
+    QuestionAnswer {
+        id: &'a str,
+        input: Value,
+        questions: Vec<latte_work_protocol::UserQuestion>,
+        answers: Option<Vec<latte_work_protocol::QuestionAnswer>>,
+    },
 }
 
 pub enum Action {
+    Title(String),
+    TitleRenamed(Result<String, String>),
     SourceUsed {
         id: String,
         name: String,
@@ -45,12 +59,23 @@ pub enum Action {
     TurnStarted,
     Interrupted,
     Event(EventKind),
+    /// Native child output; never changes the parent turn's text or execution state.
+    SubagentEvent {
+        tool_use_id: String,
+        event: EventKind,
+    },
     NativeSession(String),
     Approval {
         id: String,
         tool_use_id: Option<String>,
         tool: String,
         input: Value,
+    },
+    Question {
+        id: String,
+        tool_use_id: Option<String>,
+        input: Value,
+        questions: Vec<latte_work_protocol::UserQuestion>,
     },
     /// Must follow explicit native completion evidence, never EOF or a successful exit.
     Finished {
@@ -62,6 +87,11 @@ pub enum Action {
 pub trait AgentAdapter: Send {
     /// Only true between turns when replacing the process cannot discard live work.
     fn can_reconfigure(&self) -> bool;
+    /// Actual native tasks that outlive the main turn; distinct from reconfiguration readiness.
+    fn has_background_work(&self) -> bool;
+    /// Only children observed by this process share its credential redaction context.
+    fn knows_subagent(&self, native_id: &str) -> bool;
+    fn set_initial_title(&mut self, title: Option<String>);
     /// Prepare launch resources; may retain resume/config context for later protocol steps.
     fn command(
         &mut self,

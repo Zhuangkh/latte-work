@@ -1,4 +1,12 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useId,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type Ref,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   Check,
@@ -9,6 +17,10 @@ import {
 import type { Effort } from "./protocol";
 import type { SelectOption } from "./Select";
 
+export interface ModelSelectorHandle {
+  openMenu: (target: "model" | "effort") => boolean;
+}
+
 /** A model menu with an Agent-owned reasoning submenu. */
 export function ModelSelector({
   value,
@@ -18,6 +30,7 @@ export function ModelSelector({
   levels,
   onEffortChange,
   disabled,
+  ref,
 }: {
   value: string;
   options: SelectOption[];
@@ -26,7 +39,20 @@ export function ModelSelector({
   levels: Effort[];
   onEffortChange: (value: Effort | null) => void;
   disabled: boolean;
+  ref?: Ref<ModelSelectorHandle>;
 }) {
+  useImperativeHandle(
+    ref,
+    () => ({
+      openMenu(target) {
+        if (disabled || (target === "effort" && !levels.length)) return false;
+        setOpen(true);
+        setReasoning(target === "effort");
+        return true;
+      },
+    }),
+    [disabled, levels.length],
+  );
   const [open, setOpen] = useState(false);
   const [reasoning, setReasoning] = useState(false);
   const [position, setPosition] = useState({

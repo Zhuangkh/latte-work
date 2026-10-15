@@ -103,3 +103,43 @@ it("preserves each user message's original send time through replay", () => {
     { key: 1, type: "user", text: "继续", at },
   ]);
 });
+it("pairs saved question answers and marks unanswered terminal questions expired without manufacturing an answer", () => {
+  const question: Event = {
+    seq: 1,
+    at: 0,
+    session_id: "s",
+    event: {
+      kind: "question",
+      request_id: "q",
+      tool_use_id: null,
+      questions: [],
+    },
+  };
+  const answer: Event = {
+    seq: 2,
+    at: 1,
+    session_id: "s",
+    event: {
+      kind: "question_resolved",
+      request_id: "q",
+      answers: [{ question_id: "q0", option_indices: [1], text: null }],
+    },
+  };
+  const replied = transcript([question, answer]);
+  expect(replied).toHaveLength(1);
+  expect(replied[0]).toMatchObject({
+    resolved: true,
+    answers:
+      answer.event.kind === "question_resolved" ? answer.event.answers : null,
+  });
+  const expired = transcript([
+    question,
+    {
+      seq: 3,
+      at: 2,
+      session_id: "s",
+      event: { kind: "state", status: "stopped", message: null },
+    },
+  ]);
+  expect(expired[0]).toMatchObject({ resolved: true, answers: undefined });
+});

@@ -16,16 +16,19 @@ pub fn lane(request: &Request) -> Lane {
         | Request::CloseAgentSession { .. }
         | Request::Send { .. }
         | Request::Approve { .. }
+        | Request::AnswerQuestion { .. }
         | Request::Cancel { .. } => Lane::Control,
         Request::AgentCommands { .. }
         | Request::AgentPermissions { .. }
         | Request::Models { .. }
         | Request::ReadFile { .. }
+        | Request::SubagentTranscript { .. }
         | Request::Diff { .. }
         | Request::Changes { .. }
         | Request::ChangeDiff { .. }
         | Request::LastTurnChanges { .. }
         | Request::GitInfo { .. }
+        | Request::GitCommits { .. }
         | Request::GitReview { .. }
         | Request::GitReviewDiff { .. } => Lane::Metadata,
         _ => Lane::Read,

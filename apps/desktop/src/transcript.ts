@@ -1,4 +1,4 @@
-import type { Event, TurnChanges } from "./protocol";
+import type { Event, TurnChanges, QuestionAnswer } from "./protocol";
 /** Undo/status events for older turns must not replace the latest turn. */
 export function latestTurnChanges(events: Event[]): TurnChanges | undefined {
   type RecordedTurn = { changes: TurnChanges; at: number; seq: number };
@@ -31,6 +31,7 @@ export type Item =
       type: "event";
       value: Event["event"];
       resolved?: boolean;
+      answers?: QuestionAnswer[] | null;
       decision?: "allowed" | "denied" | "expired";
     };
 export function appendEvents(existing: Event[], incoming: Event[]): Event[] {
@@ -45,6 +46,13 @@ export function transcript(events: Event[]): Item[] {
     events.flatMap((e) =>
       e.event.kind === "approval_resolved"
         ? [[e.event.request_id, e.event.allow] as const]
+        : [],
+    ),
+  );
+  const answered = new Map(
+    events.flatMap(({ event }) =>
+      event.kind === "question_resolved"
+        ? [[event.request_id, event.answers] as const]
         : [],
     ),
   );
@@ -87,6 +95,15 @@ export function transcript(events: Event[]): Item[] {
       const last = items.at(-1);
       if (last?.type === "assistant") last.text += event.text;
       else items.push({ key: seq, type: "assistant", text: event.text });
+    } else if (event.kind === "question") {
+      items.push({
+        key: seq,
+        type: "event",
+        value: event,
+        resolved:
+          answered.has(event.request_id) || terminal.some((end) => end > seq),
+        answers: answered.get(event.request_id),
+      });
     } else if (event.kind === "approval") {
       const inactive = terminal.some((end) => end > seq);
       items.push({
@@ -105,7 +122,8 @@ export function transcript(events: Event[]): Item[] {
     } else if (
       event.kind === "state"
         ? !!event.message
-        : event.kind !== "approval_resolved"
+        : event.kind !== "approval_resolved" &&
+          event.kind !== "question_resolved"
     )
       items.push({ key: seq, type: "event", value: event });
   }
