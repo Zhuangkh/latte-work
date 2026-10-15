@@ -303,8 +303,8 @@ export function Composer(props: Props) {
           ? externalPath.trim()
           : await chooseReferencePath(directory);
       if (!valid() || !chosen) return;
-      if (!chosen.startsWith("/"))
-        throw new Error("请输入文件或目录的绝对路径，例如 /home/user/docs");
+      // The selected host validates native absolute paths before resolving them.
+      // Its path rules may differ from the desktop OS (for example over SSH).
       const response = await request(hostId, {
         method: "resolve_reference",
         project_id: projectId,

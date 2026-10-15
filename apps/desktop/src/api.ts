@@ -56,7 +56,11 @@ export function disconnect(hostId: string): Promise<void> {
   );
   return invoke("disconnect_host", { hostId });
 }
-export function chooseProjectFolder(): Promise<string | null> {
+export interface ProjectFolder {
+  path: string;
+  name: string;
+}
+export function chooseProjectFolder(): Promise<ProjectFolder | null> {
   return invoke("choose_project_folder");
 }
 export function chooseReferencePath(

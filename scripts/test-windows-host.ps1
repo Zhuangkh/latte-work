@@ -1,8 +1,18 @@
-# Build as the runner, execute native security/host tests as an ordinary user.
+# Build as the runner, execute native tests as an ordinary user.
 # Account provisioning is restricted to disposable GitHub Actions Windows runners.
+[CmdletBinding()]
+param(
+    [ValidateSet('Host', 'Desktop')]
+    [string]$Suite = 'Host'
+)
 $ErrorActionPreference = 'Stop'
-$packages = @('latte-work-windows-security', 'latte-work-platform', 'latte-work-config', 'latte-work-protocol', 'latte-work-client', 'latte-work-server')
-$cargoArgs = @('test', '--no-run', '--lib', '--bins', '--tests', '--features', 'latte-work-server/test-fixture', '--locked', '--message-format=json')
+$cargoArgs = @('test', '--no-run', '--lib', '--bins', '--tests', '--locked', '--message-format=json')
+if ($Suite -eq 'Host') {
+    $packages = @('latte-work-windows-security', 'latte-work-platform', 'latte-work-config', 'latte-work-protocol', 'latte-work-client', 'latte-work-server')
+    $cargoArgs += @('--features', 'latte-work-server/test-fixture')
+} else {
+    $packages = @('latte-work-desktop', 'latte-work-windows-webview')
+}
 foreach ($package in $packages) { $cargoArgs += @('-p', $package) }
 $artifacts = & cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) { throw 'Cannot build native test executables' }
@@ -13,6 +23,9 @@ $executables = @($artifacts | ForEach-Object {
     }
 } | Sort-Object -Unique)
 if ($executables.Count -eq 0) { throw 'No test executables were built' }
+foreach ($executable in $executables) {
+    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "Missing test executable: $executable" }
+}
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -66,7 +79,7 @@ exit 0
 '@ | Set-Content -Encoding UTF8 (Join-Path $work 'run.ps1')
     $credential = [System.Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$userName", $password)
     $arguments = @('-NoProfile', '-NonInteractive', '-File', ('"' + (Join-Path $work 'run.ps1') + '"'))
-    $child = Start-Process -FilePath (Get-Command powershell.exe).Source -ArgumentList $arguments -Credential $credential -LoadUserProfile -WorkingDirectory $work -PassThru -Wait -RedirectStandardOutput (Join-Path $work 'stdout.log') -RedirectStandardError (Join-Path $work 'stderr.log')
+    $child = Start-Process -FilePath (Get-Command powershell.exe).Source -ArgumentList $arguments -Credential $credential -LoadUserProfile -WindowStyle Hidden -WorkingDirectory $work -PassThru -Wait -RedirectStandardOutput (Join-Path $work 'stdout.log') -RedirectStandardError (Join-Path $work 'stderr.log')
     Get-Content (Join-Path $work 'stdout.log')
     Get-Content (Join-Path $work 'stderr.log')
     if ($child.ExitCode -ne 0) { throw "Native tests failed with exit code $($child.ExitCode)" }

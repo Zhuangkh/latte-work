@@ -2,16 +2,15 @@
 pub mod discovery;
 mod validation;
 use anyhow::{Context, Result, bail};
-use latte_work_platform::lock::FileLock;
+use latte_work_platform::{fs::PrivateDir, lock::FileLock};
 use latte_work_protocol::{
     AgentProviderBinding, Provider, ProviderDraft, ProviderSnapshot, Response,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+#[cfg(not(windows))]
+use std::fs::File;
 use std::{
     collections::BTreeMap,
-    fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -53,12 +52,13 @@ impl Default for Config {
 /// Intentionally not Debug/Serialize: credentials must never reach the WebView or logs.
 pub struct ProviderStore {
     path: PathBuf,
+    directory: PrivateDir,
     config: Config,
     _lock: FileLock,
 }
 fn regular(path: &Path) -> Result<bool> {
     match path.symlink_metadata() {
-        Ok(meta) if meta.is_file() => Ok(true),
+        Ok(meta) if meta.is_file() && !latte_work_platform::fs::is_link(&meta) => Ok(true),
         Ok(_) => bail!("Provider 配置路径必须是普通文件"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),
@@ -67,9 +67,12 @@ fn regular(path: &Path) -> Result<bool> {
 fn read_config(path: &Path) -> Result<Config> {
     regular(path)?;
     let mut bytes = vec![];
-    File::open(path)?
-        .take(MAX_CONFIG + 1)
-        .read_to_end(&mut bytes)?;
+    #[cfg(windows)]
+    let file = latte_work_platform::fs::open_private_file(path)
+        .context("Provider 配置权限不安全；保留原文件，请由用户恢复私有权限后重试")?;
+    #[cfg(not(windows))]
+    let file = File::open(path)?;
+    file.take(MAX_CONFIG + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_CONFIG {
         bail!("Provider 配置超出大小限制");
     }
@@ -98,16 +101,22 @@ fn read_config(path: &Path) -> Result<Config> {
     Ok(config)
 }
 impl ProviderStore {
-    /// Migrate once by reading the legacy file directly, without starting its daemon.
-    /// The legacy file is never modified. Invalid configuration fails closed.
+    /// Open App-owned storage without starting a daemon. Windows uses a dedicated
+    /// private child so unrelated App files keep their existing permissions.
+    /// Import the old App file, then the supplied legacy file, only when the new
+    /// configuration is absent. Migration sources are never modified; unsafe
+    /// Windows permissions and invalid configuration fail closed before import.
     pub fn open(directory: &Path, legacy: Option<&Path>) -> Result<Self> {
-        std::fs::create_dir_all(directory)?;
-        if !directory.symlink_metadata()?.is_dir() {
-            bail!("Provider 配置目录无效");
-        }
-        #[cfg(unix)]
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
-        let lock_path = directory.join("providers.lock");
+        #[cfg(windows)]
+        let old_app_path = directory.join("providers.json");
+        #[cfg(windows)]
+        let directory = {
+            let root = latte_work_platform::fs::prepare_state_dir(directory)?;
+            PrivateDir::prepare(&root.join("private-providers"))?
+        };
+        #[cfg(not(windows))]
+        let directory = PrivateDir::prepare(directory)?;
+        let lock_path = directory.path().join("providers.lock");
         regular(&lock_path)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         let lock = loop {
@@ -124,8 +133,15 @@ impl ProviderStore {
                 }
             }
         };
-        let path = directory.join("providers.json");
+        directory.verify()?;
+        let path = directory.path().join("providers.json");
         let exists = regular(&path)?;
+        #[cfg(windows)]
+        let legacy = if !exists && regular(&old_app_path)? {
+            Some(old_app_path.as_path())
+        } else {
+            legacy
+        };
         let config = if exists {
             read_config(&path)?
         } else if let Some(legacy) = legacy.filter(|p| p != &path) {
@@ -139,14 +155,14 @@ impl ProviderStore {
         };
         let mut store = Self {
             path,
+            directory,
             config,
             _lock: lock,
         };
         if !exists {
             store.persist(store.config.clone())?;
         } else {
-            #[cfg(unix)]
-            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600))?;
+            store.directory.protect_file("providers.json")?;
         }
         Ok(store)
     }
@@ -269,13 +285,17 @@ impl ProviderStore {
         if bytes.len() as u64 > MAX_CONFIG {
             bail!("Provider 配置超出大小限制");
         }
-        let mut file =
-            tempfile::NamedTempFile::new_in(self.path.parent().context("Provider 配置路径无效")?)?;
-        #[cfg(unix)]
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        self.directory.verify()?;
+        if regular(&self.path)? {
+            self.directory.protect_file("providers.json")?;
+        }
+        let mut file = self.directory.tempfile("providers-", ".json")?;
         file.write_all(&bytes)?;
         file.as_file().sync_all()?;
+        self.directory.verify()?;
+        if regular(&self.path)? {
+            self.directory.protect_file("providers.json")?;
+        }
         file.persist(&self.path)
             .map_err(|_| anyhow::anyhow!("无法保存 Provider 配置"))?;
         self.config = config;

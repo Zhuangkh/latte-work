@@ -153,17 +153,39 @@ jobs:
             label: Linux
           - os: macos-latest
             label: macOS
+          - os: windows-latest
+            label: Windows
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p latte-work-server --locked
-      - uses: actions/upload-artifact@v4
+      - if: runner.os != 'Windows'
+        run: cargo build --release -p latte-work-server --locked
+      - name: Build and verify Windows production Server
+        if: runner.os == 'Windows'
+        id: windows-server
+        shell: pwsh
+        run: ./scripts/build-windows-server.ps1
+      - name: Test Windows Server artifact guardrails
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          SERVER_ARTIFACT_DIRECTORY: ${{ steps.windows-server.outputs.artifact-directory }}
+        run: ./scripts/test-windows-server-artifact.ps1 -ArtifactDirectory $env:SERVER_ARTIFACT_DIRECTORY
+      - if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
         with:
           name: latte-work-server-${{ matrix.label }}-${{ runner.arch }}
           path: target/release/latte-work-server
+          if-no-files-found: error
+
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: latte-work-server-${{ matrix.label }}-${{ runner.arch }}
+          path: ${{ steps.windows-server.outputs.artifact-directory }}
           if-no-files-found: error
 
   desktop-native:
@@ -186,6 +208,88 @@ jobs:
         timeout-minutes: 3
       - run: make build
 
+  desktop-native-windows:
+    name: Windows x64 native desktop and NSIS
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Record native build environment
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path native-evidence | Out-Null
+          rustc -vV | Tee-Object -FilePath native-evidence/toolchain.txt
+          if ($LASTEXITCODE -ne 0) { throw 'rustc failed' }
+          cargo --version | Tee-Object -FilePath native-evidence/toolchain.txt -Append
+          if ($LASTEXITCODE -ne 0) { throw 'cargo failed' }
+          node --version | Tee-Object -FilePath native-evidence/toolchain.txt -Append
+          if ($LASTEXITCODE -ne 0) { throw 'node failed' }
+          npm --version | Tee-Object -FilePath native-evidence/toolchain.txt -Append
+          if ($LASTEXITCODE -ne 0) { throw 'npm failed' }
+      - name: Native desktop check with prepared sidecar
+        shell: pwsh
+        run: ./scripts/desktop.ps1 check 2>&1 | Tee-Object -FilePath native-evidence/check.log
+      - name: Strict desktop and WebView Clippy
+        shell: pwsh
+        run: |
+          cargo clippy -p latte-work-desktop -p latte-work-windows-webview --all-targets --locked -- -D warnings 2>&1 | Tee-Object -FilePath native-evidence/clippy.log
+          if ($LASTEXITCODE -ne 0) { throw 'Native desktop/WebView Clippy failed' }
+      - name: Native desktop and WebView tests as an ordinary user
+        shell: pwsh
+        run: ./scripts/test-windows-host.ps1 -Suite Desktop 2>&1 | Tee-Object -FilePath native-evidence/desktop-webview-test.log
+      - name: Native debug desktop build
+        shell: pwsh
+        run: ./scripts/desktop.ps1 build 2>&1 | Tee-Object -FilePath native-evidence/debug-build.log
+      - name: Build fresh unsigned production NSIS package
+        id: windows-package
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version=1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
+          $packages = Join-Path $metadata.target_directory 'windows-package'
+          $before = @()
+          if (Test-Path -LiteralPath $packages) {
+            $before = @(Get-ChildItem -LiteralPath $packages -Filter provenance.json -Recurse -File | Select-Object -ExpandProperty FullName)
+          }
+          ./scripts/desktop.ps1 package 2>&1 | Tee-Object -FilePath native-evidence/package.log
+          $created = @(Get-ChildItem -LiteralPath $packages -Filter provenance.json -Recurse -File | Where-Object { $_.FullName -notin $before })
+          if ($created.Count -ne 1) { throw 'Expected exactly one fresh successful package provenance' }
+          $provenance = Get-Content -LiteralPath $created[0].FullName -Raw | ConvertFrom-Json
+          "provenance-path=$($created[0].FullName)" >> $env:GITHUB_OUTPUT
+          "installer-path=$($provenance.installer.path)" >> $env:GITHUB_OUTPUT
+          "checksum-path=$($provenance.installer.checksum_path)" >> $env:GITHUB_OUTPUT
+      - name: Verify NSIS payload and production provenance
+        shell: pwsh
+        env:
+          PACKAGE_PROVENANCE: ${{ steps.windows-package.outputs.provenance-path }}
+        run: ./scripts/verify-windows-package.ps1 -ProvenancePath $env:PACKAGE_PROVENANCE 2>&1 | Tee-Object -FilePath native-evidence/verify-package.log
+      - name: Upload unsigned NSIS installer and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: latte-work-desktop-Windows-${{ runner.arch }}-nsis
+          path: |
+            ${{ steps.windows-package.outputs.installer-path }}
+            ${{ steps.windows-package.outputs.checksum-path }}
+            ${{ steps.windows-package.outputs.provenance-path }}
+          if-no-files-found: error
+      - name: Upload native build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latte-work-desktop-Windows-${{ runner.arch }}-evidence
+          path: native-evidence/
+          if-no-files-found: error
+
   pr-gate:
     name: PR Gate
     if: always()
@@ -200,6 +304,7 @@ jobs:
       - frontend
       - release-server
       - desktop-native
+      - desktop-native-windows
     steps:
       - name: Require every CI layer to pass
         shell: bash
@@ -212,9 +317,10 @@ jobs:
           FRONTEND: ${{ needs.frontend.result }}
           RELEASE_SERVER: ${{ needs.release-server.result }}
           DESKTOP_NATIVE: ${{ needs.desktop-native.result }}
+          DESKTOP_NATIVE_WINDOWS: ${{ needs.desktop-native-windows.result }}
         run: |
           failed=0
-          for name in QUALITY HOST_CHECK UNIT E2E PORTABLE_WINDOWS FRONTEND RELEASE_SERVER DESKTOP_NATIVE; do
+          for name in QUALITY HOST_CHECK UNIT E2E PORTABLE_WINDOWS FRONTEND RELEASE_SERVER DESKTOP_NATIVE DESKTOP_NATIVE_WINDOWS; do
             result="${!name}"
             if [[ "$result" != success ]]; then
               echo "::error::$name was $result; every PR Gate dependency must succeed"

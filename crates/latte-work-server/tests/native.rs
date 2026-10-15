@@ -395,13 +395,35 @@ async fn native_agent_state_files_reconnect_and_restart_share_real_server() {
     );
     std::fs::write(project.join("task.txt"), "before\n").unwrap();
     let mut client = host.client().await;
-    let Response::Hello { agents, .. } = client
+    let Response::Hello {
+        agents,
+        path_syntax,
+        ..
+    } = client
         .request(Request::Hello { version: VERSION })
         .await
         .unwrap()
     else {
         panic!()
     };
+    assert_eq!(
+        path_syntax,
+        Some(if cfg!(windows) {
+            latte_work_protocol::PathSyntax::Windows
+        } else {
+            latte_work_protocol::PathSyntax::Posix
+        })
+    );
+    let listing = ask(
+        &mut client,
+        json!({"method":"browse_directories","path":project}),
+    )
+    .await;
+    assert_eq!(listing["name"], "项目 files");
+    assert_eq!(
+        listing["path"],
+        project.canonicalize().unwrap().to_str().unwrap()
+    );
     assert!(agents[0].available, "{}", agents[0].detail);
     assert!(agents[0].detail.contains("native-fixture"));
     let added = ask(

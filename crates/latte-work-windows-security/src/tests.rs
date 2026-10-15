@@ -60,6 +60,29 @@ fn sddl(path: &Path) -> String {
 }
 
 #[test]
+fn private_file_rejects_a_different_expected_owner_before_reading() {
+    let root = tempfile::tempdir().unwrap();
+    let private = ControlDirectory::create_or_validate(&root.path().join("private")).unwrap();
+    let path = private.path().join("credential.json");
+    std::fs::write(&path, b"fixture-secret").unwrap();
+    let file = open_private_file(&path).unwrap();
+    let mut expected = win32::current_identity().unwrap();
+    // Exercise the actual native descriptor reader without taking ownership or
+    // requiring an elevated token to install another user's owner SID.
+    expected.sid = "S-1-5-18".to_owned();
+    assert_eq!(
+        win32::verify_private_file(&file, &expected)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(std::fs::write(&path, b"replacement").is_err());
+    assert!(std::fs::rename(&path, private.path().join("moved")).is_err());
+    drop(file);
+    assert_eq!(std::fs::read(&path).unwrap(), b"fixture-secret");
+}
+
+#[test]
 fn private_leaf_inherits_nothing_and_pins_until_drop() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("control");

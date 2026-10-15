@@ -8,6 +8,7 @@ export type JsonValue =
   | { [key in string]?: JsonValue }
   | null;
 export type Project = { id: string; name: string; path: string };
+export type PathSyntax = "posix" | "windows";
 export type TerminalInfo = {
   id: string;
   project_id: string;
@@ -603,6 +604,10 @@ export type Response =
       kind: "hello";
       version: number;
       server_id: string;
+      /**
+       * Absent on older hosts; clients must not infer it from their own OS.
+       */
+      path_syntax?: PathSyntax;
       agents: Array<AgentInfo>;
       permission_settings: boolean;
       history_window: boolean;
@@ -652,6 +657,10 @@ export type Response =
   | {
       kind: "directories";
       path: string;
+      /**
+       * Native basename (or root label), absent on older hosts.
+       */
+      name?: string;
       parent: string | null;
       entries: Array<FileEntry>;
       truncated: boolean;

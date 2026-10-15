@@ -152,6 +152,35 @@ pub fn verify_private_file(file: &File) -> io::Result<()> {
     win32::verify_private_file(file, &user)
 }
 
+/// Open an existing private file for reading without traversing reparse points.
+/// Ancestors are pinned until the leaf is open; the returned handle denies writes
+/// and replacement and is verified before any contents are read.
+#[cfg(windows)]
+pub fn open_private_file(path: &Path) -> io::Result<File> {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+
+    let path = path::control_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("private file needs a parent"))?;
+    let mut current = PathBuf::new();
+    let mut guards = Vec::new();
+    for component in parent.components() {
+        current.push(component);
+        if !matches!(component, std::path::Component::Prefix(_)) {
+            guards.push(win32::open_directory(&current)?);
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    verify_private_file(&file)?;
+    Ok(file)
+}
+
 /// SID of the current non-elevated process user, for the separate pipe DACL.
 #[cfg(windows)]
 pub fn current_user_sid() -> io::Result<String> {

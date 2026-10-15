@@ -304,6 +304,7 @@ async fn connection(stream: Stream, service: Service) -> Result<()> {
                         Response::Hello {
                             version: VERSION,
                             server_id: service.server_id.clone(),
+                            path_syntax: Some(host_paths::PATH_SYNTAX),
                             agents: vec![service.agent.clone()],
                             permission_settings: true,
                             history_window: true,

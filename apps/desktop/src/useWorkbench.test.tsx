@@ -96,6 +96,33 @@ const acknowledgements = () =>
   mocks.request.mock.calls.filter(
     ([, r]) => r.method === "mark_session_unread",
   );
+it("keeps path syntax scoped to the target host's actual Hello", async () => {
+  mocks.loadHosts.mockResolvedValue([
+    { id: "local", name: "Local" },
+    { id: "remote", name: "Remote", ssh: "fixture-host" },
+  ]);
+  mocks.connect.mockImplementation(async (host: { id: string }) => ({
+    kind: "hello",
+    server_id: `server-${host.id}`,
+    agents: [],
+    path_syntax: host.id === "local" ? "windows" : "posix",
+  }));
+  const { result } = renderHook(useWorkbench);
+  await act(async () => {});
+  expect(result.current.hostPathSyntax("local")).toBe("windows");
+  const remote = result.current.hosts.find((host) => host.id === "remote")!;
+  await act(async () => result.current.refreshHost(remote));
+  expect(result.current.hostPathSyntax("remote")).toBe("posix");
+  expect(result.current.hostPathSyntax("unknown")).toBeUndefined();
+  mocks.connect.mockResolvedValue({
+    kind: "hello",
+    server_id: "legacy",
+    agents: [],
+  });
+  await act(async () => result.current.refreshHost(remote));
+  expect(result.current.hostPathSyntax("remote")).toBeUndefined();
+  expect(result.current.hostPathSyntax("local")).toBe("windows");
+});
 it.each(["local", "remote"])(
   "starts in a new task after relaunch even when a %s conversation was previously selected",
   async (targetHost) => {

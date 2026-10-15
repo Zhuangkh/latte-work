@@ -55,6 +55,12 @@ pub fn browse_directories(path: Option<&str>) -> Result<latte_work_protocol::Res
     latte_work_platform::paths::absolute(&folder)?;
     let folder = folder.canonicalize().context("目录不存在或无法访问")?;
     let path = folder.to_str().context("目录路径不是 UTF-8")?.to_owned();
+    let name = folder
+        .file_name()
+        .unwrap_or_else(|| folder.as_os_str())
+        .to_str()
+        .context("目录名称不是 UTF-8")?
+        .to_owned();
     let parent = folder
         .parent()
         .map(|p| p.to_str().map(str::to_owned).context("目录路径不是 UTF-8"))
@@ -90,6 +96,7 @@ pub fn browse_directories(path: Option<&str>) -> Result<latte_work_protocol::Res
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(latte_work_protocol::Response::Directories {
         path,
+        name: Some(name),
         parent,
         entries,
         truncated,
@@ -374,6 +381,61 @@ mod tests {
             "子目录/file.txt"
         );
     }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_external_references_preserve_project_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let folder = outside.path().join("中文 docs");
+        std::fs::create_dir(&folder).unwrap();
+        let file = folder.join("中文 file.txt");
+        std::fs::write(&file, "reference only").unwrap();
+
+        for (target, directory) in [(&file, false), (&folder, true)] {
+            let canonical = target.canonicalize().unwrap();
+            let extended = canonical.to_str().unwrap();
+            let drive = extended.strip_prefix(r"\\?\").unwrap();
+            for path in [drive, extended] {
+                let entry = reference(root.path(), path).await.unwrap();
+                assert_eq!(entry.path, extended);
+                assert_eq!(entry.directory, directory);
+                assert_eq!(entry.name, target.file_name().unwrap().to_str().unwrap());
+                assert!(read(root.path(), &entry.path).await.is_err());
+                assert!(list(root.path(), &entry.path).is_err());
+            }
+        }
+        // An explicit reference must not make project-relative traversal valid.
+        assert!(
+            read(root.path(), "../中文 docs/中文 file.txt")
+                .await
+                .is_err()
+        );
+        assert!(list(root.path(), "..").is_err());
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_external_references_reject_invalid_native_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, "text").unwrap();
+        let ads = format!("{}:stream", file.to_str().unwrap());
+        let nul = format!("{}\0suffix", file.to_str().unwrap());
+        let missing = root.path().join("missing.txt");
+        for path in [
+            "relative.txt",
+            "../escape",
+            r"C:relative.txt",
+            r"\root-relative.txt",
+            r"\\server\share\file.txt",
+            r"\\?\UNC\server\share\file.txt",
+            r"\\.\pipe\file",
+            &ads,
+            &nul,
+            missing.to_str().unwrap(),
+        ] {
+            assert!(reference(root.path(), path).await.is_err(), "{path:?}");
+        }
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_backslash_names_remain_literal() {
@@ -452,6 +514,40 @@ mod tests {
             reference(root.path(), socket.to_str().unwrap())
                 .await
                 .is_err()
+        );
+    }
+    #[test]
+    fn directory_browser_names_current_folder_and_root_natively() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("中文 project");
+        std::fs::create_dir(&folder).unwrap();
+        let root = folder.ancestors().last().unwrap();
+        for (path, expected) in [
+            (&folder, "中文 project"),
+            (&root.to_owned(), root.to_str().unwrap()),
+        ] {
+            let response = browse_directories(path.to_str()).unwrap();
+            let latte_work_protocol::Response::Directories { name, .. } = response else {
+                panic!("expected directory listing");
+            };
+            // Canonical Windows roots use the verbatim prefix.
+            let expected = if path == root {
+                path.canonicalize().unwrap().to_str().unwrap().to_owned()
+            } else {
+                expected.to_owned()
+            };
+            assert_eq!(name.as_deref(), Some(expected.as_str()));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn directory_browser_preserves_unix_backslashes_in_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join(r"foo\bar");
+        std::fs::create_dir(&folder).unwrap();
+        let response = browse_directories(folder.to_str()).unwrap();
+        assert!(
+            matches!(response, latte_work_protocol::Response::Directories { name: Some(name), .. } if name == r"foo\bar")
         );
     }
     #[test]

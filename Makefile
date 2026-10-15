@@ -1,6 +1,11 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := help
+ifeq ($(OS),Windows_NT)
+DESKTOP := pwsh -NoProfile -File scripts/desktop.ps1
+else
+DESKTOP := ./scripts/desktop.sh
+endif
 # Per-checkout targets avoid Cargo lock contention; sccache shares compiled dependencies.
 export CARGO_TARGET_DIR ?= $(CURDIR)/target
 SCCACHE := $(shell command -v sccache 2>/dev/null)
@@ -44,11 +49,11 @@ web-build: ## Typecheck and bundle React
 ci: fmt-check types-check lint-ci lint test web-build ## Full local gate
 	RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 build: ## Build server and native app
-	./scripts/desktop.sh build
+	$(DESKTOP) build
 dev: ## Launch real desktop with development UI
-	./scripts/desktop.sh dev
-package: ## Build release app/server and verified drag-install DMG on macOS
-	./scripts/desktop.sh package
+	$(DESKTOP) dev
+package: ## Build unsigned native app/server (macOS DMG or Windows x64 NSIS)
+	$(DESKTOP) package
 server: ## Start host service in foreground
 	cargo run -p latte-work-server --locked -- serve
 clean: ## Remove only this checkout's Cargo build artifacts
@@ -60,7 +65,7 @@ cache-info: ## Show build cache configuration
 
 .PHONY: prepare
 prepare: ## Prepare native sidecar before checking desktop
-	./scripts/desktop.sh prepare
+	$(DESKTOP) prepare
 
 .PHONY: types-check
 types-check: ## Check generated Rust/TypeScript protocol stays synchronized

@@ -14,6 +14,8 @@ mod backend;
 
 #[cfg(windows)]
 pub use backend::directory_identity;
+#[cfg(windows)]
+pub use latte_work_windows_security::open_private_file;
 /// Windows project restore primitives retain project permissions, distinct from PrivateDir.
 #[cfg(windows)]
 pub mod project {
@@ -74,6 +76,14 @@ impl PrivateDir {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Recheck the retained directory's Windows owner/DACL before secret I/O.
+    /// Unix permissions are established by `prepare`.
+    pub fn verify(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        self._guard.verify()?;
+        Ok(())
     }
 
     /// Restrict an existing regular file on Unix; validate its owner/DACL on Windows.

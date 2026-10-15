@@ -359,6 +359,9 @@ it("keeps references unchanged on cancellation and rejects invalid or inaccessib
   expect(screen.queryByLabelText("已添加项目引用")).toBeNull();
 
   const field = screen.getByRole("textbox", { name: "引用绝对路径" });
+  mocks.request.mockRejectedValueOnce(
+    new Error("请输入不超过 4096 字节的绝对路径"),
+  );
   fireEvent.change(field, { target: { value: "../secret" } });
   fireEvent.click(screen.getByRole("button", { name: "添加引用" }));
   expect(await screen.findByRole("alert")).toHaveProperty(
@@ -373,6 +376,119 @@ it("keeps references unchanged on cancellation and rejects invalid or inaccessib
   );
   expect(screen.queryByLabelText("已添加项目引用")).toBeNull();
 });
+it.each([
+  ["manual", String.raw`C:\项目\中文 file.txt`],
+  ["manual", String.raw`\\?\C:\项目\中文 file.txt`],
+  ["manual", "/outside/中文 file.txt"],
+  ["file picker", String.raw`C:\项目\中文 file.txt`],
+  ["folder picker", String.raw`\\?\C:\项目\docs`],
+  ["file picker", "/outside/中文 file.txt"],
+])(
+  "resolves a local %s path unchanged on its host: %s",
+  async (source, path) => {
+    const entry = {
+      name: "chosen",
+      path: "canonical/reference",
+      directory: false,
+    };
+    mocks.choose.mockResolvedValue(path);
+    mocks.request.mockImplementation(async (_host, req) =>
+      req.method === "resolve_reference"
+        ? { kind: "file_reference", entry }
+        : { kind: "files", entries: [] },
+    );
+    render(<Harness hostId="local" />);
+    type("keep this draft");
+    fireEvent.click(screen.getByRole("button", { name: "添加项目引用" }));
+    fireEvent.click(screen.getByRole("button", { name: "工作区外引用…" }));
+    if (source === "manual") {
+      fireEvent.change(screen.getByRole("textbox", { name: "引用绝对路径" }), {
+        target: { value: path },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "添加引用" }));
+      expect(mocks.choose).not.toHaveBeenCalled();
+    } else {
+      const directory = source === "folder picker";
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: directory ? "选择文件夹…" : "选择文件…",
+        }),
+      );
+      expect(mocks.choose).toHaveBeenCalledWith(directory);
+    }
+    await screen.findByRole("button", { name: "移除引用 canonical/reference" });
+    expect(mocks.request).toHaveBeenCalledWith("local", {
+      method: "resolve_reference",
+      project_id: "p",
+      path,
+    });
+    expect(screen.getByRole("textbox", { name: "任务输入" })).toHaveProperty(
+      "value",
+      "keep this draft",
+    );
+    expect(mocks.send).not.toHaveBeenCalled();
+  },
+);
+
+it.each([
+  ["local", "relative/file.txt"],
+  ["local", "../secret"],
+  ["local", String.raw`C:relative.txt`],
+  ["local", String.raw`\root-relative.txt`],
+  ["local", String.raw`\\server\share\file.txt`],
+  ["local", String.raw`\\?\UNC\server\share\file.txt`],
+  ["local", String.raw`\\.\pipe\file`],
+  ["local", String.raw`C:\file.txt:stream`],
+  ["local", "/nul\0path"],
+  ["ssh:unix", String.raw`C:\local\file.txt`],
+])(
+  "preserves the draft when %s rejects its native path: %s",
+  async (hostId, path) => {
+    const hostError = "Host rejected native absolute path";
+    mocks.request.mockImplementation(async (_host, req) => {
+      if (req.method === "resolve_reference") throw new Error(hostError);
+      return { kind: "files", entries: [] };
+    });
+    render(<Harness hostId={hostId} />);
+    type("keep this draft");
+    fireEvent.click(screen.getByRole("button", { name: "添加项目引用" }));
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: hostId === "local" ? "工作区外引用…" : "引用远程路径…",
+      }),
+    );
+    const field = screen.getByRole("textbox", { name: "引用绝对路径" });
+    fireEvent.change(field, { target: { value: path } });
+    fireEvent.click(screen.getByRole("button", { name: "添加引用" }));
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      expect.stringContaining(hostError),
+    );
+    expect(mocks.request).toHaveBeenCalledWith(hostId, {
+      method: "resolve_reference",
+      project_id: "p",
+      path,
+    });
+    expect(
+      mocks.request.mock.calls.filter(
+        ([, req]) => req.method === "resolve_reference",
+      ),
+    ).toHaveLength(1);
+    expect(field).toHaveProperty("value", path);
+    expect(screen.getByRole("textbox", { name: "任务输入" })).toHaveProperty(
+      "value",
+      "keep this draft",
+    );
+    expect(screen.queryByLabelText("已添加项目引用")).toBeNull();
+    expect(screen.getByRole("button", { name: "添加引用" })).toHaveProperty(
+      "disabled",
+      false,
+    );
+    expect(mocks.choose).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+  },
+);
+
 it("discards a late native selection after switching hosts", async () => {
   let finish: (value: string) => void = () => {};
   mocks.choose.mockImplementation(

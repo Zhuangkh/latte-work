@@ -7,6 +7,14 @@ use ts_rs::TS;
 pub const VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
 
+/// Syntax of native absolute paths on the execution host, not the UI platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PathSyntax {
+    Posix,
+    Windows,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct Project {
     pub id: String,
@@ -1000,6 +1008,10 @@ pub enum Response {
     Hello {
         version: u32,
         server_id: String,
+        /// Absent on older hosts; clients must not infer it from their own OS.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        path_syntax: Option<PathSyntax>,
         agents: Vec<AgentInfo>,
         #[serde(default)]
         permission_settings: bool,
@@ -1066,6 +1078,10 @@ pub enum Response {
     },
     Directories {
         path: String,
+        /// Native basename (or root label), absent on older hosts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        name: Option<String>,
         parent: Option<String>,
         entries: Vec<FileEntry>,
         truncated: bool,
@@ -1120,11 +1136,26 @@ mod tests {
                 "permission_settings":true,"history_window":true}"#,
         )
         .unwrap();
-        let Response::Hello { terminal, undo, .. } = response else {
+        let Response::Hello {
+            terminal,
+            undo,
+            path_syntax,
+            ..
+        } = response
+        else {
             panic!("expected hello");
         };
+        assert_eq!(path_syntax, None);
         assert!(terminal, "missing terminal capability must stay compatible");
         assert!(undo, "missing undo capability must stay compatible");
+    }
+    #[test]
+    fn old_directory_listings_do_not_invent_a_native_name() {
+        let response: Response = serde_json::from_str(
+            r#"{"kind":"directories","path":"/tmp","parent":"/","entries":[],"truncated":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(response, Response::Directories { name: None, .. }));
     }
 }
 

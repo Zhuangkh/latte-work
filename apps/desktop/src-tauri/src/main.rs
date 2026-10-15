@@ -6,6 +6,7 @@ mod browser_native;
 mod lifecycle;
 mod paste;
 mod pending_close;
+mod project_folder;
 mod providers;
 mod request_channels;
 mod source_preview;
@@ -777,7 +778,9 @@ async fn choose_reference_path(
     receive.await.map_err(|e| e.to_string())?
 }
 #[tauri::command]
-async fn choose_project_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+async fn choose_project_folder(
+    app: tauri::AppHandle,
+) -> Result<Option<project_folder::ProjectFolder>, String> {
     let (send, receive) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -786,8 +789,8 @@ async fn choose_project_folder(app: tauri::AppHandle) -> Result<Option<String>, 
             let result = folder
                 .map(|p| {
                     p.into_path()
-                        .map(|p| p.to_string_lossy().into_owned())
                         .map_err(|e| e.to_string())
+                        .and_then(project_folder::ProjectFolder::try_from)
                 })
                 .transpose();
             let _ = send.send(result);

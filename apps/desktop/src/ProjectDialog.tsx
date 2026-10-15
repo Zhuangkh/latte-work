@@ -20,8 +20,9 @@ import {
   request,
   type Host,
 } from "./api";
-import type { Response } from "./protocol";
+import type { PathSyntax, Response } from "./protocol";
 import type { Workbench } from "./useWorkbench";
+import { projectFolderName } from "./projectFolderName";
 
 export function ProjectDialog({ state }: { state: Workbench }) {
   const {
@@ -39,6 +40,31 @@ export function ProjectDialog({ state }: { state: Workbench }) {
     addProject,
   } = state;
   const host = hosts.find((h) => h.id === projectHostId) ?? hosts[0];
+  const hostKey = JSON.stringify(host);
+  const currentHost = useRef(hostKey);
+  currentHost.current = hostKey;
+  const [browsedHost, setBrowsedHost] = useState<{
+    hostKey: string;
+    pathSyntax?: PathSyntax;
+  }>();
+  const pathSyntax =
+    state.hostPathSyntax(host.id) ??
+    (browsedHost?.hostKey === hostKey ? browsedHost.pathSyntax : undefined);
+  const pathExample = pathSyntax
+    ? {
+        windows: "C:\\Users\\you\\projects\\my-project",
+        posix: "/home/you/projects/my-project",
+      }[pathSyntax]
+    : "输入主机上的绝对路径";
+  const [selectedFolder, setSelectedFolder] = useState<{
+    hostKey: string;
+    path: string;
+    name?: string;
+  }>();
+  const folderName =
+    (selectedFolder?.hostKey === hostKey && selectedFolder.path === projectPath
+      ? selectedFolder.name
+      : undefined) ?? projectFolderName(projectPath, pathSyntax);
   const [menu, setMenu] = useState(false);
   const source = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -56,10 +82,12 @@ export function ProjectDialog({ state }: { state: Workbench }) {
       mounted.current = false;
     };
   }, []);
-  function selectFolder(path: string) {
-    setProjectPath(path);
-    if (!projectName.trim())
-      setProjectName(path.split("/").filter(Boolean).at(-1) ?? "项目");
+  function selectFolder(folder: { path: string; name?: string }) {
+    setProjectPath(folder.path);
+    setSelectedFolder({ ...folder, hostKey });
+    const selectedName = folder.name;
+    if (selectedName)
+      setProjectName((name) => (name.trim() ? name : selectedName));
     setRemoteBrowser(false);
     setError("");
   }
@@ -71,10 +99,12 @@ export function ProjectDialog({ state }: { state: Workbench }) {
     }
     setPicking(true);
     try {
-      const path = await chooseProjectFolder();
-      if (mounted.current && path) selectFolder(path);
+      const folder = await chooseProjectFolder();
+      if (mounted.current && currentHost.current === hostKey && folder)
+        selectFolder(folder);
     } catch (e) {
-      if (mounted.current) setError(message(e));
+      if (mounted.current && currentHost.current === hostKey)
+        setError(message(e));
     } finally {
       if (mounted.current) setPicking(false);
     }
@@ -115,8 +145,12 @@ export function ProjectDialog({ state }: { state: Workbench }) {
         </button>
         {remoteBrowser ? (
           <RemoteFolderBrowser
+            key={hostKey}
             host={host}
             initialPath={projectPath}
+            onPathSyntax={(syntax) =>
+              setBrowsedHost({ hostKey, pathSyntax: syntax })
+            }
             cancel={() => setRemoteBrowser(false)}
             select={selectFolder}
           />
@@ -238,9 +272,7 @@ export function ProjectDialog({ state }: { state: Workbench }) {
                     <div className="chosen-folder">
                       <Folder size={19} />
                       <div>
-                        <strong>
-                          {projectPath.split("/").filter(Boolean).at(-1) ?? "/"}
-                        </strong>
+                        <strong>{folderName ?? "项目文件夹"}</strong>
                         <span title={projectPath}>{projectPath}</span>
                       </div>
                     </div>
@@ -262,13 +294,12 @@ export function ProjectDialog({ state }: { state: Workbench }) {
                   <summary>输入文件夹路径</summary>
                   <input
                     aria-label="项目绝对路径"
-                    placeholder={
-                      host.ssh
-                        ? "/home/user/projects/my-project"
-                        : "/Users/you/projects/my-project"
-                    }
+                    placeholder={pathExample}
                     value={projectPath}
-                    onChange={(e) => setProjectPath(e.target.value)}
+                    onChange={(e) => {
+                      setSelectedFolder(undefined);
+                      setProjectPath(e.target.value);
+                    }}
                   />
                 </details>
                 {error && (
@@ -296,13 +327,15 @@ export function ProjectDialog({ state }: { state: Workbench }) {
 function RemoteFolderBrowser({
   host,
   initialPath,
+  onPathSyntax,
   cancel,
   select,
 }: {
   host: Host;
   initialPath: string;
+  onPathSyntax: (syntax: PathSyntax | undefined) => void;
   cancel: () => void;
-  select: (path: string) => void;
+  select: (folder: { path: string; name?: string }) => void;
 }) {
   const [listing, setListing] =
     useState<Extract<Response, { kind: "directories" }>>();
@@ -310,7 +343,7 @@ function RemoteFolderBrowser({
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const generation = useRef(0);
-  async function browse(target: string | null) {
+  async function browse(target: string | null, entryName?: string) {
     const ticket = ++generation.current;
     setLoading(true);
     setError("");
@@ -320,6 +353,8 @@ function RemoteFolderBrowser({
         throw new Error(
           hello.kind === "error" ? hello.message : "主机连接失败",
         );
+      if (ticket !== generation.current) return;
+      onPathSyntax(hello.path_syntax);
       const response = await request(host.id, {
         method: "browse_directories",
         path: target,
@@ -327,7 +362,7 @@ function RemoteFolderBrowser({
       if (ticket !== generation.current) return;
       if (response.kind !== "directories")
         throw new Error("此 Server 不支持文件夹浏览，请更新远程 Server");
-      setListing(response);
+      setListing({ ...response, name: response.name ?? entryName });
       setPath(response.path);
     } catch (e) {
       if (ticket === generation.current) setError(message(e));
@@ -379,7 +414,10 @@ function RemoteFolderBrowser({
         ) : (
           <>
             {listing?.entries.map((entry) => (
-              <button key={entry.path} onClick={() => void browse(entry.path)}>
+              <button
+                key={entry.path}
+                onClick={() => void browse(entry.path, entry.name)}
+              >
                 <Folder size={17} />
                 <span>{entry.name}</span>
                 <ChevronRight size={15} />
@@ -404,7 +442,9 @@ function RemoteFolderBrowser({
         <button
           className="primary"
           disabled={loading || !listing || !!error || path !== listing.path}
-          onClick={() => listing && select(listing.path)}
+          onClick={() =>
+            listing && select({ path: listing.path, name: listing.name })
+          }
         >
           选择此文件夹
         </button>

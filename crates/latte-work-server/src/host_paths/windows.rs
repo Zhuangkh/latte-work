@@ -1,5 +1,7 @@
 use std::{io, path::PathBuf};
 
+pub const PATH_SYNTAX: latte_work_protocol::PathSyntax = latte_work_protocol::PathSyntax::Windows;
+
 pub fn provider_directory(state: &std::path::Path) -> io::Result<PathBuf> {
     if state.join("providers.json").try_exists()? {
         return Err(io::Error::new(

@@ -6,4 +6,4 @@ mod backend;
 #[path = "host_paths/windows.rs"]
 mod backend;
 
-pub use backend::{default_state_dir, launch_directory, provider_directory};
+pub use backend::{PATH_SYNTAX, default_state_dir, launch_directory, provider_directory};

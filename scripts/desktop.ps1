@@ -3,7 +3,7 @@
 # so every mode prepares the server binary under apps/desktop/src-tauri/binaries.
 [CmdletBinding()]
 param(
-    [ValidateSet('prepare', 'check', 'test', 'build', 'dev')]
+    [ValidateSet('prepare', 'check', 'test', 'build', 'dev', 'package')]
     [string]$Mode = 'dev'
 )
 $ErrorActionPreference = 'Stop'
@@ -11,7 +11,8 @@ Set-StrictMode -Version Latest
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
+. (Join-Path $PSScriptRoot 'windows-package-common.ps1')
+$targetDir = Get-PackageTargetDirectory $root
 $triple = (& rustc -vV | Select-String '^host: ').ToString().Substring(6).Trim()
 if (-not $triple) { throw 'Cannot determine the Rust host triple' }
 
@@ -31,6 +32,7 @@ function Invoke-Cargo([string[]]$Arguments, [string]$Failure) {
 }
 
 switch ($Mode) {
+    'package' { & (Join-Path $PSScriptRoot 'package-windows-desktop.ps1') }
     'prepare' { Invoke-Prepare }
     'check' {
         Invoke-Prepare
