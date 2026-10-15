@@ -112,6 +112,7 @@ impl Store {
                         interrupted: true,
                         background_pending: false,
                         undo: latte_work_protocol::TurnUndoStatus::Unknown,
+                        undo_unavailable: None,
                     },
                 },
             )?;
@@ -868,7 +869,10 @@ impl Store {
             )
             .optional()?
             .flatten();
-        serde_json::from_str(&data.context("此轮尚未结束或没有保存变更快照")?).map_err(Into::into)
+        let mut turn: crate::task_changes::FrozenTurn =
+            serde_json::from_str(&data.context("此轮尚未结束或没有保存变更快照")?)?;
+        turn.refresh_undo_availability();
+        Ok(turn)
     }
     pub fn last_turn_changes(&self, id: &str) -> Result<Option<crate::task_changes::FrozenTurn>> {
         self.session(id)?;
@@ -1161,6 +1165,21 @@ impl Store {
         tx.commit()?;
         Ok(true)
     }
+    fn event_for_display(&self, session: &str, data: &str) -> Result<EventKind> {
+        let mut event: EventKind = serde_json::from_str(data)?;
+        if let EventKind::TurnChanges { changes } = &mut event
+            && changes.undo_unavailable.is_none()
+            && changes.undo == latte_work_protocol::TurnUndoStatus::Ready
+        {
+            // Project old Windows events without loading their byte snapshots into
+            // the history response. Durable events themselves remain unchanged.
+            changes.undo_unavailable = self.db.query_row(
+                "SELECT CASE WHEN json_type(data,'$.before.root_identity.windows_v1') IS NOT NULL AND json_type(data,'$.before.windows_files_v1') IS NULL AND json_type(data,'$.after.windows_files_v1') IS NULL THEN '此历史快照缺少 Windows 文件权限元数据，不能撤销' ELSE json_extract(data,'$.changes.undo_unavailable') END FROM turn_changes WHERE session_id=?1 AND request_id=?2 AND data IS NOT NULL",
+                params![session, changes.request_id], |row| row.get::<_, Option<String>>(0),
+            ).optional()?.flatten();
+        }
+        Ok(event)
+    }
     /// Reverse pages avoid replaying every historical tool output to show the latest reply.
     pub fn history(
         &self,
@@ -1184,7 +1203,7 @@ impl Store {
         let mut split_text = false;
         while let Some(row) = rows.next()? {
             let data: String = row.get(2)?;
-            let event: EventKind = serde_json::from_str(&data)?;
+            let event = self.event_for_display(id, &data)?;
             let text = match &event {
                 EventKind::Text { text } => Some(text),
                 _ => None,
@@ -1274,7 +1293,7 @@ impl Store {
                 seq: seq as f64,
                 session_id: id.into(),
                 at,
-                event: serde_json::from_str(&data)?,
+                event: self.event_for_display(id, &data)?,
             });
         }
         Ok((events, false))

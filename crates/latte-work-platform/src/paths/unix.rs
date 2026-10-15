@@ -1,4 +1,7 @@
 use std::{io, path::Path};
+pub(super) fn overlap(left: &Path, right: &Path) -> io::Result<bool> {
+    Ok(left.starts_with(right) || right.starts_with(left))
+}
 pub(super) fn component(name: &str) -> io::Result<()> {
     if name.contains('\0') {
         Err(super::invalid())

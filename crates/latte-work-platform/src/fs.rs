@@ -14,6 +14,14 @@ mod backend;
 
 #[cfg(windows)]
 pub use backend::directory_identity;
+/// Windows project restore primitives retain project permissions, distinct from PrivateDir.
+#[cfg(windows)]
+pub mod project {
+    pub use latte_work_windows_security::{
+        DirectoryIdentity as FileIdentity, ProjectMetadata, ProjectPath, PublishedFile,
+        RecoveryDir, StagedFile, delete_file, project_metadata,
+    };
+}
 pub(crate) use backend::open_lock_file;
 
 /// Ordinary application state; Windows inherits ACLs, Unix retains 0700.

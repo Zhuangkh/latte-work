@@ -202,6 +202,10 @@ export type TurnChanges = {
   interrupted: boolean;
   background_pending: boolean;
   undo: TurnUndoStatus;
+  /**
+   * Why these stored snapshots cannot be restored on this host; absent on older servers.
+   */
+  undo_unavailable?: string;
 };
 export type SourceKind = "file" | "directory" | "tool" | "connector";
 export type TaskSource = {

@@ -39,6 +39,10 @@ pub fn absolute(path: &Path) -> io::Result<()> {
 pub fn check_project_links(root: &Path, relative: &Path) -> io::Result<()> {
     backend::check_project_links(root, relative)
 }
+/// Whether two existing project directories overlap, using native identity semantics.
+pub fn overlap(left: &Path, right: &Path) -> io::Result<bool> {
+    backend::overlap(left, right)
+}
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,

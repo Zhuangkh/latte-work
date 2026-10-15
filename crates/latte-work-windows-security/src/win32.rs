@@ -1,4 +1,11 @@
 //! The sole FFI module. See ../SAFETY.md for ownership and trust boundaries.
+#[path = "win32/console.rs"]
+pub(crate) mod console;
+#[cfg(test)]
+#[path = "experiments/mod.rs"]
+mod experiments;
+#[path = "win32/project.rs"]
+pub(crate) mod project;
 use std::{
     ffi::{OsStr, c_void},
     fs::File,

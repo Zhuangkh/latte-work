@@ -398,6 +398,7 @@ export function ChangesView({
           {turn &&
             (turn.undo === "reverted" ||
               turn.undo === "unknown" ||
+              turn.undo_unavailable ||
               turn.interrupted ||
               turn.background_pending) && (
               <p className="panel-notice">
@@ -407,6 +408,7 @@ export function ChangesView({
                     : turn.undo === "unknown"
                       ? "撤销状态待核对，仍显示原始快照。"
                       : "",
+                  turn.undo_unavailable,
                   turn.interrupted ? "本轮已中断，保留已记录的修改。" : "",
                   turn.background_pending
                     ? "采集快照时后台任务尚未结束，保留当时已记录的修改。"

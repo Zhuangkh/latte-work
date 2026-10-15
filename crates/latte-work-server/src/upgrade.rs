@@ -139,7 +139,7 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
         Request::CloseOwnedResources {
             server_id,
             owner_id,
-            resources,
+            mut resources,
         } => {
             validate_resources(&owner_id, &resources)?;
             // A restarted daemon has already lost these ephemeral resources. Never
@@ -151,43 +151,50 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
                 tokio::time::timeout(Duration::from_secs(2), service.lifecycle.draining.write())
                     .await
                     .context("后台正在处理请求")?;
-            for resource in resources {
-                let owned = service
-                    .lifecycle
-                    .owners
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
-                    .get(&resource)
-                    .is_some_and(|id| id == &owner_id);
-                if !owned {
-                    continue;
-                }
-                match &resource {
-                    Resource::AgentSession(id) => {
-                        let exists = service
-                            .runs
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
-                            .contains_key(id);
-                        if exists {
-                            crate::runtime::close(&service.database, &service.runs, id, false)
-                                .await?;
+            // Each actor must receive at most one close even when the batch repeats it.
+            let mut seen = std::collections::HashSet::new();
+            resources.retain(|resource| seen.insert(resource.clone()));
+            let results = futures_util::future::join_all(resources.into_iter().map(|resource| {
+                let owner_id = &owner_id;
+                async move {
+                    let owned = service
+                        .lifecycle
+                        .owners
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
+                        .get(&resource)
+                        .is_some_and(|id| id == owner_id);
+                    if !owned {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    match &resource {
+                        Resource::AgentSession(id) => {
+                            let exists = service
+                                .runs
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
+                                .contains_key(id);
+                            if exists {
+                                crate::runtime::close(&service.database, &service.runs, id, false)
+                                    .await?;
+                            }
+                        }
+                        Resource::Terminal(id) => {
+                            crate::terminal::close(&service.terminals, id).await?;
                         }
                     }
-                    Resource::Terminal(id) => {
-                        service
-                            .terminals
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-                            .close(id);
-                    }
+                    service
+                        .lifecycle
+                        .owners
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
+                        .remove(&resource);
+                    Ok(())
                 }
-                service
-                    .lifecycle
-                    .owners
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
-                    .remove(&resource);
+            }))
+            .await;
+            for result in results {
+                result?;
             }
             Ok(Response::ResourcesClosed)
         }

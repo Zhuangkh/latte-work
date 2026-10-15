@@ -2,6 +2,21 @@ use std::{
     io,
     path::{Component, Path, Prefix},
 };
+pub(super) fn overlap(left: &Path, right: &Path) -> io::Result<bool> {
+    let left_id = crate::fs::directory_identity(left)?;
+    let right_id = crate::fs::directory_identity(right)?;
+    for path in left.ancestors() {
+        if crate::fs::directory_identity(path)? == right_id {
+            return Ok(true);
+        }
+    }
+    for path in right.ancestors() {
+        if crate::fs::directory_identity(path)? == left_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 pub(super) fn component(name: &str) -> io::Result<()> {
     let stem = name
         .split('.')
@@ -64,6 +79,18 @@ pub(super) fn check_project_links(root: &Path, relative: &Path) -> io::Result<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlap_uses_directory_identity_for_case_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("Child");
+        let other = root.path().join("Other");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let alias = std::path::PathBuf::from(child.to_str().unwrap().to_ascii_uppercase());
+        assert!(super::overlap(root.path(), &alias).unwrap());
+        assert!(super::overlap(&alias, &child).unwrap());
+        assert!(!super::overlap(&child, &other).unwrap());
+    }
     #[test]
     fn rejects_windows_aliases_and_device_paths() {
         for name in ["name:stream", "NUL", "COM1.txt", "a.", "a ", "x?y"] {

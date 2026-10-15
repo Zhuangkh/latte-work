@@ -24,6 +24,18 @@ struct WindowsIdentity {
     volume: u64,
     file_id: [u8; 16],
 }
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowsFile {
+    identity: WindowsIdentity,
+    security: String,
+    attributes: u32,
+}
+struct CapturedFile {
+    bytes: Vec<u8>,
+    mode: Option<u32>,
+    windows: Option<WindowsFile>,
+    undo_unavailable: Option<String>,
+}
 use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
 const FILE_LIMIT: usize = 512 * 1024;
@@ -183,6 +195,10 @@ pub struct Snapshot {
     files: BTreeMap<String, Option<Vec<u8>>>,
     #[serde(default)]
     modes: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    windows_files_v1: BTreeMap<String, WindowsFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    undo_unavailable: Option<String>,
     pub truncated: bool,
     pub unavailable: Option<String>,
 }
@@ -193,6 +209,8 @@ impl Snapshot {
             root_identity: None,
             files: BTreeMap::new(),
             modes: BTreeMap::new(),
+            windows_files_v1: BTreeMap::new(),
+            undo_unavailable: None,
             truncated: false,
             unavailable: Some(message),
         }
@@ -207,10 +225,13 @@ impl Snapshot {
                 root_identity: Some(backend::identity(root)?),
                 files: BTreeMap::new(),
                 modes: BTreeMap::new(),
+                windows_files_v1: BTreeMap::new(),
+                undo_unavailable: None,
                 truncated: inventory_truncated,
                 unavailable: None,
             };
             let mut total = 0;
+            let mut metadata_total = 0;
             for path in &paths {
                 let path = path.as_str();
                 if snapshot.files.len() >= COUNT_LIMIT {
@@ -242,16 +263,22 @@ impl Snapshot {
                     snapshot.truncated = true;
                     continue;
                 }
-                let mut bytes = Vec::new();
-                let Some(file) =
-                    if_present(tokio::fs::File::open(target).await.map_err(Into::into))?
+                let capture_root = root.to_path_buf();
+                let capture_path = path.to_owned();
+                let Some(captured) = if_present(
+                    tokio::task::spawn_blocking(move || {
+                        backend::capture_file(&capture_root, &capture_path)
+                    })
+                    .await?,
+                )?
                 else {
                     snapshot.files.insert(path.into(), None);
                     continue;
                 };
-                file.take((FILE_LIMIT + 1) as u64)
-                    .read_to_end(&mut bytes)
-                    .await?;
+                let bytes = captured.bytes;
+                if let Some(reason) = captured.undo_unavailable {
+                    snapshot.undo_unavailable.get_or_insert(reason);
+                }
                 total += bytes.len();
                 if total > TOTAL_LIMIT {
                     snapshot.truncated = true;
@@ -261,8 +288,18 @@ impl Snapshot {
                     snapshot.truncated = true;
                     continue;
                 }
-                if let Some(mode) = backend::mode(&metadata) {
+                if let Some(mode) = captured.mode {
                     snapshot.modes.insert(path.into(), mode);
+                }
+                if let Some(metadata) = captured.windows {
+                    if metadata_total + metadata.security.len() > TOTAL_LIMIT {
+                        snapshot
+                            .undo_unavailable
+                            .get_or_insert("Windows 文件权限元数据超出限制".into());
+                    } else {
+                        metadata_total += metadata.security.len();
+                        snapshot.windows_files_v1.insert(path.into(), metadata);
+                    }
                 }
                 snapshot.files.insert(path.into(), Some(bytes));
             }
@@ -495,11 +532,31 @@ fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 /// Retain only changed bytes after completion; historical previews never read live files.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FrozenTurn {
     pub changes: latte_work_protocol::TurnChanges,
     before: Snapshot,
     after: Snapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_undo_recovery_v1: Option<UndoRecovery>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct UndoRecovery {
+    attempt_id: String,
+    project_root: std::path::PathBuf,
+    project_identity: WindowsIdentity,
+    git_dir: std::path::PathBuf,
+    git_identity: WindowsIdentity,
+    recovery_dir: std::path::PathBuf,
+    recovery_identity: WindowsIdentity,
+    entries: Vec<UndoRecoveryEntry>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct UndoRecoveryEntry {
+    path: String,
+    source_identity: Option<WindowsIdentity>,
+    recovery_name: Option<String>,
+    operation: String,
 }
 impl FrozenTurn {
     pub async fn freeze(
@@ -510,6 +567,7 @@ impl FrozenTurn {
         background_pending: bool,
     ) -> Result<Self> {
         let summary = before.compare(&after).await?;
+        let undo_unavailable = backend::undo_reason(&before, &after);
         before
             .files
             .retain(|path, _| summary.entries.iter().any(|e| &e.path == path));
@@ -520,6 +578,12 @@ impl FrozenTurn {
             .modes
             .retain(|path, _| before.files.contains_key(path));
         after.modes.retain(|path, _| after.files.contains_key(path));
+        before
+            .windows_files_v1
+            .retain(|path, _| before.files.contains_key(path));
+        after
+            .windows_files_v1
+            .retain(|path, _| after.files.contains_key(path));
         Ok(Self {
             changes: latte_work_protocol::TurnChanges {
                 request_id,
@@ -527,18 +591,29 @@ impl FrozenTurn {
                 interrupted,
                 background_pending,
                 undo: latte_work_protocol::TurnUndoStatus::Ready,
+                undo_unavailable,
             },
             before,
             after,
+            windows_undo_recovery_v1: None,
         })
     }
     pub fn validate_undo(&self, root: &Path) -> Result<()> {
         backend::require_undo()?;
+        if let Some(reason) = self
+            .changes
+            .undo_unavailable
+            .clone()
+            .or_else(|| backend::undo_reason(&self.before, &self.after))
+        {
+            bail!("{reason}");
+        }
         if self.changes.undo != latte_work_protocol::TurnUndoStatus::Ready
             || self.changes.summary.truncated
             || self.changes.summary.unavailable.is_some()
             || self.changes.background_pending
             || self.changes.summary.entries.is_empty()
+            || self.changes.summary.entries.len() > COUNT_LIMIT
         {
             bail!("此轮变更无法安全撤销，请查看工作区并手动核对");
         }
@@ -549,22 +624,12 @@ impl FrozenTurn {
             bail!("项目目录已改变，无法安全撤销");
         }
         for entry in &self.changes.summary.entries {
-            if self
-                .before
-                .files
-                .get(&entry.path)
-                .and_then(Option::as_ref)
-                .is_some()
-                && !self.before.modes.contains_key(&entry.path)
-            {
-                bail!("缺少原文件权限，无法撤销");
-            }
+            backend::validate_before(&self.before, &entry.path)?;
             self.verify_current(root, &entry.path)?;
         }
         Ok(())
     }
     fn verify_current(&self, root: &Path, path: &str) -> Result<()> {
-        use std::io::Read;
         if self.before.root_identity != Some(backend::identity(root)?)
             || latte_work_platform::fs::is_link(&root.symlink_metadata()?)
         {
@@ -592,64 +657,40 @@ impl FrozenTurn {
                 _ => {}
             }
         }
-        let expected = self.after.files.get(path).and_then(Option::as_ref);
-        match (target.symlink_metadata(), expected) {
-            (Err(e), None) if e.kind() == std::io::ErrorKind::NotFound => {}
-            (Ok(meta), Some(bytes)) if meta.is_file() && meta.len() <= FILE_LIMIT as u64 => {
-                let mut current = Vec::new();
-                std::fs::File::open(&target)?
-                    .take((FILE_LIMIT + 1) as u64)
-                    .read_to_end(&mut current)?;
-                if &current != bytes
-                    || self
-                        .after
-                        .modes
-                        .get(path)
-                        .is_none_or(|mode| Some(*mode) != backend::mode(&meta))
-                {
-                    bail!("文件在本轮结束后已改变，未撤销：{path}");
-                }
-            }
-            _ => bail!("文件在本轮结束后已改变，未撤销：{path}"),
-        }
-        Ok(())
+        backend::verify_current(self, root, path)
     }
-    pub fn restore(&self, root: &Path) -> Result<()> {
-        backend::require_undo()?;
-        use std::io::Write;
-        // Called only after durable Unknown intent, with host admission paused and
-        // overlapping idle native processes closed. External edits are checked again.
-        for entry in &self.changes.summary.entries {
-            self.verify_current(root, &entry.path)?;
-            let target = root.join(&entry.path);
-            if let Some(bytes) = self.before.files.get(&entry.path).and_then(Option::as_ref) {
-                let mode = self
-                    .before
-                    .modes
-                    .get(&entry.path)
-                    .context("缺少原文件权限，无法撤销")?;
-                let mut temporary =
-                    tempfile::NamedTempFile::new_in(target.parent().context("文件目录缺失")?)?;
-                temporary.write_all(bytes)?;
-                backend::restore_mode(temporary.as_file(), *mode)?;
-                temporary.as_file().sync_all()?;
-                self.verify_current(root, &entry.path)?;
-                if self
-                    .after
-                    .files
-                    .get(&entry.path)
-                    .and_then(Option::as_ref)
-                    .is_some()
-                {
-                    temporary.persist(&target)?;
-                } else {
-                    temporary.persist_noclobber(&target)?;
-                }
-            } else {
-                std::fs::remove_file(&target)?;
-            }
+    pub fn refresh_undo_availability(&mut self) {
+        if self.changes.undo_unavailable.is_none() {
+            self.changes.undo_unavailable = backend::undo_reason(&self.before, &self.after);
         }
-        Ok(())
+    }
+    pub async fn prepare_undo(&self, root: &Path) -> Result<PreparedUndo> {
+        #[cfg(windows)]
+        let git_dir = {
+            let (git_dir, truncated) =
+                files::git(root, &["rev-parse", "--absolute-git-dir"]).await?;
+            if truncated {
+                bail!("Git 目录路径超出限制");
+            }
+            let git_dir = git_dir.strip_suffix('\n').unwrap_or(&git_dir);
+            let git_dir = git_dir.strip_suffix('\r').unwrap_or(git_dir);
+            std::path::PathBuf::from(git_dir)
+        };
+        let turn = self.clone();
+        let root = root.to_owned();
+        tokio::task::spawn_blocking(move || {
+            turn.validate_undo(&root)?;
+            #[cfg(windows)]
+            let files = backend::prepare(&turn, &root, &git_dir)?;
+            #[cfg(unix)]
+            let files = backend::prepare(&turn, &root)?;
+            Ok(PreparedUndo { turn, root, files })
+        })
+        .await?
+    }
+    #[cfg(test)]
+    pub async fn restore(&self, root: &Path) -> Result<()> {
+        self.prepare_undo(root).await?.restore().map(drop)
     }
     pub async fn patch(&self, path: &str) -> Result<(String, bool)> {
         // The summary was computed before compaction. Retained bytes are sufficient
@@ -664,6 +705,70 @@ impl FrozenTurn {
         after.truncated = false;
         before.patch_between(&after, path).await
     }
+}
+fn restore_checkpoint(_completed: usize) -> Result<()> {
+    #[cfg(feature = "test-fixture")]
+    if _completed == 1
+        && let Some(path) = std::env::var_os("LATTE_WORK_TEST_UNDO_BARRIER")
+    {
+        let path = std::path::PathBuf::from(path);
+        std::fs::write(path.join("ready"), b"first file published")?;
+        if path.join("fail").exists() {
+            bail!("fixture: restoration failed after first file");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.join("release").exists() {
+            if std::time::Instant::now() >= deadline {
+                bail!("fixture: restoration barrier timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+#[cfg(windows)]
+fn undo_phase_checkpoint(_phase: &str) -> Result<()> {
+    #[cfg(feature = "test-fixture")]
+    if let Some(path) = std::env::var_os(format!(
+        "LATTE_WORK_TEST_UNDO_{}",
+        _phase.to_ascii_uppercase()
+    )) {
+        let path = std::path::PathBuf::from(path);
+        std::fs::write(path.join("ready"), _phase)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.join("release").exists() {
+            if std::time::Instant::now() >= deadline {
+                bail!("fixture: {_phase} barrier timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+pub struct PreparedUndo {
+    turn: FrozenTurn,
+    root: std::path::PathBuf,
+    files: backend::Prepared,
+}
+impl PreparedUndo {
+    pub fn record_intent(&self, turn: &mut FrozenTurn) {
+        #[cfg(windows)]
+        {
+            turn.windows_undo_recovery_v1 = Some(self.files.intent.clone());
+        }
+        #[cfg(unix)]
+        let _ = turn;
+    }
+    /// Caller persists Unknown before applying; preparation only created staging files.
+    pub fn restore(self) -> Result<RestoredUndo> {
+        Ok(RestoredUndo {
+            _guards: backend::restore(self.files, &self.turn, &self.root)?,
+        })
+    }
+}
+/// Owned file/directory guards are released only after the result transaction commits.
+pub struct RestoredUndo {
+    _guards: backend::Restored,
 }
 async fn no_index(before: &Path, after: &Path, stats: bool) -> Result<(String, bool)> {
     let mut command = Command::new("git");
@@ -864,15 +969,18 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_undo_is_refused_before_any_restore() {
+    async fn windows_legacy_snapshot_is_refused_before_any_restore() {
         let dir = tempfile::tempdir().unwrap();
         repository(dir.path());
         let before = Snapshot::capture(dir.path()).await.unwrap();
         std::fs::write(dir.path().join("dirty.txt"), "changed\n").unwrap();
         let after = Snapshot::capture(dir.path()).await.unwrap();
-        let frozen = FrozenTurn::freeze("r".into(), before, after, false, false)
+        let mut frozen = FrozenTurn::freeze("r".into(), before, after, false, false)
             .await
             .unwrap();
+        frozen.validate_undo(dir.path()).unwrap();
+        frozen.before.windows_files_v1.clear();
+        frozen.after.windows_files_v1.clear();
         assert!(
             frozen
                 .validate_undo(dir.path())
@@ -880,14 +988,14 @@ mod tests {
                 .to_string()
                 .contains("Windows")
         );
-        assert!(frozen.restore(dir.path()).is_err());
+        assert!(frozen.restore(dir.path()).await.is_err());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("dirty.txt")).unwrap(),
             "changed\n"
         );
     }
 
-    fn git(root: &Path, args: &[&str]) {
+    pub(super) fn git(root: &Path, args: &[&str]) {
         assert!(
             std::process::Command::new("git")
                 .current_dir(root)
@@ -898,7 +1006,7 @@ mod tests {
                 .success()
         );
     }
-    fn repository(root: &Path) {
+    pub(super) fn repository(root: &Path) {
         git(root, &["init", "-q"]);
         git(root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("dirty.txt"), "original\n").unwrap();
@@ -1099,7 +1207,6 @@ mod tests {
                 .is_err()
         );
     }
-    #[cfg(unix)]
     #[tokio::test]
     async fn frozen_turns_survive_later_edits_and_restore_only_the_latest_exact_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1153,7 +1260,7 @@ mod tests {
         );
         std::fs::write(root.join("dirty.txt"), "turn two\n").unwrap();
         two.validate_undo(root).unwrap();
-        two.restore(root).unwrap();
+        two.restore(root).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("dirty.txt")).unwrap(),
             "turn one\nsecond line\n"
@@ -1219,7 +1326,7 @@ mod tests {
         std::fs::rename(&root, dir.path().join("original-project")).unwrap();
         std::os::unix::fs::symlink(&external, &root).unwrap();
         assert!(turn.validate_undo(&root).is_err());
-        assert!(turn.restore(&root).is_err());
+        assert!(turn.restore(&root).await.is_err());
         assert_eq!(
             std::fs::read_to_string(external.join("dirty.txt")).unwrap(),
             "after\n"

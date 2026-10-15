@@ -342,10 +342,12 @@ pub(crate) async fn git(root: &Path, args: &[&str]) -> Result<(String, bool)> {
     {
         bytes.truncate(error.valid_up_to());
     }
-    let text = if args
-        .iter()
-        .any(|arg| matches!(*arg, "-z" | "--show-prefix" | "--show-toplevel"))
-    {
+    let text = if args.iter().any(|arg| {
+        matches!(
+            *arg,
+            "-z" | "--show-prefix" | "--show-toplevel" | "--absolute-git-dir"
+        )
+    }) {
         String::from_utf8(bytes).context("Git 文件路径不是 UTF-8")?
     } else {
         // Diff contents are display-only; metadata used as paths must remain exact.

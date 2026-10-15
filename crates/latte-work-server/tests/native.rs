@@ -11,6 +11,14 @@ use std::{
 };
 use tokio::process::{Child, Command};
 const SERVER: &str = env!("CARGO_BIN_EXE_latte-work-server");
+#[path = "native/owned_resources.rs"]
+mod owned_resources;
+#[cfg(windows)]
+#[path = "native/terminal.rs"]
+mod terminal;
+#[cfg(windows)]
+#[path = "native/undo.rs"]
+mod undo;
 struct Host {
     root: tempfile::TempDir,
     fixture: PathBuf,
@@ -18,18 +26,22 @@ struct Host {
 }
 impl Host {
     fn spawn(root: &Path, fixture: &Path) -> Child {
-        Command::new(SERVER)
+        Self::command(root, fixture).spawn().unwrap()
+    }
+    fn command(root: &Path, fixture: &Path) -> Command {
+        let mut command = Command::new(SERVER);
+        command
             .args(["serve", "--state-dir"])
             .arg(root.join("state"))
             .env("LATTE_WORK_CLAUDE", fixture)
             .env("LATTE_WORK_AGENT_ENV", "inherit")
+            .env("LATTE_WORK_TEST_TERMINAL_NO_PROFILE", "1")
             .env("LATTE_NATIVE_PROMPT_LOG", root.join("prompts.log"))
             .env("LATTE_NATIVE_ACTION_LOG", root.join("actions.log"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap()
+            .kill_on_drop(true);
+        command
     }
     async fn start() -> Self {
         #[cfg(unix)]
@@ -459,19 +471,39 @@ async fn native_agent_state_files_reconnect_and_restart_share_real_server() {
     );
     #[cfg(windows)]
     {
-        let refused = ask(
-            &mut client,
-            json!({"method":"undo_turn_changes","session_id":session,"request_id":"native-edit"}),
-        )
-        .await;
-        assert_eq!(refused["kind"], "error");
-        assert!(
-            refused["message"].as_str().unwrap().contains("Windows"),
-            "{refused}"
+        let undo =
+            json!({"method":"undo_turn_changes","session_id":session,"request_id":"native-edit"});
+        let terminal_id = uuid::Uuid::new_v4().to_string();
+        let opened = ask(&mut client, json!({"method":"create_terminal","project_id":project_id,"terminal_id":terminal_id,"cols":80,"rows":24})).await;
+        assert_eq!(opened["kind"], "terminal", "{opened}");
+        let refused = ask(&mut client, undo.clone()).await;
+        assert_eq!(refused["kind"], "error", "{refused}");
+        assert_eq!(
+            ask(
+                &mut client,
+                json!({"method":"close_terminal","terminal_id":terminal_id})
+            )
+            .await["kind"],
+            "ok"
         );
+        std::fs::write(project.join("task.txt"), "external edit\n").unwrap();
+        assert_eq!(ask(&mut client, undo.clone()).await["kind"], "error");
         assert_eq!(
             std::fs::read_to_string(project.join("task.txt")).unwrap(),
-            "fixture edit\n"
+            "external edit\n"
+        );
+        std::fs::write(project.join("task.txt"), "fixture edit\n").unwrap();
+        let restored = ask(&mut client, undo.clone()).await;
+        assert_eq!(restored["changes"]["undo"], "reverted", "{restored}");
+        assert_eq!(
+            std::fs::read_to_string(project.join("task.txt")).unwrap(),
+            "before\n"
+        );
+        std::fs::write(project.join("task.txt"), "post-undo manual edit\n").unwrap();
+        assert_eq!(ask(&mut client, undo).await["changes"]["undo"], "reverted");
+        assert_eq!(
+            std::fs::read_to_string(project.join("task.txt")).unwrap(),
+            "post-undo manual edit\n"
         );
         for path in ["task.txt:stream", "NUL", "task.txt.", "..\\outside"] {
             let refused = ask(
@@ -560,9 +592,17 @@ async fn windows_capabilities_and_invalid_cli_fail_explicitly() {
     )
     .await;
     let project = added["project"]["id"].as_str().unwrap();
-    let terminal = ask(&mut client, json!({"method":"create_terminal","project_id":project,"terminal_id":uuid::Uuid::new_v4().to_string(),"cols":80,"rows":24})).await;
-    assert_eq!(terminal["kind"], "error");
-    assert!(terminal["message"].as_str().unwrap().contains("PTY"));
+    let id = uuid::Uuid::new_v4().to_string();
+    let terminal = ask(&mut client, json!({"method":"create_terminal","project_id":project,"terminal_id":id,"cols":80,"rows":24})).await;
+    assert_eq!(terminal["kind"], "terminal", "{terminal}");
+    assert_eq!(
+        ask(
+            &mut client,
+            json!({"method":"close_terminal","terminal_id":id})
+        )
+        .await["kind"],
+        "ok"
+    );
     host.stop(&mut client).await;
     drop(client);
     host.fixture = host.root.path().join("unsupported.cmd");

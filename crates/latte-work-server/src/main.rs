@@ -55,6 +55,18 @@ impl Service {
     }
 }
 fn main() -> std::process::ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "__terminal")
+    {
+        return match terminal::helper() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("terminal helper: {error:#}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     let bridge = std::env::args_os()
         .nth(1)
         .is_some_and(|command| command == "connect" || command == "connect-local");
@@ -249,18 +261,14 @@ async fn serve(endpoint: &Endpoint) -> Result<()> {
         clients.shutdown().await;
         *service.lifecycle.draining.write().await = true;
     }
-    service
-        .terminals
-        .lock()
-        .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-        .close_all();
-    let (cleanup, ()) = tokio::join!(
+    let (cleanup, terminals) = tokio::join!(
         runtime::shutdown(&service.runs),
-        tokio::time::sleep(Duration::from_secs(3))
+        terminal::close_all(&service.terminals)
     );
     clients.shutdown().await;
     drop(listener);
     cleanup?;
+    terminals?;
     accept_result
 }
 async fn connection(stream: Stream, service: Service) -> Result<()> {
@@ -368,7 +376,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         Request::UndoTurnChanges { .. } | Request::ArchiveSession { archived: true, .. }
     );
     let _exclusive_guard = if exclusive {
-        Some(s.file_admission.write().await)
+        Some(s.file_admission.clone().write_owned().await)
     } else {
         None
     };
@@ -575,20 +583,15 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             rows,
         } => {
             let project = db(&s.database, |d| d.project(&project_id))?;
-            let terminals = s.terminals.clone();
-            tokio::task::spawn_blocking(move || {
-                terminals
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-                    .create(
-                        project_id,
-                        Path::new(&project.path),
-                        terminal_id,
-                        cols,
-                        rows,
-                    )
-            })
-            .await??
+            terminal::create(
+                &s.terminals,
+                project_id,
+                Path::new(&project.path),
+                terminal_id,
+                cols,
+                rows,
+            )
+            .await?
         }
         Request::Terminals { project_id } => {
             db(&s.database, |d| d.project(&project_id))?;
@@ -606,16 +609,10 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             terminal_id,
             cols,
             rows,
-        } => s
-            .terminals
-            .lock()
-            .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-            .resize(&terminal_id, cols, rows)?,
-        Request::CloseTerminal { terminal_id } => s
-            .terminals
-            .lock()
-            .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-            .close(&terminal_id),
+        } => terminal::resize(&s.terminals, &terminal_id, cols, rows).await?,
+        Request::CloseTerminal { terminal_id } => {
+            terminal::close(&s.terminals, &terminal_id).await?
+        }
         Request::Projects => Response::Projects {
             projects: db(&s.database, |d| d.projects())?,
         },
@@ -1293,7 +1290,10 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             let session = db(&s.database, |d| d.session(&session_id))?;
             let project = db(&s.database, |d| d.project(&session.project_id))?;
             let root = Path::new(&project.path);
-            turn.validate_undo(root)?;
+            let validation = turn.clone();
+            let validation_root = root.to_owned();
+            tokio::task::spawn_blocking(move || validation.validate_undo(&validation_root))
+                .await??;
             // Close only idle runtimes in overlapping directories before restoration.
             let running_ids: Vec<_> = s
                 .runs
@@ -1306,20 +1306,29 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 let session = db(&s.database, |d| d.session(&id))?;
                 let other = db(&s.database, |d| d.project(&session.project_id))?;
                 let other = Path::new(&other.path);
-                if root.starts_with(other) || other.starts_with(root) {
+                if latte_work_platform::paths::overlap(root, other)? {
                     runtime::close(&s.database, &s.runs, &session.id, true).await?;
                 }
             }
-            turn.validate_undo(root)?;
-            turn.changes.undo = TurnUndoStatus::Unknown;
-            db(&s.database, |d| d.update_turn(&session_id, &turn))?;
-            turn.restore(root)
-                .context("撤销未能全部完成，状态待核对；请检查工作区，系统不会自动重试")?;
-            turn.changes.undo = TurnUndoStatus::Reverted;
-            db(&s.database, |d| d.update_turn(&session_id, &turn))?;
-            Response::TurnChanges {
-                changes: turn.changes,
-            }
+            let prepared = turn.prepare_undo(root).await?;
+            let database = s.database.clone();
+            // The blocking worker owns admission and prepared guards through all
+            // mutations and the durable result, even if this connection is cancelled.
+            let changes = tokio::task::spawn_blocking(move || {
+                let _admission = _exclusive_guard;
+                prepared.record_intent(&mut turn);
+                turn.changes.undo = TurnUndoStatus::Unknown;
+                db(&database, |d| d.update_turn(&session_id, &turn))?;
+                let restored = prepared
+                    .restore()
+                    .context("撤销未能全部完成，状态待核对；请检查工作区，系统不会自动重试")?;
+                turn.changes.undo = TurnUndoStatus::Reverted;
+                db(&database, |d| d.update_turn(&session_id, &turn))?;
+                drop(restored);
+                Ok::<_, anyhow::Error>(turn.changes)
+            })
+            .await??;
+            Response::TurnChanges { changes }
         }
         Request::LastTurnChanges { session_id } => {
             let turn = db(&s.database, |d| d.last_turn_changes(&session_id))?;

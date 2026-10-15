@@ -2050,6 +2050,92 @@ async fn terminal_until(client: &mut Client, id: &str, cursor: &mut f64, needle:
     }
 }
 #[tokio::test]
+async fn terminal_drains_output_while_a_large_input_waits_for_the_slave() {
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let project = tempfile::tempdir().unwrap();
+    let project_id = terminal_project(&mut client, project.path()).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let script = project.path().join("duplex.py");
+    std::fs::write(
+        &script,
+        r#"import os, signal, sys, termios, tty
+signal.alarm(10)
+original = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    os.write(1, b'RAW_READY\n')
+    assert os.read(0, 1) == b'G'
+    sys.stdout.buffer.write(b'v' * (4 * 1024 * 1024))
+    sys.stdout.buffer.flush()
+    remaining = 16383
+    while remaining:
+        data = os.read(0, remaining)
+        assert data
+        remaining -= len(data)
+    os.write(1, b'\r\nDUPLEX_OK\r\n')
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, original)
+"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::CreateTerminal {
+                project_id,
+                terminal_id: id.clone(),
+                cols: 80,
+                rows: 24
+            }
+        )
+        .await,
+        Response::Terminal { .. }
+    ));
+    terminal_write(
+        &mut client,
+        &id,
+        format!("python3 '{}'\n", script.display()).as_bytes(),
+    )
+    .await;
+    let mut cursor = 0.0;
+    terminal_until(&mut client, &id, &mut cursor, "RAW_READY").await;
+    let mut input = vec![b'x'; 16 * 1024];
+    input[0] = b'G';
+    terminal_write(&mut client, &id, &input).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut tail = Vec::new();
+    loop {
+        let Response::TerminalOutput { data, next, .. } = ask(
+            &mut client,
+            Request::ReadTerminal {
+                terminal_id: id.clone(),
+                after: cursor,
+            },
+        )
+        .await
+        else {
+            panic!("terminal output failed")
+        };
+        assert!(next >= cursor);
+        cursor = next;
+        tail.extend(data);
+        if tail
+            .windows(b"DUPLEX_OK".len())
+            .any(|part| part == b"DUPLEX_OK")
+        {
+            break;
+        }
+        tail.drain(..tail.len().saturating_sub(128));
+        assert!(Instant::now() < deadline, "duplex transfer stalled");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(matches!(
+        ask(&mut client, Request::CloseTerminal { terminal_id: id }).await,
+        Response::Ok
+    ));
+}
+#[tokio::test]
 async fn terminal_pty_cwd_resize_unicode_reconnect_interrupt_and_exit() {
     let host = Host::start().await;
     let mut client = host.client().await;

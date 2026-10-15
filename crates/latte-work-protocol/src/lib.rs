@@ -859,6 +859,10 @@ pub struct TurnChanges {
     pub interrupted: bool,
     pub background_pending: bool,
     pub undo: TurnUndoStatus,
+    /// Why these stored snapshots cannot be restored on this host; absent on older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub undo_unavailable: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]

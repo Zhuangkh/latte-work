@@ -10,6 +10,14 @@ mod path;
 mod win32;
 
 #[cfg(windows)]
+pub use win32::console::{ConsoleChild, PseudoConsole};
+#[cfg(windows)]
+pub use win32::project::{
+    ProjectMetadata, ProjectPath, PublishedFile, RecoveryDir, StagedFile, delete_file,
+    project_metadata,
+};
+
+#[cfg(windows)]
 use std::{
     fs::File,
     io,

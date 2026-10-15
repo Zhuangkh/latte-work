@@ -84,6 +84,9 @@ it("blocks undo for old, incomplete, background or unconfirmed turns", () => {
     { changes: { ...changes, background_pending: true } },
     { changes: { ...changes, undo: "unknown" as const } },
     {
+      changes: { ...changes, undo_unavailable: "缺少 Windows 文件权限元数据" },
+    },
+    {
       changes: { ...changes, summary: { ...changes.summary, truncated: true } },
     },
   ]) {
@@ -97,6 +100,25 @@ it("blocks undo for old, incomplete, background or unconfirmed turns", () => {
     ).toBe(true);
     cleanup();
   }
+});
+it("explains unavailable snapshots while preserving diff access", () => {
+  const reason = "此历史快照缺少 Windows 文件权限元数据，不能撤销";
+  render(
+    <TurnChangesCard
+      {...props}
+      changes={{ ...changes, undo_unavailable: reason }}
+    />,
+  );
+  expect(screen.getByText(reason)).toBeTruthy();
+  const undo = screen.getByRole("button", {
+    name: "撤销",
+  }) as HTMLButtonElement;
+  expect(undo.disabled).toBe(true);
+  expect(undo.title).toBe(reason);
+  fireEvent.click(undo);
+  expect(mocks.request).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "查看变更" }));
+  expect(props.open).toHaveBeenCalled();
 });
 it("keeps the changes card outside folded execution and replaces undo updates in place", () => {
   const turns = turnTranscript([

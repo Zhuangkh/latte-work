@@ -4,12 +4,52 @@ use std::{
     io::{BufRead, Write},
     time::Duration,
 };
+fn terminal_fixture(args: &[std::ffi::OsString]) {
+    let dir = std::path::Path::new(&args[1]);
+    let leaf = args[0] == "--terminal-leaf";
+    let name = if leaf { "leaf" } else { "root" };
+    let file = std::fs::File::create(dir.join(format!("{name}.lock"))).unwrap();
+    file.lock().unwrap();
+    std::fs::write(
+        dir.join(format!("{name}.ready")),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    let mut child = if leaf {
+        None
+    } else {
+        Some(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--terminal-leaf")
+                .arg(dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    // Fixture has a safety lifetime if a failed test loses its Server.
+    std::thread::sleep(Duration::from_secs(30));
+    if let Some(child) = &mut child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop(file);
+}
 fn emit(value: Value) {
     println!("{value}");
     std::io::stdout().flush().unwrap();
 }
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--terminal-tree" || arg == "--terminal-leaf")
+    {
+        terminal_fixture(&args);
+        return;
+    }
     if args.iter().any(|arg| arg == "--version") {
         println!("native-fixture 1");
         return;
@@ -72,6 +112,10 @@ fn main() {
                 }
                 if text == "edit" {
                     std::fs::write("task.txt", "fixture edit\n").unwrap();
+                }
+                if text == "edit-pair" {
+                    std::fs::write("a.txt", "after a\n").unwrap();
+                    std::fs::write("z.txt", "after z\n").unwrap();
                 }
                 emit(
                     json!({"type":"assistant","message":{"content":[{"type":"text","text":format!("native:{text}")}]}}),
