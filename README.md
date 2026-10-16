@@ -39,7 +39,7 @@ Unix SSH can start the daemon on demand. See [SSH setup](docs/remote.md).
 - Request deduplication, reconnect and honest interrupted/unknown state after crashes.
 - Host-owned terminal tabs, read-only file previews and project-scoped Git review.
 - Frozen per-turn changes and guarded Undo; Windows Undo supports eligible local
-  NTFS regular files.
+  NTFS regular files in Git and non-Git projects.
 - App-owned Provider configuration, per-host Agent associations, and per-turn
   model, effort and permission choices. Claude accepts Anthropic Messages;
   OpenAI configurations can be saved but have no implemented Agent adapter.

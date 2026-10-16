@@ -822,7 +822,30 @@ total and 12 seconds. Unknown, oversized and symlink entries are explicitly part
 old tasks without a baseline never retroactively infer one. Task totals/diffs compare
 this baseline with the current worktree, regardless of staging or later commits.
 This is temporal attribution: other writers in a shared directory can appear in
-these net changes. The UI provides separate task and workspace views.
+these net changes. The unified change review page selects task, saved-turn and Git comparison scopes.
+
+Windows supports Undo of eligible ordinary-file additions, modifications and
+deletions in both Git and non-Git projects on local NTFS. It uses saved before/after
+bytes and requires complete file identity, permission and attribute evidence;
+legacy non-Git snapshots that lack this eligibility evidence remain explicitly
+unverifiable. Ordinary-directory Undo on Unix uses the existing Unix restoration
+backend. See [restoration constraints](docs/architecture.md#per-turn-restoration-and-windows-undo).
+
+For Windows non-Git Undo, the server lazily creates a private project-local
+`.latte-work-undo/<attemptUUID>` recovery area. Its namespace must match a durable
+registration in the original daemon's database and a bounded `owner.json` manifest.
+Registration commits before before-image staging. Verified managed roots are
+excluded from live file capture, listings and diffs, including Git force-tracked
+paths and rename endpoints; frozen historical turn diffs and commit/blob views
+remain unchanged. Existing Git recovery stays in `<gitdir>/latte-work-undo` with
+its existing v1 intent; Git roots are not thereby treated as private managed roots.
+
+The registry and manifest guard against accidental namespace collisions, not a
+malicious process running as the same user. Collisions, mismatches and orphaned
+managed stores fail closed. A lost or alternate database cannot adopt an existing
+namespace. The server does not automatically repair, adopt, delete or garbage-collect
+these stores; attempt directories and displaced originals remain after success or
+failure for inspection.
 
 Explicit user reference manifests and actual native tool calls are indexed durably.
 The compact Composer manifest and legacy expanded manifest are both recognized;
@@ -877,8 +900,12 @@ each atomic replacement.
 Files are restored without touching Git's index or refs. A durable unknown intent
 precedes writes; only full success becomes reverted. Failure/crash stays unknown
 and is never automatically retried. Completed repeated Undo requests reconcile
-idempotently. Independent external writers are not locked; post-turn conflicts
-are rejected and an interrupted restoration requires manual workspace inspection.
+idempotently without writing again. On Windows, source handles remain held while
+originals move to recovery and verified before-images are published without
+overwriting an occupied destination. Independent external writers are not globally
+locked; post-turn conflicts are rejected, and an interrupted restoration requires
+manual inspection. Undo does not recreate deleted directory trees or provide a
+transaction across multiple files.
 
 ## Embedded browser
 

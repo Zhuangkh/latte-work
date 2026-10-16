@@ -5,6 +5,7 @@ mod attachments;
 mod files;
 mod git_review;
 mod host_paths;
+mod managed_recovery;
 mod message_queue;
 mod providers;
 mod questions;
@@ -1174,8 +1175,13 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         }
         Request::Files { project_id, path } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
             Response::Files {
-                entries: files::list(Path::new(&p.path), &path)?,
+                entries: files::list_excluding(Path::new(&p.path), &path, &exclusions)?,
             }
         }
         Request::BeginAttachment { name, size } => Response::AttachmentUpload {
@@ -1269,9 +1275,19 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                         "此任务没有记录文件基线，请查看工作区改动".into(),
                     )
                 });
-                baseline.summary(Path::new(&p.path)).await?
+                let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                    &s.database,
+                    Path::new(&p.path),
+                )
+                .await?;
+                baseline.summary(Path::new(&p.path), &exclusions).await?
             } else {
-                task_changes::workspace_summary(Path::new(&p.path)).await?
+                let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                    &s.database,
+                    Path::new(&p.path),
+                )
+                .await?;
+                task_changes::workspace_summary(Path::new(&p.path), &exclusions).await?
             };
             Response::ChangeSummary { summary }
         }
@@ -1326,12 +1342,20 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                     runtime::close(&s.database, &s.runs, &session.id, true).await?;
                 }
             }
-            let prepared = turn.prepare_undo(root).await?;
+            #[cfg(windows)]
+            let git_dir = task_changes::windows_undo_git_dir(root).await?;
+            let root = root.to_owned();
             let database = s.database.clone();
             // The blocking worker owns admission and prepared guards through all
             // mutations and the durable result, even if this connection is cancelled.
             let changes = tokio::task::spawn_blocking(move || {
                 let _admission = _exclusive_guard;
+                let prepared = turn.prepare_undo_blocking(
+                    &root,
+                    &database,
+                    #[cfg(windows)]
+                    git_dir.as_deref(),
+                )?;
                 prepared.record_intent(&mut turn);
                 turn.changes.undo = TurnUndoStatus::Unknown;
                 db(&database, |d| d.update_turn(&session_id, &turn))?;
@@ -1375,7 +1399,14 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             let project = db(&s.database, |d| d.project(&session.project_id))?;
             let baseline =
                 db(&s.database, |d| d.baseline(&session_id))?.context("此任务没有记录文件基线")?;
-            let (text, truncated) = baseline.patch(Path::new(&project.path), &path).await?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&project.path),
+            )
+            .await?;
+            let (text, truncated) = baseline
+                .patch(Path::new(&project.path), &path, &exclusions)
+                .await?;
             Response::Content { text, truncated }
         }
         Request::PreviewSource {
@@ -1434,12 +1465,24 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         }
         Request::ReadFile { project_id, path } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
+            exclusions.require_visible(Path::new(&p.path), &path)?;
             let (text, truncated) = files::read(Path::new(&p.path), &path).await?;
             Response::Content { text, truncated }
         }
         Request::Changes { project_id } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (entries, truncated) = files::changes(Path::new(&p.path)).await?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
+            let (entries, truncated) =
+                files::changes_excluding(Path::new(&p.path), &exclusions).await?;
             Response::Changes { entries, truncated }
         }
         Request::GitInfo { project_id } => {
@@ -1468,8 +1511,29 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             base,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let exclusions = if matches!(
+                scope,
+                latte_work_protocol::GitReviewScope::Branch
+                    | latte_work_protocol::GitReviewScope::Commit
+            ) {
+                None
+            } else {
+                Some(
+                    managed_recovery::ManagedRecoveryExclusions::load_live(
+                        &s.database,
+                        Path::new(&p.path),
+                    )
+                    .await?,
+                )
+            };
             Response::GitReview {
-                review: git_review::review(Path::new(&p.path), scope, base.as_deref()).await?,
+                review: git_review::review_excluding(
+                    Path::new(&p.path),
+                    scope,
+                    base.as_deref(),
+                    exclusions.as_ref(),
+                )
+                .await?,
             }
         }
         Request::GitReviewDiff {
@@ -1481,13 +1545,29 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             full_context,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (text, truncated) = git_review::diff(
+            let exclusions = if matches!(
+                scope,
+                latte_work_protocol::GitReviewScope::Branch
+                    | latte_work_protocol::GitReviewScope::Commit
+            ) {
+                None
+            } else {
+                Some(
+                    managed_recovery::ManagedRecoveryExclusions::load_live(
+                        &s.database,
+                        Path::new(&p.path),
+                    )
+                    .await?,
+                )
+            };
+            let (text, truncated) = git_review::diff_excluding(
                 Path::new(&p.path),
                 scope,
                 base.as_deref(),
                 head.as_deref(),
                 &path,
                 full_context,
+                exclusions.as_ref(),
             )
             .await?;
             Response::Content { text, truncated }
@@ -1498,12 +1578,27 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             section,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (text, truncated) = files::change_diff(Path::new(&p.path), &path, section).await?;
+            let (text, truncated) = files::change_diff_excluding(
+                Path::new(&p.path),
+                &managed_recovery::ManagedRecoveryExclusions::load_live(
+                    &s.database,
+                    Path::new(&p.path),
+                )
+                .await?,
+                &path,
+                section,
+            )
+            .await?;
             Response::Content { text, truncated }
         }
         Request::Diff { project_id } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (text, truncated) = files::diff(Path::new(&p.path)).await?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
+            let (text, truncated) = files::diff_excluding(Path::new(&p.path), &exclusions).await?;
             Response::Content { text, truncated }
         }
     };

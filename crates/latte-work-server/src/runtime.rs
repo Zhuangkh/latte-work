@@ -965,6 +965,14 @@ async fn cleanup_failed_process(process: &mut Option<Process>) -> bool {
     *process = None;
     true
 }
+async fn capture_workspace(
+    database: &Database,
+    root: &Path,
+) -> Result<crate::task_changes::Snapshot> {
+    let exclusions =
+        crate::managed_recovery::ManagedRecoveryExclusions::load_live(database, root).await?;
+    crate::task_changes::Snapshot::capture_excluding(root, &exclusions).await
+}
 async fn finish_turn(
     database: &Database,
     id: &str,
@@ -973,7 +981,7 @@ async fn finish_turn(
     background_pending: bool,
 ) -> Result<()> {
     if let Some((request_id, before)) = db(database, |s| s.pending_turn(id))? {
-        let after = crate::task_changes::Snapshot::capture(std::path::Path::new(path))
+        let after = capture_workspace(database, std::path::Path::new(path))
             .await
             .unwrap_or_else(|e| crate::task_changes::Snapshot::unavailable(e.to_string()));
         let turn = crate::task_changes::FrozenTurn::freeze(
@@ -1075,7 +1083,7 @@ async fn accept_turn(
     // After durable admission, all failures become explicit terminal events. The
     // accepted request ID still reconciles a lost transport response without replay.
     let result = async {
-        let baseline = crate::task_changes::Snapshot::capture(std::path::Path::new(path))
+        let baseline = capture_workspace(database, std::path::Path::new(path))
             .await
             .unwrap_or_else(|e| crate::task_changes::Snapshot::unavailable(e.to_string()));
         db(database, |s| {

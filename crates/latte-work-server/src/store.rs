@@ -21,6 +21,55 @@ pub fn now() -> f64 {
         .as_millis() as f64
 }
 impl Store {
+    #[cfg(windows)]
+    pub fn windows_undo_stores(&self) -> Result<Vec<crate::managed_recovery::Registration>> {
+        let mut statement = self.db.prepare("SELECT substr(store_id,1,257),substr(project_path,1,32769),substr(data,1,65537) FROM windows_undo_stores LIMIT 1001")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() > 1000 {
+            bail!("Undo store registry exceeds the capture limit");
+        }
+        rows.into_iter()
+            .map(|(store_id, project_path, data)| {
+                if store_id.len() > 256 || project_path.len() > 32768 || data.len() > 64 * 1024 {
+                    bail!("Undo registration exceeds the limit");
+                }
+                let record: crate::managed_recovery::Registration = serde_json::from_str(&data)?;
+                if store_id != record.store_uuid || Path::new(&project_path) != record.project_path
+                {
+                    bail!("Undo registry keys do not match the registered identities");
+                }
+                Ok(record)
+            })
+            .collect()
+    }
+    #[cfg(windows)]
+    pub fn register_windows_undo_store(
+        &mut self,
+        record: &crate::managed_recovery::Registration,
+    ) -> Result<()> {
+        let transaction = self.db.transaction()?;
+        transaction.execute(
+            "INSERT INTO windows_undo_stores(store_id,project_path,data) VALUES(?1,?2,?3)",
+            params![
+                record.store_uuid,
+                record
+                    .project_path
+                    .to_str()
+                    .context("project path is not UTF-8")?,
+                serde_json::to_string(record)?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -39,6 +88,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS subagent_native_transcripts(session_id TEXT NOT NULL,task_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(session_id,task_id),FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
         CREATE INDEX IF NOT EXISTS events_session ON events(session_id,seq);
         CREATE TABLE IF NOT EXISTS turn_changes(session_id TEXT NOT NULL REFERENCES sessions(id), request_id TEXT NOT NULL REFERENCES requests(id), baseline TEXT, data TEXT, PRIMARY KEY(session_id,request_id));
+        CREATE TABLE IF NOT EXISTS windows_undo_stores(store_id TEXT PRIMARY KEY, project_path TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS task_baselines(session_id TEXT PRIMARY KEY REFERENCES sessions(id), data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS task_sources(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, data TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(session_id,id));
         CREATE TABLE IF NOT EXISTS observed_tools(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, PRIMARY KEY(session_id,id));

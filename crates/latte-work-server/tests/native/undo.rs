@@ -747,3 +747,249 @@ async fn windows_legacy_turn_is_readable_but_history_and_summary_explain_undo_re
     );
     host.stop(&mut client).await;
 }
+
+#[tokio::test]
+async fn windows_ordinary_directory_crud_undo_is_durable_idempotent_and_keeps_historical_patch() {
+    let mut host = Host::start().await;
+    let project = host.root.path().join("ordinary project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("edit.txt"), b"before\r\n").unwrap();
+    std::fs::write(project.join("delete.dat"), b"before\0\xff").unwrap();
+    let mut client = host.client().await;
+    let session = create_session(&mut client, &project).await;
+    let result = ask(
+        &mut client,
+        json!({"method":"send","session_id":session,"request_id":"crud","text":"wait"}),
+    )
+    .await;
+    assert_eq!(result["kind"], "accepted", "{result}");
+    finished(&mut client, &session, "running").await;
+    std::fs::write(project.join("edit.txt"), b"after\r\n").unwrap();
+    std::fs::remove_file(project.join("delete.dat")).unwrap();
+    std::fs::write(project.join("added.dat"), b"added\0\xfe\r\n").unwrap();
+    ask(&mut client, json!({"method":"cancel","session_id":session})).await;
+    finished(&mut client, &session, "stopped").await;
+    let summary = ask(
+        &mut client,
+        json!({"method":"turn_change_summary","session_id":session,"request_id":"crud"}),
+    )
+    .await;
+    assert!(
+        summary["changes"]["undo_unavailable"].is_null(),
+        "{summary}"
+    );
+    assert_eq!(
+        summary["changes"]["summary"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let patch_request = json!({"method":"turn_change_diff","session_id":session,"request_id":"crud","path":"edit.txt"});
+    let patch = ask(&mut client, patch_request.clone()).await;
+    let undo = json!({"method":"undo_turn_changes","session_id":session,"request_id":"crud"});
+    let result = ask(&mut client, undo.clone()).await;
+    assert_eq!(result["changes"]["undo"], "reverted", "{result}");
+    assert_eq!(
+        std::fs::read(project.join("edit.txt")).unwrap(),
+        b"before\r\n"
+    );
+    assert_eq!(
+        std::fs::read(project.join("delete.dat")).unwrap(),
+        b"before\0\xff"
+    );
+    assert!(!project.join("added.dat").exists());
+    let saved = frozen(&host, &session, "crud");
+    let recovery = &saved["windows_undo_recovery_v2"];
+    assert_eq!(recovery["version"], 2);
+    assert!(saved["windows_undo_recovery_v1"].is_null());
+    assert_original(recovery, "edit.txt", b"after\r\n");
+    assert_original(recovery, "added.dat", b"added\0\xfe\r\n");
+    assert_eq!(patch, ask(&mut client, patch_request.clone()).await);
+    std::fs::write(project.join("edit.txt"), b"later external edit").unwrap();
+    assert_eq!(
+        ask(&mut client, undo.clone()).await["changes"]["undo"],
+        "reverted"
+    );
+    assert_eq!(
+        std::fs::read(project.join("edit.txt")).unwrap(),
+        b"later external edit"
+    );
+    host.stop(&mut client).await;
+    drop(client);
+    host.process = Host::spawn(host.root.path(), &host.fixture);
+    host.ready().await;
+    let mut client = host.client().await;
+    assert_eq!(ask(&mut client, undo).await["changes"]["undo"], "reverted");
+    assert_eq!(patch, ask(&mut client, patch_request).await);
+    assert_eq!(
+        std::fs::read(project.join("edit.txt")).unwrap(),
+        b"later external edit"
+    );
+    host.stop(&mut client).await;
+}
+
+#[tokio::test]
+async fn windows_ordinary_preparation_keeps_admission_after_request_disconnect() {
+    let (mut host, barrier) = barrier_host("LATTE_WORK_TEST_UNDO_PREPARATION", "preparation").await;
+    let project = host.root.path().join("ordinary");
+    std::fs::create_dir(&project).unwrap();
+    let mut client = host.client().await;
+    let session = edit_pair(&mut client, &project).await;
+    let pending = pending_undo(client, &session, "pair");
+    barrier_ready(&barrier).await;
+    assert!(!project.join(".latte-work-undo").exists());
+    pending.abort();
+    let _ = pending.await;
+    let mut writer = host.client().await;
+    let next_session = session.clone();
+    let mut send = tokio::spawn(async move {
+        let result = ask(
+            &mut writer,
+            json!({"method":"send","session_id":next_session,"request_id":"next","text":"wait"}),
+        )
+        .await;
+        (writer, result)
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut send)
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(project.join("a.txt")).unwrap(), b"after a\n");
+    std::fs::write(barrier.join("release"), b"").unwrap();
+    let (mut client, result) = send.await.unwrap();
+    assert_eq!(result["kind"], "accepted", "{result}");
+    assert_eq!(
+        frozen(&host, &session, "pair")["changes"]["undo"],
+        "reverted"
+    );
+    assert_eq!(std::fs::read(project.join("a.txt")).unwrap(), b"before a\n");
+    finished(&mut client, &session, "running").await;
+    ask(&mut client, json!({"method":"cancel","session_id":session})).await;
+    finished(&mut client, &session, "stopped").await;
+    host.stop(&mut client).await;
+}
+
+#[tokio::test]
+async fn windows_ordinary_registration_failure_and_precommit_crash_never_displace_sources() {
+    for crash in [false, true] {
+        let (mut host, barrier) =
+            barrier_host("LATTE_WORK_TEST_UNDO_REGISTRATION", "registration").await;
+        let project = host.root.path().join("ordinary");
+        std::fs::create_dir(&project).unwrap();
+        let mut client = host.client().await;
+        let session = edit_pair(&mut client, &project).await;
+        if !crash {
+            let database = rusqlite::Connection::open(host.state().join("state.sqlite")).unwrap();
+            database.execute_batch("CREATE TRIGGER fail_registration BEFORE INSERT ON windows_undo_stores BEGIN SELECT RAISE(FAIL,'fixture registration rejected'); END;").unwrap();
+        }
+        let undo = pending_undo(client, &session, "pair");
+        barrier_ready(&barrier).await;
+        assert!(project.join(".latte-work-undo/owner.json").exists());
+        assert_eq!(std::fs::read(project.join("a.txt")).unwrap(), b"after a\n");
+        assert!(!std::fs::read_dir(&project).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".latte-undo-")
+        }));
+        if crash {
+            host.process.kill().await.unwrap();
+        } else {
+            std::fs::write(barrier.join("release"), b"").unwrap();
+        }
+        let (mut client, result) = undo.await.unwrap();
+        if crash {
+            assert!(result.is_err());
+        } else {
+            assert!(matches!(result.unwrap(), Response::Error { .. }));
+            host.stop(&mut client).await;
+        }
+        drop(client);
+        let database = rusqlite::Connection::open(host.state().join("state.sqlite")).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM windows_undo_stores", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(database);
+        host.process = Host::spawn(host.root.path(), &host.fixture);
+        host.ready().await;
+        let mut client = host.client().await;
+        let result = ask(
+            &mut client,
+            json!({"method":"undo_turn_changes","session_id":session,"request_id":"pair"}),
+        )
+        .await;
+        assert_eq!(result["kind"], "error", "{result}");
+        assert_eq!(std::fs::read(project.join("a.txt")).unwrap(), b"after a\n");
+        assert_eq!(std::fs::read(project.join("z.txt")).unwrap(), b"after z\n");
+        let project_id = ask(
+            &mut client,
+            json!({"method":"add_project","path":project,"name":null}),
+        )
+        .await["project"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            ask(
+                &mut client,
+                json!({"method":"change_summary","project_id":project_id,"session_id":session})
+            )
+            .await["kind"],
+            "error"
+        );
+        host.stop(&mut client).await;
+    }
+}
+
+#[tokio::test]
+async fn windows_ordinary_partial_restore_crash_retains_original_and_unknown_without_replay() {
+    let (mut host, barrier) =
+        barrier_host("LATTE_WORK_TEST_UNDO_BARRIER", "ordinary-partial").await;
+    let project = host.root.path().join("ordinary");
+    std::fs::create_dir(&project).unwrap();
+    let mut client = host.client().await;
+    let session = edit_pair(&mut client, &project).await;
+    let undo = pending_undo(client, &session, "pair");
+    barrier_ready(&barrier).await;
+    let saved = frozen(&host, &session, "pair");
+    let recovery = saved["windows_undo_recovery_v2"].clone();
+    assert_eq!(saved["changes"]["undo"], "unknown");
+    assert_original(&recovery, "a.txt", b"after a\n");
+    assert_eq!(std::fs::read(project.join("a.txt")).unwrap(), b"before a\n");
+    assert_eq!(std::fs::read(project.join("z.txt")).unwrap(), b"after z\n");
+    host.process.kill().await.unwrap();
+    let (_, result) = undo.await.unwrap();
+    assert!(result.is_err());
+    host.process = Host::spawn(host.root.path(), &host.fixture);
+    host.ready().await;
+    let mut client = host.client().await;
+    let summary = ask(
+        &mut client,
+        json!({"method":"turn_change_summary","session_id":session,"request_id":"pair"}),
+    )
+    .await;
+    assert_eq!(summary["changes"]["undo"], "unknown");
+    assert_eq!(
+        ask(
+            &mut client,
+            json!({"method":"undo_turn_changes","session_id":session,"request_id":"pair"})
+        )
+        .await["kind"],
+        "error"
+    );
+    assert_eq!(
+        frozen(&host, &session, "pair")["windows_undo_recovery_v2"],
+        recovery
+    );
+    assert_original(&recovery, "a.txt", b"after a\n");
+    assert_eq!(std::fs::read(project.join("a.txt")).unwrap(), b"before a\n");
+    assert_eq!(std::fs::read(project.join("z.txt")).unwrap(), b"after z\n");
+    host.stop(&mut client).await;
+}

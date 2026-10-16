@@ -58,6 +58,28 @@ lint has been weakened.
   no secret bytes are read on rejection. The returned handle prevents writes and
   replacement during a bounded read. It never changes source permissions and
   supports safe legacy imports from ordinary mixed-use parent directories.
+- `ManagedRecoveryRoot::create_new(project_root, expected_project_identity)`
+  creates the fixed `.latte-work-undo` namespace for an ordinary project. It pins
+  the project and all ancestors, verifies the expected project identity and local
+  NTFS volume, then creates and verifies a token-user-owned, protected sole-user
+  directory. Any existing namespace, including an empty interrupted creation,
+  fails without adoption, repair or cleanup.
+- `ManagedRecoveryRoot::open_verified(project_root, expected_project_identity,
+  expected_store_identity)` creates nothing. It verifies both independently
+  registered identities and the store's private directory policy. `identity()`
+  and `project_identity()` read the pinned handles; a manifest alone never
+  authorizes reopening. Registration and manifest interpretation belong to Server.
+- Managed root manifest methods address only `owner.json`. Writes use a private
+  CREATE_NEW file, verify it before writing and call `sync_all` before returning.
+  Reads validate the same opened file's owner, protected sole-user DACL and ordinary
+  project-file metadata before reading bytes, with read-only sharing. The caller's
+  bound must be 1–65,536 bytes; reads allow one extra byte to detect oversized input.
+  Failed writes may leave an incomplete manifest for inspection; no overwrite or
+  automatic cleanup is provided.
+- `ManagedRecoveryRoot::create_attempt(uuid)` creates a new private UUID-named
+  directory on the project volume and returns a `RecoveryDir`. It clones every
+  pinned ancestor handle, so dropping the root guard does not release the attempt's
+  path protection. Existing attempts are never adopted, repaired or removed.
 
 Platform retains its state-directory API and adds `control` exactly once before
 calling the security crate. That distinction is covered by a regression test.
@@ -165,8 +187,8 @@ transport application bytes.
 
 ## ConPTY and project restoration
 
-`win32/console.rs` and `win32/project.rs` are private child modules of the same
-Win32 boundary. Platform re-exports safe owned interfaces; no HANDLE, HPCON,
+`win32/console.rs`, `win32/project.rs` and its `project/managed.rs` child are within
+the same Win32 boundary. Platform re-exports safe owned interfaces; no HANDLE, HPCON,
 security descriptor pointer or unsafe requirement escapes to Server.
 
 - PseudoConsole uniquely owns HPCON; synchronous non-inheritable pipes are Files.
@@ -189,6 +211,15 @@ security descriptor pointer or unsafe requirement escapes to Server.
   allocation through SetSecurityInfo. Returned UTF-16 is read only through its first
   terminator within the returned bound. Null/incomplete restoration descriptors fail;
   neither SACL access nor privilege adjustment is requested.
+- Managed store and attempt creation pass an explicit token-user owner and
+  protected sole-user full-control DACL to CreateDirectoryW. The terminated UTF-16
+  path, SECURITY_ATTRIBUTES and LocalMemory-owned descriptor remain live for the
+  call. Creation collisions propagate; only a successfully opened and verified
+  non-reparse directory becomes a capability. Manifest protection checks use a
+  GetSecurityInfo allocation owned by LocalMemory, with no borrowed pointer escaping.
+  Operations recheck the pinned store's private ACL before manifest access or
+  attempt creation. Project ancestry rejects ambiguous, short-name, `.git` and
+  reparse aliases; ancestry ACLs are preserved rather than made private.
 - StagedFile creates an exclusive new same-directory file. It sets recorded security
   and verifies exact readback before returning a content writer (inherited ACEs can
   change with the parent); then Server writes bytes, attributes and flushes. FILE_RENAME_INFO uses bounded aligned
@@ -196,6 +227,14 @@ security descriptor pointer or unsafe requirement escapes to Server.
   unpublished temporary objects are deleted through their own handle. Only those
   temporary objects may have readonly cleared for cleanup. Delete of a user target
   requires a separate validated DELETE handle and never clears its readonly flag.
+- Both recovery capabilities displace an exact held source through a no-replace
+  rename, check the destination identity and return the source handle. Displacement
+  preserves its bytes and security descriptor; it does not rewrite it to the
+  managed directory's ACL policy. The returned file only closes on Drop. Staged
+  publication likewise uses no-replace rename and retains the published handle.
+  The existing `RecoveryDir::create(git_dir, attempt)` keeps its Git namespace and
+  inherited ACL behavior; the managed store's private-directory guarantees do not
+  apply to all Git recovery roots or to displaced files.
 - Project ACLs are not App private-storage ACLs. Caller preflight, owned admission,
   Unknown intent, per-file revalidation and final readback live in Server. Legacy
   rename cannot atomically compare destination identity; multi-file restoration is
@@ -253,6 +292,15 @@ Unicode/long paths, ambiguous path rejection and non-pipe handle rejection.
 Platform tests cover real parent/child pipe authentication in both directions,
 peer exit rejection, first-instance collision, SQOS-opening round trip, remote
 name rejection and busy-pipe timeout, with bounded process/I/O waits.
+
+`project/managed_tests.rs` covers managed root/manifest/attempt private creation,
+registered-identity reopening, collision and identity rejection without mutation,
+manifest bounds and unprotected ACL rejection, store ACL changes without repair,
+retained attempt guards after root drop, and displaced identity/security preservation.
+It also covers unsafe attempt names, project/store junctions and manifest hard-link
+and reparse rejection. The short-name fixture exercises alias rejection only when
+the NTFS volume provides an 8.3 alias. These are native capability tests, separate
+from Server registration, durable Undo recovery and real UI acceptance.
 
 Platform's [process lifecycle tests](../../docs/process-lifecycle.md) also cover
 real descendants after root exit, nested Jobs, supervisor death, task cancellation,

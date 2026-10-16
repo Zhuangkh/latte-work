@@ -354,7 +354,9 @@ match across systems. `windows_files_v1` records file identity, owner/group/DACL
 supported attributes instead of fabricating Unix modes. Content and metadata are
 read from the same opened object and checked for changes. Legacy Windows history
 remains readable, with an explicit `undo_unavailable` reason when restoration metadata
-is absent; current files cannot supply missing historical metadata.
+is absent; current files cannot supply missing historical metadata. Legacy non-Git
+snapshots that did not assess Windows Undo eligibility remain explicitly unverifiable;
+this capability does not make every historical snapshot undoable.
 
 ## Windows terminal backend
 
@@ -397,8 +399,9 @@ overlapping idle Agent runtimes close first. The owned admission guard stays wit
 blocking restore worker through preparation, publication and durable outcome, even
 if its caller disconnects. Git index and refs remain unchanged.
 
-Windows supports additions, modifications and deletions of local NTFS regular files,
-including empty/binary/CRLF content. It restores before bytes, restorable owner/group/
+Windows supports additions, modifications and deletions of eligible local NTFS regular
+files in Git and non-Git projects, including empty/binary/CRLF content. It restores
+saved before bytes, restorable owner/group/
 DACL protection/inheritance, and readonly/hidden/system/archive attributes. It refuses:
 
 - Missing/partial/legacy restoration metadata, metadata-only turns, non-latest turns,
@@ -413,21 +416,49 @@ No elevation, ownership takeover or temporary ACL widening is attempted. File ID
 timestamps, SACL auditing, empty directories and whole deleted directory trees are
 not restored. The Windows directory identity comparison recognizes casing aliases.
 
+Git recovery continues to use `<gitdir>/latte-work-undo/<attemptUUID>` and the existing
+`windows_undo_recovery_v1` intent. This does not classify every Git recovery root as
+private managed storage. Non-Git Undo lazily creates a separate private namespace
+at `<project>/.latte-work-undo`, with one child per attempt UUID. A v2 registration
+in the daemon's SQLite store and a flushed `owner.json` manifest (at most 64 KiB)
+must agree on kind/version, store UUID, project/namespace paths and native identities.
+Protected ACLs and retained directory handles are also verified. Registration commits
+before attempt creation and before-image staging; the non-Git durable intent uses
+`windows_undo_recovery_v2` and includes the managed registration.
+
+Only verified registered managed roots are excluded from live capture, file listings
+and workspace diffs, including Git force-tracked paths and both rename endpoints.
+Identity checks cover casing aliases and overlapping projects; merely naming an
+ordinary directory `.latte-work-undo` does not hide its contents. Frozen historical
+turn patches and Git commit/blob views keep their existing semantics.
+
+The registry and manifest prevent accidental collisions; they do not defend against
+a malicious same-user process. Existing namespace collisions, identity/manifest
+mismatches and recognizable orphaned stores fail closed. A lost or alternate daemon
+database cannot adopt an existing namespace. No automatic repair, adoption, deletion
+or garbage collection occurs. Attempt directories and displaced originals are kept
+after both success and failure.
+
 Restoration pins the root and parents, validates every after-image, and prepares all
 same-directory before-image files before touching targets. A staged file receives its
 recorded security and exact readback before content is written, then attributes/flush
 and metadata verification. Preparation failure removes only owned temporary files.
-Immediately before the first target mutation, the worker durably records **Unknown**.
-It rechecks each target and publishes through source-handle `FileRenameInfo` (or a
-validated handle deletion); creation of a deleted file cannot overwrite a new target.
+Before restoration mutates any target, the worker durably records **Unknown**.
+It retains each validated source handle, moves the original into its same-volume
+recovery attempt through that handle, then publishes the verified before-image with
+no replacement. Undo of an added file leaves its original in recovery and verifies
+that the project path is absent. Undo of a deleted file also uses no-replace
+publication, so a newly occupied destination cannot be overwritten.
 Only complete restoration and readback records **Reverted**. Repeated successful Undo
 returns the saved outcome without overwriting later edits. Failure/restart stays
 Unknown, with no automatic retry or rollback. Preparation/publication each have a
 12-second budget checked at file boundaries, not a promise to interrupt kernel I/O.
 
-Traditional Windows rename requires releasing the target validation handle and cannot
-atomically compare the destination File ID. Independent editors can write between the
-last check and publication. Multi-file Undo is nontransactional: failure may leave only
-some files restored. A killed worker may leave `.latte-undo-*` files with the restored
-permissions; users must inspect these alongside the Unknown workspace. Restart neither
-cleans them automatically nor resumes the operation.
+Retained source handles reject ordinary writers and deleters; independent external
+editors are not globally locked. An editor can occupy the destination after displacement,
+in which case publication fails without replacing that file and the displaced original
+remains in recovery. Multi-file Undo is nontransactional: failure may leave only some
+files restored. It does not recreate deleted directory trees. A killed worker may also
+leave `.latte-undo-*` staging files with the restored permissions; users must inspect
+these and the retained recovery attempt alongside the Unknown workspace. Restart
+neither cleans them automatically nor resumes the operation.

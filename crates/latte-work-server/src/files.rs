@@ -1,4 +1,5 @@
 //! Read-only project inspection, with canonical containment and bounded output.
+use crate::managed_recovery::ManagedRecoveryExclusions;
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{ChangeSection, FileEntry, GitChange};
 use std::{
@@ -120,10 +121,15 @@ pub fn resolve(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
     }
     Ok(target)
 }
-pub fn list(root: &Path, path: &str) -> Result<Vec<FileEntry>> {
+pub fn list_excluding(
+    root: &Path,
+    path: &str,
+    exclusions: &ManagedRecoveryExclusions,
+) -> Result<Vec<FileEntry>> {
+    exclusions.require_visible(root, path)?;
     let folder = resolve(root, path)?;
     let mut entries = Vec::new();
-    for entry in folder.read_dir()?.take(1001) {
+    for entry in folder.read_dir()? {
         let entry = entry?;
         let name = entry
             .file_name()
@@ -137,6 +143,12 @@ pub fn list(root: &Path, path: &str) -> Result<Vec<FileEntry>> {
             continue;
         }
         let relative = latte_work_platform::paths::relative_text(&Path::new(path).join(&name))?;
+        if exclusions.contains(root, &relative)? {
+            continue;
+        }
+        if entries.len() >= 1000 {
+            break;
+        }
         let Ok(target) = resolve(root, &relative) else {
             continue;
         };
@@ -152,6 +164,10 @@ pub fn list(root: &Path, path: &str) -> Result<Vec<FileEntry>> {
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(entries)
+}
+#[cfg(test)]
+fn list(root: &Path, path: &str) -> Result<Vec<FileEntry>> {
+    list_excluding(root, path, &ManagedRecoveryExclusions::empty())
 }
 pub async fn read(root: &Path, path: &str) -> Result<(String, bool)> {
     let target = resolve(root, path)?;
@@ -170,33 +186,78 @@ pub async fn read(root: &Path, path: &str) -> Result<(String, bool)> {
     }
     Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
-pub async fn diff(root: &Path) -> Result<(String, bool)> {
-    let (unstaged, a) = git(root, &["diff", "--no-ext-diff", "--no-textconv", "--", "."]).await?;
-    let (staged, b) = git(
-        root,
-        &[
-            "diff",
-            "--cached",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--",
-            ".",
-        ],
-    )
-    .await?;
-    let (status, c) = git(
-        root,
-        &["status", "--short", "--untracked-files=normal", "--", "."],
-    )
-    .await?;
-    Ok((
-        format!("# 工作区状态\n{status}\n# 未暂存改动\n{unstaged}\n# 已暂存改动\n{staged}"),
-        a || b || c,
-    ))
+pub async fn diff_excluding(
+    root: &Path,
+    exclusions: &ManagedRecoveryExclusions,
+) -> Result<(String, bool)> {
+    let (entries, mut truncated) = changes_excluding(root, exclusions).await?;
+    let status = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} {}\n",
+                entry.status,
+                crate::git_review::quote_path(&entry.path)
+            )
+        })
+        .collect::<String>();
+    let mut sections = Vec::new();
+    for section in [ChangeSection::Unstaged, ChangeSection::Staged] {
+        let paths: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.section == section)
+            .flat_map(|entry| {
+                std::iter::once(entry.path.as_str()).chain(entry.previous_path.as_deref())
+            })
+            .collect();
+        if paths.is_empty() {
+            sections.push(String::new());
+            continue;
+        }
+        // Renames crossing the private boundary are deliberately omitted by changes.
+        // Both validated endpoints preserve ordinary rename semantics in this patch.
+        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--find-renames"];
+        if section == ChangeSection::Staged {
+            args.push("--cached");
+        }
+        args.push("--");
+        args.extend(paths);
+        let (text, partial) = git(root, &args).await?;
+        truncated |= partial;
+        sections.push(text);
+    }
+    let mut text = format!(
+        "# 工作区状态\n{status}\n# 未暂存改动\n{}\n# 已暂存改动\n{}",
+        sections[0], sections[1]
+    );
+    if text.len() > LIMIT {
+        truncated = true;
+        let mut end = LIMIT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    Ok((text, truncated))
+}
+#[cfg(all(test, unix))]
+async fn changes(root: &Path) -> Result<(Vec<GitChange>, bool)> {
+    changes_excluding(root, &ManagedRecoveryExclusions::empty()).await
+}
+#[cfg(all(test, unix))]
+async fn diff(root: &Path) -> Result<(String, bool)> {
+    diff_excluding(root, &ManagedRecoveryExclusions::empty()).await
+}
+#[cfg(all(test, unix))]
+async fn change_diff(root: &Path, path: &str, section: ChangeSection) -> Result<(String, bool)> {
+    change_diff_excluding(root, &ManagedRecoveryExclusions::empty(), path, section).await
 }
 /// Porcelain -z always reports repository-relative paths, including in subprojects.
 /// Read one bounded snapshot, and keep project paths literal throughout Git calls.
-pub async fn changes(root: &Path) -> Result<(Vec<GitChange>, bool)> {
+pub async fn changes_excluding(
+    root: &Path,
+    exclusions: &ManagedRecoveryExclusions,
+) -> Result<(Vec<GitChange>, bool)> {
     let (prefix, _) = git(root, &["rev-parse", "--show-prefix"]).await?;
     let prefix = prefix.strip_suffix('\n').unwrap_or(&prefix);
     let (status, mut truncated) = git(
@@ -234,6 +295,15 @@ pub async fn changes(root: &Path) -> Result<(Vec<GitChange>, bool)> {
         let previous_path = previous
             .and_then(|path| path.strip_prefix(prefix))
             .map(str::to_owned);
+        if exclusions.contains(root, path)?
+            || previous_path
+                .as_deref()
+                .map(|p| exclusions.contains(root, p))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            continue;
+        }
         for (flag, section) in if flags == b"??" {
             vec![(b'?', ChangeSection::Untracked)]
         } else {
@@ -267,11 +337,13 @@ pub async fn changes(root: &Path) -> Result<(Vec<GitChange>, bool)> {
     }
     Ok((entries, truncated))
 }
-pub async fn change_diff(
+pub async fn change_diff_excluding(
     root: &Path,
+    exclusions: &ManagedRecoveryExclusions,
     path: &str,
     section: ChangeSection,
 ) -> Result<(String, bool)> {
+    exclusions.require_visible(root, path)?;
     if path.is_empty()
         || path.len() > 4096
         || path.contains('\0')
@@ -282,6 +354,13 @@ pub async fn change_diff(
     {
         bail!("路径必须位于项目目录内");
     }
+    let (entries, partial) = changes_excluding(root, exclusions).await?;
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.path == path && entry.section == section)
+    else {
+        return Ok((String::new(), partial));
+    };
     if section == ChangeSection::Untracked {
         let (text, truncated) = read(root, path).await?;
         // Plain contents, not a synthetic patch: binary and symlink checks stay in read().
@@ -297,11 +376,7 @@ pub async fn change_diff(
     if section == ChangeSection::Staged {
         args.push("--cached");
     }
-    let (entries, _) = changes(root).await?;
-    let previous = entries
-        .iter()
-        .find(|entry| entry.path == path && entry.section == section)
-        .and_then(|entry| entry.previous_path.as_deref());
+    let previous = entry.previous_path.as_deref();
     args.extend(["--", path]);
     if let Some(previous) = previous {
         args.push(previous);
@@ -309,6 +384,64 @@ pub async fn change_diff(
     git(root, &args).await
 }
 
+/// Index/worktree renames can be absent from one scoped diff. Keep both
+/// endpoints vetoed when the combined porcelain record crosses private storage.
+pub(crate) async fn private_rename_paths(
+    root: &Path,
+    exclusions: &ManagedRecoveryExclusions,
+) -> Result<std::collections::HashSet<String>> {
+    let (prefix, prefix_truncated) = git(root, &["rev-parse", "--show-prefix"]).await?;
+    let (status, truncated) = git(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )
+    .await?;
+    if truncated || prefix_truncated {
+        bail!("Git rename boundary information exceeds the read limit");
+    }
+    let prefix = prefix.trim_end_matches('\n');
+    let mut records = status.split('\0');
+    let mut veto = std::collections::HashSet::new();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() < 4 || record.as_bytes()[2] != b' ' {
+            bail!("Invalid Git rename boundary record");
+        }
+        if !record.as_bytes()[..2]
+            .iter()
+            .any(|flag| matches!(flag, b'R' | b'C'))
+        {
+            continue;
+        }
+        let previous = records
+            .next()
+            .context("Incomplete Git rename boundary record")?;
+        let path = record[3..].strip_prefix(prefix);
+        let previous = previous.strip_prefix(prefix);
+        if path
+            .map(|path| exclusions.contains(root, path))
+            .transpose()?
+            .unwrap_or(false)
+            || previous
+                .map(|path| exclusions.contains(root, path))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            veto.extend(path.map(str::to_owned));
+            veto.extend(previous.map(str::to_owned));
+        }
+    }
+    Ok(veto)
+}
 pub(crate) async fn git(root: &Path, args: &[&str]) -> Result<(String, bool)> {
     let mut child = Command::new("git")
         .args([
@@ -667,5 +800,51 @@ mod tests {
                 .unwrap()
                 .1
         );
+    }
+    #[tokio::test]
+    async fn change_diff_missing_from_bounded_listing_preserves_partial_state() {
+        let root = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "core.autocrlf", "false"]);
+        let paths: Vec<_> = (0..1002)
+            .map(|index| format!("file-{index:04}.txt"))
+            .collect();
+        for path in &paths {
+            std::fs::write(root.path().join(path), b"actual contents\n").unwrap();
+        }
+        let exclusions = ManagedRecoveryExclusions::empty();
+        for section in [ChangeSection::Untracked, ChangeSection::Staged] {
+            if section == ChangeSection::Staged {
+                run(&["add", "."]);
+            }
+            let (entries, partial) = changes_excluding(root.path(), &exclusions).await.unwrap();
+            assert!(partial);
+            assert_eq!(entries.len(), 1000);
+            let missing = paths
+                .iter()
+                .find(|path| !entries.iter().any(|entry| &entry.path == *path))
+                .unwrap();
+            assert!(root.path().join(missing).is_file());
+            let result = change_diff_excluding(root.path(), &exclusions, missing, section)
+                .await
+                .unwrap();
+            assert!(result.0.is_empty());
+            assert!(
+                result.1,
+                "An omitted existing path must remain explicitly partial"
+            );
+        }
     }
 }

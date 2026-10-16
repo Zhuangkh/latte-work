@@ -1,8 +1,11 @@
 //! NTFS project files. Unlike private App storage, retain the user's ACL policy.
+#[path = "project/managed.rs"]
+mod managed;
 #[cfg(test)]
 #[path = "project/tests.rs"]
 mod tests;
 use super::*;
+pub use managed::ManagedRecoveryRoot;
 use std::{
     fs::OpenOptions,
     os::windows::fs::OpenOptionsExt,

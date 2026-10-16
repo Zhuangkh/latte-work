@@ -408,3 +408,77 @@ Set-Acl -LiteralPath $p -AclObject $a
         }
     }
 }
+
+#[tokio::test]
+async fn ordinary_project_conflicts_and_legacy_masked_refusals_never_write_targets() {
+    for case in [
+        "bytes",
+        "identity",
+        "attributes",
+        "acl",
+        "missing_parent",
+        "missing_metadata",
+        "legacy_masked",
+        "other_refusal",
+        "truncated",
+        "unchanged_unsupported",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = tempfile::tempdir().unwrap();
+        let database = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::Store::open(&state.path().join("state.sqlite")).unwrap(),
+        ));
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), b"before\r\n").unwrap();
+        if case == "unchanged_unsupported" {
+            std::fs::write(root.join("unchanged.txt"), b"same").unwrap();
+            std::fs::write(root.join("unchanged.txt:stream"), b"unsupported").unwrap();
+        }
+        let before = Snapshot::capture(root).await.unwrap();
+        std::fs::write(root.join("sub/file.txt"), b"after\r\n").unwrap();
+        let mut turn = frozen(root, before).await;
+        match case {
+            "bytes" => std::fs::write(root.join("sub/file.txt"), b"external").unwrap(),
+            "identity" => {
+                std::fs::rename(root.join("sub/file.txt"), root.join("saved.txt")).unwrap();
+                std::fs::write(root.join("sub/file.txt"), b"after\r\n").unwrap();
+            }
+            "attributes" => {
+                powershell(root, "[IO.File]::SetAttributes((Join-Path $env:LATTE_UNDO_TEST_ROOT 'sub/file.txt'),[IO.FileAttributes]'Hidden,Archive')").await;
+            }
+            "acl" => {
+                powershell(root, r#"$ErrorActionPreference='Stop'; $p=Join-Path $env:LATTE_UNDO_TEST_ROOT 'sub/file.txt'; $a=[IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($p),[Security.AccessControl.AccessControlSections]::Access); $u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $a.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;$u)",[Security.AccessControl.AccessControlSections]::Access); [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($p),$a)"#).await;
+            }
+            "missing_parent" => {
+                std::fs::remove_file(root.join("sub/file.txt")).unwrap();
+                std::fs::remove_dir(root.join("sub")).unwrap();
+            }
+            "missing_metadata" => {
+                turn.before.windows_files_v1.clear();
+            }
+            "legacy_masked" => {
+                turn.before.undo_unavailable = Some(super::super::WINDOWS_NON_GIT_UNDO.into());
+                turn.changes.undo_unavailable = Some(super::super::WINDOWS_NON_GIT_UNDO.into());
+            }
+            "other_refusal" => {
+                turn.changes.undo_unavailable = Some("specific historical refusal".into());
+            }
+            "truncated" => {
+                turn.changes.summary.truncated = true;
+            }
+            _ => assert!(turn.changes.undo_unavailable.is_some()),
+        }
+        let target = std::fs::read(root.join("sub/file.txt")).ok();
+        assert!(
+            turn.prepare_undo_blocking(root, &database, None).is_err(),
+            "{case}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("sub/file.txt")).ok(),
+            target,
+            "{case}"
+        );
+        assert!(!root.join(".latte-work-undo").exists(), "{case}");
+    }
+}

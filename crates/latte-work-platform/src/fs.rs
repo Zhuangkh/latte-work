@@ -20,8 +20,8 @@ pub use latte_work_windows_security::open_private_file;
 #[cfg(windows)]
 pub mod project {
     pub use latte_work_windows_security::{
-        DirectoryIdentity as FileIdentity, ProjectMetadata, ProjectPath, PublishedFile,
-        RecoveryDir, StagedFile, delete_file, project_metadata,
+        DirectoryIdentity as FileIdentity, ManagedRecoveryRoot, ProjectMetadata, ProjectPath,
+        PublishedFile, RecoveryDir, StagedFile, delete_file, project_metadata,
     };
 }
 pub(crate) use backend::open_lock_file;

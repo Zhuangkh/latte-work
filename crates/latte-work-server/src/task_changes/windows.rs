@@ -6,7 +6,8 @@ use super::{
 };
 use anyhow::{Context, Result, bail};
 use latte_work_platform::fs::project::{
-    ProjectMetadata, ProjectPath, PublishedFile, RecoveryDir, StagedFile, project_metadata,
+    ManagedRecoveryRoot, ProjectMetadata, ProjectPath, PublishedFile, RecoveryDir, StagedFile,
+    project_metadata,
 };
 use std::{
     collections::HashSet,
@@ -93,7 +94,11 @@ pub(super) fn undo_reason(before: &Snapshot, after: &Snapshot) -> Option<String>
         .as_ref()
         .or(after.undo_unavailable.as_ref())
     {
-        return Some(reason.clone());
+        return Some(if reason == super::WINDOWS_NON_GIT_UNDO {
+            "此旧版普通目录快照未完整评估 Windows 撤销条件，无法验证；请手动核对".into()
+        } else {
+            reason.clone()
+        });
     }
     for snapshot in [before, after] {
         let mut identities = HashSet::new();
@@ -220,11 +225,60 @@ pub(super) struct Prepared {
     files: Vec<PreparedFile>,
     recovery: RecoveryDir,
     pub(super) intent: super::UndoRecovery,
+    pub(super) managed: Option<crate::managed_recovery::Registration>,
+    managed_root: Option<ManagedRecoveryRoot>,
 }
 pub(super) fn prepare(turn: &FrozenTurn, root: &Path, git_dir: &Path) -> Result<Prepared> {
-    let deadline = Instant::now() + Duration::from_secs(12);
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let recovery = RecoveryDir::create(git_dir, &attempt_id)?;
+    prepare_files(turn, root, git_dir, recovery, attempt_id, None, None)
+}
+pub(super) fn prepare_registered(
+    turn: &FrozenTurn,
+    root: &Path,
+    git_dir: Option<&Path>,
+    database: &crate::runtime::Database,
+) -> Result<Prepared> {
+    if let Some(git_dir) = git_dir {
+        return prepare(turn, root, git_dir);
+    }
+    let Some(Identity::Windows {
+        windows_v1: expected,
+    }) = &turn.before.root_identity
+    else {
+        bail!("Missing project identity");
+    };
+    super::undo_phase_checkpoint("preparation")?;
+    let (guard, registration) = crate::managed_recovery::prepare_store(
+        database,
+        root,
+        latte_work_platform::fs::project::FileIdentity {
+            volume: expected.volume,
+            file_id: expected.file_id,
+        },
+    )?;
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let recovery = guard.create_attempt(&attempt_id)?;
+    prepare_files(
+        turn,
+        root,
+        root,
+        recovery,
+        attempt_id,
+        Some(registration),
+        Some(guard),
+    )
+}
+fn prepare_files(
+    turn: &FrozenTurn,
+    root: &Path,
+    git_dir: &Path,
+    recovery: RecoveryDir,
+    attempt_id: String,
+    managed: Option<crate::managed_recovery::Registration>,
+    managed_root: Option<ManagedRecoveryRoot>,
+) -> Result<Prepared> {
+    let deadline = Instant::now() + Duration::from_secs(12);
     let mut files = Vec::new();
     let mut entries = Vec::new();
     for entry in &turn.changes.summary.entries {
@@ -341,6 +395,8 @@ pub(super) fn prepare(turn: &FrozenTurn, root: &Path, git_dir: &Path) -> Result<
         files,
         recovery,
         intent,
+        managed,
+        managed_root,
     })
 }
 fn require_absent(guard: &ProjectPath, path: &str) -> Result<()> {
@@ -351,6 +407,7 @@ fn require_absent(guard: &ProjectPath, path: &str) -> Result<()> {
     }
 }
 pub(super) struct Restored {
+    _managed_root: Option<ManagedRecoveryRoot>,
     recovery: RecoveryDir,
     originals: Vec<File>,
     published: Vec<(String, PublishedFile)>,
@@ -367,6 +424,7 @@ pub(super) fn restore(prepared: Prepared, turn: &FrozenTurn, _root: &Path) -> Re
 fn apply(prepared: Prepared, turn: &FrozenTurn) -> Result<Restored> {
     let deadline = Instant::now() + Duration::from_secs(12);
     let mut restored = Restored {
+        _managed_root: prepared.managed_root,
         recovery: prepared.recovery,
         originals: Vec::new(),
         published: Vec::new(),

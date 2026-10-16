@@ -1,6 +1,6 @@
 //! Bounded, durable pre-request worktree baselines. Read-only inspection never
 //! changes the user's index, refs or files. Shared-directory attribution is temporal.
-use crate::{files, store::now};
+use crate::{files, managed_recovery::ManagedRecoveryExclusions, store::now};
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{ChangeSummary, TaskChange};
 use serde::{Deserialize, Serialize};
@@ -19,10 +19,10 @@ enum Identity {
     Unix((u64, u64)),
     Windows { windows_v1: WindowsIdentity },
 }
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WindowsIdentity {
-    volume: u64,
-    file_id: [u8; 16],
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WindowsIdentity {
+    pub(crate) volume: u64,
+    pub(crate) file_id: [u8; 16],
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WindowsFile {
@@ -103,7 +103,10 @@ async fn inventory_entry_type(
         .await,
     )
 }
-async fn inventory(root: &Path) -> Result<(Vec<String>, bool)> {
+async fn inventory(
+    root: &Path,
+    exclusions: &ManagedRecoveryExclusions,
+) -> Result<(Vec<String>, bool)> {
     let (inside, truncated) = match files::git(root, &["rev-parse", "--is-inside-work-tree"]).await
     {
         Ok(result) => result,
@@ -128,15 +131,17 @@ async fn inventory(root: &Path) -> Result<(Vec<String>, bool)> {
             ],
         )
         .await?;
-        return Ok((
-            paths
-                .split('\0')
-                .filter(|path| !path.is_empty())
-                .filter_map(|path| path.strip_prefix(prefix.trim_end_matches('\n')))
-                .map(str::to_owned)
-                .collect(),
-            a || b,
-        ));
+        let mut visible = Vec::new();
+        for path in paths
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .filter_map(|path| path.strip_prefix(prefix.trim_end_matches('\n')))
+        {
+            if !exclusions.contains(root, path)? {
+                visible.push(path.to_owned());
+            }
+        }
+        return Ok((visible, a || b));
     }
     let mut directories = vec![root.to_path_buf()];
     let mut paths = Vec::new();
@@ -149,6 +154,11 @@ async fn inventory(root: &Path) -> Result<(Vec<String>, bool)> {
         while let Some(entry) =
             if_present(entries.next_entry().await.map_err(Into::into))?.flatten()
         {
+            let relative =
+                latte_work_platform::paths::relative_text(entry.path().strip_prefix(root)?)?;
+            if exclusions.contains(root, &relative)? {
+                continue;
+            }
             visited += 1;
             if visited > INVENTORY_LIMIT || paths.len() >= COUNT_LIMIT {
                 truncated = true;
@@ -187,6 +197,28 @@ async fn inventory(root: &Path) -> Result<(Vec<String>, bool)> {
     paths.sort();
     Ok((paths, truncated))
 }
+#[cfg(windows)]
+const WINDOWS_NON_GIT_UNDO: &str =
+    "Windows 普通目录支持变更快照和差异；撤销需要同卷 NTFS Git 恢复目录";
+
+#[cfg(windows)]
+pub(crate) async fn windows_undo_git_dir(root: &Path) -> Result<Option<std::path::PathBuf>> {
+    let (git_dir, truncated) = match files::git(root, &["rev-parse", "--absolute-git-dir"]).await {
+        Ok(result) => result,
+        Err(error) if error.to_string() == "无法读取 Git 状态，请确认项目是 Git 仓库" =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if truncated {
+        bail!("Git 目录路径超出限制");
+    }
+    let git_dir = git_dir.strip_suffix('\n').unwrap_or(&git_dir);
+    let git_dir = git_dir.strip_suffix('\r').unwrap_or(git_dir);
+    Ok(Some(std::path::PathBuf::from(git_dir)))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub at: f64,
@@ -215,11 +247,18 @@ impl Snapshot {
             unavailable: Some(message),
         }
     }
+    #[cfg(test)]
     pub async fn capture(root: &Path) -> Result<Self> {
+        Self::capture_excluding(root, &ManagedRecoveryExclusions::empty()).await
+    }
+    pub async fn capture_excluding(
+        root: &Path,
+        exclusions: &ManagedRecoveryExclusions,
+    ) -> Result<Self> {
         tokio::time::timeout(Duration::from_secs(12), async {
             // Git keeps its tracked/ignored-file semantics. Ordinary directories
             // use a bounded, symlink-free inventory with the same byte limits.
-            let (paths, inventory_truncated) = inventory(root).await?;
+            let (paths, inventory_truncated) = inventory(root, exclusions).await?;
             let mut snapshot = Self {
                 at: now(),
                 root_identity: Some(backend::identity(root)?),
@@ -311,11 +350,15 @@ impl Snapshot {
         .await
         .context("读取任务变更基线超时")?
     }
-    pub async fn summary(&self, root: &Path) -> Result<ChangeSummary> {
+    pub async fn summary(
+        &self,
+        root: &Path,
+        exclusions: &ManagedRecoveryExclusions,
+    ) -> Result<ChangeSummary> {
         if self.unavailable.is_some() {
             return Ok(self.empty_summary());
         }
-        let current = Self::capture(root).await?;
+        let current = Self::capture_excluding(root, exclusions).await?;
         self.compare(&current).await
     }
     pub async fn compare(&self, current: &Self) -> Result<ChangeSummary> {
@@ -436,8 +479,13 @@ impl Snapshot {
             unavailable: self.unavailable.clone(),
         }
     }
-    pub async fn patch(&self, root: &Path, path: &str) -> Result<(String, bool)> {
-        let current = Self::capture(root).await?;
+    pub async fn patch(
+        &self,
+        root: &Path,
+        path: &str,
+        exclusions: &ManagedRecoveryExclusions,
+    ) -> Result<(String, bool)> {
+        let current = Self::capture_excluding(root, exclusions).await?;
         self.patch_between(&current, path).await
     }
     pub async fn patch_between(&self, current: &Self, path: &str) -> Result<(String, bool)> {
@@ -539,6 +587,8 @@ pub struct FrozenTurn {
     after: Snapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     windows_undo_recovery_v1: Option<UndoRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_undo_recovery_v2: Option<ManagedUndoRecovery>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct UndoRecovery {
@@ -547,6 +597,16 @@ struct UndoRecovery {
     project_identity: WindowsIdentity,
     git_dir: std::path::PathBuf,
     git_identity: WindowsIdentity,
+    recovery_dir: std::path::PathBuf,
+    recovery_identity: WindowsIdentity,
+    entries: Vec<UndoRecoveryEntry>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct ManagedUndoRecovery {
+    kind: String,
+    version: u32,
+    attempt_id: String,
+    store: crate::managed_recovery::Registration,
     recovery_dir: std::path::PathBuf,
     recovery_identity: WindowsIdentity,
     entries: Vec<UndoRecoveryEntry>,
@@ -596,10 +656,14 @@ impl FrozenTurn {
             before,
             after,
             windows_undo_recovery_v1: None,
+            windows_undo_recovery_v2: None,
         })
     }
     pub fn validate_undo(&self, root: &Path) -> Result<()> {
         backend::require_undo()?;
+        if self.windows_undo_recovery_v1.is_some() && self.windows_undo_recovery_v2.is_some() {
+            bail!("Conflicting Windows Undo recovery intents");
+        }
         if let Some(reason) = self
             .changes
             .undo_unavailable
@@ -660,33 +724,63 @@ impl FrozenTurn {
         backend::verify_current(self, root, path)
     }
     pub fn refresh_undo_availability(&mut self) {
+        if self.windows_undo_recovery_v1.is_some() && self.windows_undo_recovery_v2.is_some() {
+            self.changes.undo_unavailable =
+                Some("Conflicting Windows Undo recovery intents".into());
+            return;
+        }
+        #[cfg(windows)]
+        if self.changes.undo_unavailable.as_deref() == Some(WINDOWS_NON_GIT_UNDO) {
+            self.changes.undo_unavailable =
+                Some("此旧版普通目录快照未完整评估 Windows 撤销条件，无法验证；请手动核对".into());
+        }
         if self.changes.undo_unavailable.is_none() {
             self.changes.undo_unavailable = backend::undo_reason(&self.before, &self.after);
         }
     }
+    /// The caller transfers admission to its blocking worker before invoking this.
+    pub fn prepare_undo_blocking(
+        &self,
+        root: &Path,
+        database: &crate::runtime::Database,
+        #[cfg(windows)] git_dir: Option<&Path>,
+    ) -> Result<PreparedUndo> {
+        let exclusions = ManagedRecoveryExclusions::load(database, root)?;
+        for entry in &self.changes.summary.entries {
+            exclusions.require_visible(root, &entry.path)?;
+        }
+        self.validate_undo(root)?;
+        #[cfg(windows)]
+        let files = backend::prepare_registered(self, root, git_dir, database)?;
+        #[cfg(unix)]
+        let files = {
+            let _ = database;
+            backend::prepare(self, root)?
+        };
+        Ok(PreparedUndo {
+            turn: self.clone(),
+            root: root.to_owned(),
+            files,
+            exclusions,
+        })
+    }
+    #[cfg(test)]
     pub async fn prepare_undo(&self, root: &Path) -> Result<PreparedUndo> {
         #[cfg(windows)]
-        let git_dir = {
-            let (git_dir, truncated) =
-                files::git(root, &["rev-parse", "--absolute-git-dir"]).await?;
-            if truncated {
-                bail!("Git 目录路径超出限制");
-            }
-            let git_dir = git_dir.strip_suffix('\n').unwrap_or(&git_dir);
-            let git_dir = git_dir.strip_suffix('\r').unwrap_or(git_dir);
-            std::path::PathBuf::from(git_dir)
-        };
-        let turn = self.clone();
-        let root = root.to_owned();
-        tokio::task::spawn_blocking(move || {
-            turn.validate_undo(&root)?;
-            #[cfg(windows)]
-            let files = backend::prepare(&turn, &root, &git_dir)?;
-            #[cfg(unix)]
-            let files = backend::prepare(&turn, &root)?;
-            Ok(PreparedUndo { turn, root, files })
+        let git_dir = windows_undo_git_dir(root).await?.context(
+            "Test requires Git recovery; use registered preparation for ordinary projects",
+        )?;
+        self.validate_undo(root)?;
+        #[cfg(windows)]
+        let files = backend::prepare(self, root, &git_dir)?;
+        #[cfg(unix)]
+        let files = backend::prepare(self, root)?;
+        Ok(PreparedUndo {
+            turn: self.clone(),
+            root: root.to_owned(),
+            files,
+            exclusions: ManagedRecoveryExclusions::empty(),
         })
-        .await?
     }
     #[cfg(test)]
     pub async fn restore(&self, root: &Path) -> Result<()> {
@@ -727,7 +821,7 @@ fn restore_checkpoint(_completed: usize) -> Result<()> {
     Ok(())
 }
 #[cfg(windows)]
-fn undo_phase_checkpoint(_phase: &str) -> Result<()> {
+pub(crate) fn undo_phase_checkpoint(_phase: &str) -> Result<()> {
     #[cfg(feature = "test-fixture")]
     if let Some(path) = std::env::var_os(format!(
         "LATTE_WORK_TEST_UNDO_{}",
@@ -749,12 +843,26 @@ pub struct PreparedUndo {
     turn: FrozenTurn,
     root: std::path::PathBuf,
     files: backend::Prepared,
+    exclusions: ManagedRecoveryExclusions,
 }
 impl PreparedUndo {
     pub fn record_intent(&self, turn: &mut FrozenTurn) {
         #[cfg(windows)]
         {
-            turn.windows_undo_recovery_v1 = Some(self.files.intent.clone());
+            if let Some(store) = &self.files.managed {
+                let intent = &self.files.intent;
+                turn.windows_undo_recovery_v2 = Some(ManagedUndoRecovery {
+                    kind: "managed_project".into(),
+                    version: 2,
+                    attempt_id: intent.attempt_id.clone(),
+                    store: store.clone(),
+                    recovery_dir: intent.recovery_dir.clone(),
+                    recovery_identity: intent.recovery_identity.clone(),
+                    entries: intent.entries.clone(),
+                });
+            } else {
+                turn.windows_undo_recovery_v1 = Some(self.files.intent.clone());
+            }
         }
         #[cfg(unix)]
         let _ = turn;
@@ -763,12 +871,14 @@ impl PreparedUndo {
     pub fn restore(self) -> Result<RestoredUndo> {
         Ok(RestoredUndo {
             _guards: backend::restore(self.files, &self.turn, &self.root)?,
+            _exclusions: self.exclusions,
         })
     }
 }
 /// Owned file/directory guards are released only after the result transaction commits.
 pub struct RestoredUndo {
     _guards: backend::Restored,
+    _exclusions: ManagedRecoveryExclusions,
 }
 async fn no_index(before: &Path, after: &Path, stats: bool) -> Result<(String, bool)> {
     let mut command = Command::new("git");
@@ -818,8 +928,11 @@ async fn no_index(before: &Path, after: &Path, stats: bool) -> Result<(String, b
     bytes.truncate(FILE_LIMIT);
     Ok((String::from_utf8_lossy(&bytes).into(), truncated))
 }
-pub async fn workspace_summary(root: &Path) -> Result<ChangeSummary> {
-    let (entries, truncated) = files::changes(root).await?;
+pub async fn workspace_summary(
+    root: &Path,
+    exclusions: &ManagedRecoveryExclusions,
+) -> Result<ChangeSummary> {
+    let (entries, truncated) = files::changes_excluding(root, exclusions).await?;
     let mut result = ChangeSummary {
         entries: vec![],
         added: 0,
@@ -1034,7 +1147,14 @@ mod tests {
         std::fs::write(root.join("nested/edit.txt"), "before\n").unwrap();
         std::fs::write(root.join("delete.txt"), "remove\n").unwrap();
         let before = Snapshot::capture(root).await.unwrap();
-        assert!(before.summary(root).await.unwrap().entries.is_empty());
+        assert!(
+            before
+                .summary(root, &ManagedRecoveryExclusions::empty())
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         std::fs::write(root.join("nested/edit.txt"), "after\nextra\n").unwrap();
         std::fs::remove_file(root.join("delete.txt")).unwrap();
         std::fs::write(root.join("new.txt"), "created\n").unwrap();
@@ -1057,13 +1177,46 @@ mod tests {
         assert_eq!(turn.patch("nested/edit.txt").await.unwrap().0, patch);
         assert!(turn.validate_undo(root).is_err());
         std::fs::write(root.join("nested/edit.txt"), "after\nextra\n").unwrap();
-        turn.restore(root).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("nested/edit.txt")).unwrap(),
-            "before\n"
-        );
-        assert!(root.join("delete.txt").exists());
-        assert!(!root.join("new.txt").exists());
+        #[cfg(unix)]
+        {
+            turn.restore(root).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("nested/edit.txt")).unwrap(),
+                "before\n"
+            );
+            assert!(root.join("delete.txt").exists());
+            assert!(!root.join("new.txt").exists());
+        }
+        #[cfg(windows)]
+        {
+            assert!(turn.changes.undo_unavailable.is_none());
+            let state = tempfile::tempdir().unwrap();
+            let database = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::store::Store::open(&state.path().join("store.sqlite")).unwrap(),
+            ));
+            let prepared = turn.prepare_undo_blocking(root, &database, None).unwrap();
+            let mut persisted = turn.clone();
+            prepared.record_intent(&mut persisted);
+            assert!(persisted.windows_undo_recovery_v2.is_some());
+            assert!(persisted.windows_undo_recovery_v1.is_none());
+            let restored = prepared.restore().unwrap();
+            assert_eq!(
+                std::fs::read(root.join("nested/edit.txt")).unwrap(),
+                b"before\n"
+            );
+            assert_eq!(std::fs::read(root.join("delete.txt")).unwrap(), b"remove\n");
+            assert!(!root.join("new.txt").exists());
+            assert_eq!(turn.patch("nested/edit.txt").await.unwrap().0, patch);
+            drop(restored);
+            let context = ManagedRecoveryExclusions::load(&database, root).unwrap();
+            let after_undo = Snapshot::capture_excluding(root, &context).await.unwrap();
+            assert!(
+                after_undo
+                    .files
+                    .keys()
+                    .all(|path| !path.starts_with(".latte-work-undo"))
+            );
+        }
     }
     #[tokio::test]
     async fn ordinary_inventory_is_bounded_and_does_not_follow_symlinks() {
@@ -1078,11 +1231,20 @@ mod tests {
         assert!(before.truncated);
         assert!(before.files.is_empty());
         std::fs::remove_file(dir.path().join("large.txt")).unwrap();
-        assert!(before.summary(dir.path()).await.unwrap().entries.is_empty());
+        assert!(
+            before
+                .summary(dir.path(), &ManagedRecoveryExclusions::empty())
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         for n in 0..=COUNT_LIMIT {
             std::fs::write(dir.path().join(format!("file-{n}.txt")), "bounded").unwrap();
         }
-        let (paths, truncated) = inventory(dir.path()).await.unwrap();
+        let (paths, truncated) = inventory(dir.path(), &ManagedRecoveryExclusions::empty())
+            .await
+            .unwrap();
         assert!(truncated && paths.len() == COUNT_LIMIT);
         assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
         let snapshot = Snapshot::capture(dir.path()).await.unwrap();
@@ -1119,7 +1281,9 @@ mod tests {
         );
         std::fs::write(dir.path().join("kept.txt"), "kept").unwrap();
         assert_eq!(
-            inventory(dir.path()).await.unwrap(),
+            inventory(dir.path(), &ManagedRecoveryExclusions::empty())
+                .await
+                .unwrap(),
             (vec!["kept.txt".into()], false)
         );
         // Disappearance is the only ignored error; permission and path-boundary
@@ -1141,7 +1305,14 @@ mod tests {
         std::fs::write(root.join("dirty.txt"), "existing dirty\n").unwrap();
         std::fs::write(root.join("existing.txt"), "preexisting untracked\n").unwrap();
         let baseline = Snapshot::capture(root).await.unwrap();
-        assert!(baseline.summary(root).await.unwrap().entries.is_empty());
+        assert!(
+            baseline
+                .summary(root, &ManagedRecoveryExclusions::empty())
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         let baseline: Snapshot =
             serde_json::from_str(&serde_json::to_string(&baseline).unwrap()).unwrap();
         std::fs::write(root.join("dirty.txt"), "task edit\nsecond line\n").unwrap();
@@ -1151,7 +1322,10 @@ mod tests {
         std::fs::write(root.join("binary.dat"), [0, 4, 2]).unwrap();
         git(root, &["add", "dirty.txt"]);
         let index = std::fs::read(root.join(".git/index")).unwrap();
-        let result = baseline.summary(root).await.unwrap();
+        let result = baseline
+            .summary(root, &ManagedRecoveryExclusions::empty())
+            .await
+            .unwrap();
         assert_eq!(
             (result.added, result.removed, result.binary_files),
             (3, 2, 1)
@@ -1165,7 +1339,10 @@ mod tests {
             .find(|e| e.path == "empty.txt")
             .unwrap();
         assert_eq!((empty.added, empty.removed), (Some(0), Some(0)));
-        let (patch, _) = baseline.patch(root, "dirty.txt").await.unwrap();
+        let (patch, _) = baseline
+            .patch(root, "dirty.txt", &ManagedRecoveryExclusions::empty())
+            .await
+            .unwrap();
         assert!(
             patch.contains("-existing dirty") && patch.contains("+task edit"),
             "{patch}"
@@ -1175,8 +1352,18 @@ mod tests {
             "{patch}"
         );
         assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
-        assert!(baseline.patch(root, "../private").await.is_err());
-        assert!(baseline.patch(root, "existing.txt").await.is_err());
+        assert!(
+            baseline
+                .patch(root, "../private", &ManagedRecoveryExclusions::empty())
+                .await
+                .is_err()
+        );
+        assert!(
+            baseline
+                .patch(root, "existing.txt", &ManagedRecoveryExclusions::empty())
+                .await
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn workspace_totals_count_net_edits_once_across_staging() {
@@ -1185,7 +1372,9 @@ mod tests {
         std::fs::write(dir.path().join("dirty.txt"), "staged\n").unwrap();
         git(dir.path(), &["add", "dirty.txt"]);
         std::fs::write(dir.path().join("dirty.txt"), "final\n").unwrap();
-        let result = workspace_summary(dir.path()).await.unwrap();
+        let result = workspace_summary(dir.path(), &ManagedRecoveryExclusions::empty())
+            .await
+            .unwrap();
         assert_eq!((result.added, result.removed), (1, 1));
     }
     #[tokio::test]
@@ -1197,9 +1386,19 @@ mod tests {
         std::fs::write(sub.join("a.txt"), "old\n").unwrap();
         let baseline = Snapshot::capture(&sub).await.unwrap();
         std::fs::write(dir.path().join("dirty.txt"), "outside\n").unwrap();
-        assert!(baseline.summary(&sub).await.unwrap().entries.is_empty());
+        assert!(
+            baseline
+                .summary(&sub, &ManagedRecoveryExclusions::empty())
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         std::fs::write(sub.join("a.txt"), vec![b'a'; FILE_LIMIT + 1]).unwrap();
-        let result = baseline.summary(&sub).await.unwrap();
+        let result = baseline
+            .summary(&sub, &ManagedRecoveryExclusions::empty())
+            .await
+            .unwrap();
         assert!(result.truncated && result.entries.is_empty());
         assert!(
             Snapshot::capture(Path::new("/missing-fixture-root"))
