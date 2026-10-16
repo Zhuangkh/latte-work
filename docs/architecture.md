@@ -13,6 +13,24 @@ React UI → Tauri commands → latte-work-client
                                      └─ AgentAdapter → Claude CLI children
 ```
 
+`latte-work-platform` provides OS directory lookup, file locks and private storage
+without dependencies on the protocol, configuration, Server or GUI. Platform-specific
+implementations are selected at module boundaries; product paths and retry policy
+remain with callers. Its Windows control-channel backend calls the project-owned
+`latte-work-windows-security` boundary (windows-sys only) for user-only DACLs,
+reparse checks and peer tokens. Unsafe is confined to that crate's private win32
+module; platform and all other callers retain forbid. A second reviewed boundary,
+`latte-work-windows-webview`, owns the WebView2 find/capture calls (see
+[its SAFETY notes](../crates/latte-work-windows-webview/SAFETY.md)). The public
+`ipc::Endpoint`
+now owns transport identity and lock paths. Listener and accepted streams share
+the singleton lease, and connect/accept return only authenticated streams retaining
+their endpoint guard. See [the IPC contract](ipc.md). Ordinary Windows state uses
+parent ACLs; Host Provider/launch files and attachments use verified private leaves.
+Native path and snapshot rules are described below; build, packaging and validation
+commands live in [Development](../DEVELOPMENT.md). The two Windows SAFETY documents
+record the exact FFI ownership and bounds; callers do not gain unsafe allowances.
+
 `latte-work-protocol` contains only serde wire types and TypeScript type export.
 `latte-work-client` owns version handshakes, bounded frames, connection timeouts,
 and local/SSH transport. It knows no Claude message formats.
@@ -24,6 +42,13 @@ discovery, launch configuration, wire encoding/decoding and protocol state live 
 `agents/claude.rs`. The internal transport contract currently covers bounded UTF-8
 line-framed stdio, not arbitrary future Agent transports.
 `apps/desktop` owns presentation, OS integration and saved host connections.
+Its pending-close journal uses `latte-work-platform` `PrivateDir`/`FileLock` for the
+validated private leaf, and `latte-work-client` launches stdio bridges with
+`CREATE_NO_WINDOW` on Windows. Browser page find/capture uses the reviewed
+`latte-work-windows-webview` boundary, and the SSH askpass helper shares the
+control-channel private pipe. Windows desktop support includes the local sidecar, platform integration, window
+chrome, SSH askpass, WebView2 find/capture and unsigned x64 per-user NSIS packaging.
+Windows 11 terminals use pwsh/ConPTY; eligible local NTFS files support Undo.
 
 ## Adapter and Runtime boundary
 
@@ -46,7 +71,8 @@ The refactor does not change desktop/host protocol v1 or add another Agent.
 
 ## One daemon per host user
 
-Default state is `~/.local/share/latte-work`. `server.lock` is an OS file lock held
+Default state is `~/.local/share/latte-work` on Unix and the system Known Folder
+`%LOCALAPPDATA%/latte-work` on Windows. `server.lock` is an OS file lock held
 for the daemon lifetime. `connect` attaches to its private Unix socket, starting
 `serve` only when necessary. Racing launch attempts are serialized by the lock;
 losing bridges attach to the winning daemon. A bridge is not another server.
@@ -60,13 +86,26 @@ replacement. An idle daemon drains, removes its socket and releases `server.lock
 before the bundled server starts. The coordinator verifies the replacement on the
 actual socket it forwards. All waits are bounded; no requests are replayed.
 Legacy servers without this handshake require a manual restart, never a forced
-kill. SSH `connect` does not perform automatic upgrades.
+kill. SSH does not perform automatic upgrades. Windows `connect-existing` requires an
+independent same-user daemon; Unix `connect` retains on-demand startup.
+
+`serve`, `connect`, and `connect-local` call the same platform IPC API; the Unix
+backend preserves the established socket address and the Windows backend uses a
+user-only named pipe. `process::ManagedChild` supervises Agents/probes with Unix
+process groups or owned Windows Jobs; daemon launch and exit notification have
+separate APIs. Shutdown fences admission and checks cleanup before releasing IPC.
+See [process lifecycle](process-lifecycle.md). The Windows core passes native
+fixture E2E, including Windows 11 terminals and Undo. The user reports real local Claude, Windows SSH and installation/upgrade acceptance;
+fixture coverage and platform-specific limits remain distinct (see Development).
+Windows Service deployment is unsupported.
 
 There is no per-project or per-session daemon. Multiple sessions can have
 independent Claude processes. The explicit state-directory option creates an
 isolated instance for testing or a separate installation, not ordinary projects.
 
-Directory mode is 0700 and socket mode is 0600. There is no public TCP listener.
+Unix directory mode is 0700 and socket mode is 0600. Windows ordinary state inherits
+parent ACLs; control/private leaves have the stricter policies in [IPC](ipc.md) and
+[Provider storage](providers.md). There is no public TCP listener.
 SSH uses the user's OpenSSH configuration and host-key verification. The desktop
 can select a local identity file or provide a password through OpenSSH askpass;
 the latter remains in process memory for the current app run and is never saved
@@ -163,9 +202,9 @@ switching project does not move an existing session or persist an empty draft.
 The protocol supports project rename and reversible removal. Removal hides a registered
 project from the catalog without deleting its directory, sessions, or events;
 adding the same canonical directory restores its existing identity and history.
-Projects with running or waiting sessions cannot be removed. Pinning is a local
-desktop preference keyed by host and project ID. The desktop owns project context
-menus and suppresses the WebView's default menus; Finder reveal is local-only and
+Projects with running or waiting sessions cannot be removed. Pinning applies to
+sessions, as described below. The desktop owns project context menus and suppresses
+the WebView's default menus; Finder reveal is local-only and
 resolves a registered project ID through the server before opening its directory.
 
 The protocol supports host-owned model catalogs and a per-turn `send.model` selection.
@@ -189,8 +228,8 @@ by pin time, retaining the original project row and namespacing IDs by host.
 
 The desktop refreshes pinned sessions and the selected project's list every five
 seconds. Its local pin cache preserves shortcuts while a host is unavailable;
-mutations are acknowledged by the owning server. Read/unread is manual; opening
-an unread conversation marks it read. Archived records are accessible from the
+mutations are acknowledged by the owning server. Read acknowledgement follows
+[sidebar activity and unread state](#sidebar-activity-and-unread-state). Archived records are accessible from the
 project's archived-list toggle and remain read-only until restored. Markdown copy
 loads paginated history with size/time/page bounds and copies user/assistant text,
 without raw tool payloads; exceeding a bound reports an error rather than silently
@@ -216,8 +255,9 @@ execution Host only when no Provider is bound; the UI does not read host setting
 
 The protocol supports host-owned PTYs (`terminals`, `create_terminal`, `read_terminal`,
 `write_terminal`, `resize_terminal`, `close_terminal`). Local and SSH use the same
-requests. The server starts the host user's default login shell in a registered
-project directory; the desktop only renders UTF-8 bytes with xterm.js. A terminal
+requests. The server starts the host user's default login shell on Unix, and pwsh
+on Windows, in a registered project directory; the desktop only renders UTF-8 bytes
+with xterm.js. A terminal
 is a full user shell, not the read-only file preview or an agent approval channel.
 
 Creation uses a client UUID, is idempotent for that live terminal, and rejects
@@ -228,10 +268,14 @@ The output cursor counts bytes; xterm's streaming decoder handles split Unicode.
 
 Each host permits 16 open terminals (including exited tabs), each with a 1 MiB
 output ring and 64 KiB read batches. Overrun is explicit. Input frames are at most
-16 KiB, with bounded UI/server queues and a 2-second write deadline. Nonblocking
-PTY I/O threads are cancellable. Dimensions are limited to 2–500 columns and
-1–300 rows. Close hangs up the shell and kills its foreground job, with a bounded
-shell kill fallback. Deliberately detached processes have ordinary shell semantics.
+16 KiB, with bounded UI/server queues and a 2-second write deadline. Unix uses
+nonblocking PTY I/O; Windows isolates synchronous ConPTY I/O in a Job-owned helper.
+Dimensions are limited to 2–500 columns and 1–300 rows. Close retains the registry
+entry until cleanup is confirmed; failure remains retryable and vetoes Undo/upgrade.
+Owned-resource batches close concurrently. Unix hangs up the shell and kills its
+foreground job with a bounded kill fallback; deliberately detached Unix processes
+retain ordinary shell semantics. Windows closes the entire owned Job, including
+remaining descendants after the root exits. See the platform-specific terminal and Undo rules below.
 
 Sidebar state belongs only to the conversation ID. Local storage retains its
 ordered tabs, selection, file location, visibility, expansion and width. First
@@ -290,3 +334,100 @@ and host server from the same source revision so both implement the turn overrid
 UI history reads use a persistent transport independent of slow Agent control and
 CLI metadata. Local and SSH hosts share the same request routing and connection
 lifetime; only bridge creation and network latency differ.
+
+## Native paths and Windows snapshots
+
+Host absolute paths remain native `Path`/`PathBuf` values. Protocol-relative paths
+are encoded from components with `/`; Unix backslashes remain filename characters.
+Paths that cannot be represented in a required UTF-8 protocol field fail explicitly.
+Git path metadata is decoded strictly; lossy display previews never become paths.
+Windows rejects drive-relative, UNC/device, ADS, reserved DOS and trailing-dot/space
+aliases, and checks reparse points before canonical containment. These rules also
+apply to attachment names; external references retain explicit reference authorization.
+Git status and review stay within the registered project, including nested projects.
+Git's `/dev/null` diff sentinel is distinct from a filesystem path; isolated global
+Git configuration uses an actual empty temporary file.
+
+Persisted root identity keeps Unix `[device,inode]` serialization unchanged and adds
+`windows_v1` with volume serial and all 128 file-ID bits. Platform identities cannot
+match across systems. `windows_files_v1` records file identity, owner/group/DACL and
+supported attributes instead of fabricating Unix modes. Content and metadata are
+read from the same opened object and checked for changes. Legacy Windows history
+remains readable, with an explicit `undo_unavailable` reason when restoration metadata
+is absent; current files cannot supply missing historical metadata.
+
+## Windows terminal backend
+
+The shared terminal registry owns project/UUID validation, queues, output cursors
+and create/close confirmation. Windows starts the same Server's internal `__terminal`
+helper suspended, assigns it to a non-inheritable kill-on-close Job, then resumes it.
+The helper creates ConPTY/pwsh and exchanges bounded stdio frames without another
+listener. Blocking console I/O and close remain isolated in that disposable helper.
+
+Only PowerShell 7 is supported: discovery uses absolute PATH directories and the
+standard installation location, never the project cwd. Missing `pwsh.exe` fails
+explicitly; no Windows PowerShell/cmd/Git Bash/WSL fallback occurs. Interactive pwsh
+uses `-NoLogo` and its user profile; Agent environment capture still inherits Server
+variables without profiles. Test-fixture builds alone may disable profiles. Shell cwd
+converts local verbatim-drive spelling for pwsh without changing file authorization.
+The helper clears its inherited ignore-Ctrl+C flag; Ctrl+C remains terminal input,
+and bytes lost while the shell interrupts are never replayed. Raw UTF-8/VT forwarding
+does not guarantee that every console program uses Unicode output encoding.
+
+Close bypasses the input queue and continues draining output. Success requires helper
+exit and an empty Job; blocked cleanup forces the Job closed. A close call waits at
+most four seconds. Failure keeps registry ownership and remains retryable; caller
+cancellation cannot establish closure. Disconnection retains the terminal, while
+daemon restart never recreates it or replays commands. Windows 10, other shells,
+user-profile variations, full-screen TUI/IME interaction and long-running concurrency
+need their own evidence rather than being inferred from fixture success.
+
+## Per-turn restoration and Windows Undo
+
+A request is persisted before its baseline is captured and native dispatch begins.
+Frozen before/after bytes drive historical turn diffs, independently of HEAD and later
+edits. Capture is bounded to 1,000 files, 512 KiB per file, 8 MiB total and 12 seconds;
+Windows permission metadata has separate 64 KiB/file and 8 MiB total limits.
+Incomplete collection and unfinished background children cannot become a complete
+undoable result. Attribution is temporal: independent writers may appear in changes.
+
+Undo requires the latest complete turn, no active host tasks/background work/open
+terminals, and exact stored after-image matches. Host admission blocks new writes;
+overlapping idle Agent runtimes close first. The owned admission guard stays with the
+blocking restore worker through preparation, publication and durable outcome, even
+if its caller disconnects. Git index and refs remain unchanged.
+
+Windows supports additions, modifications and deletions of local NTFS regular files,
+including empty/binary/CRLF content. It restores before bytes, restorable owner/group/
+DACL protection/inheritance, and readonly/hidden/system/archive attributes. It refuses:
+
+- Missing/partial/legacy restoration metadata, metadata-only turns, non-latest turns,
+  or unfinished/background/terminal resources.
+- Network/mapped or non-NTFS volumes, reparse/junction/symlink paths, ADS, multiple hard
+  links, short-name aliases, `.git` aliases, missing parents and unsupported attributes
+  such as compression/encryption.
+- Changed after bytes, identity, ACL or attributes; occupied or readonly targets; or
+  before metadata that cannot be recreated with the current user's ordinary rights.
+
+No elevation, ownership takeover or temporary ACL widening is attempted. File IDs,
+timestamps, SACL auditing, empty directories and whole deleted directory trees are
+not restored. The Windows directory identity comparison recognizes casing aliases.
+
+Restoration pins the root and parents, validates every after-image, and prepares all
+same-directory before-image files before touching targets. A staged file receives its
+recorded security and exact readback before content is written, then attributes/flush
+and metadata verification. Preparation failure removes only owned temporary files.
+Immediately before the first target mutation, the worker durably records **Unknown**.
+It rechecks each target and publishes through source-handle `FileRenameInfo` (or a
+validated handle deletion); creation of a deleted file cannot overwrite a new target.
+Only complete restoration and readback records **Reverted**. Repeated successful Undo
+returns the saved outcome without overwriting later edits. Failure/restart stays
+Unknown, with no automatic retry or rollback. Preparation/publication each have a
+12-second budget checked at file boundaries, not a promise to interrupt kernel I/O.
+
+Traditional Windows rename requires releasing the target validation handle and cannot
+atomically compare the destination File ID. Independent editors can write between the
+last check and publication. Multi-file Undo is nontransactional: failure may leave only
+some files restored. A killed worker may leave `.latte-undo-*` files with the restored
+permissions; users must inspect these alongside the Unknown workspace. Restart neither
+cleans them automatically nor resumes the operation.

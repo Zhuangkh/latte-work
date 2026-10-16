@@ -4,8 +4,11 @@ Latte Work is a Tauri desktop client and a standalone Rust host service. Read
 DEVELOPMENT.md before changing build or runtime contracts.
 
 ## Boundaries
-- Rust 2024 workspace: protocol (wire types), client (transport), server (state,
-  filesystem, process supervision, internal agent adapters), desktop (Tauri shell).
+- Rust 2024 workspace: platform (shared OS primitives), protocol (wire types),
+  client (transport), config (App-owned providers), server (state, filesystem,
+  process supervision, internal agent adapters), desktop (Tauri shell).
+- Keep OS selection at platform/backend module boundaries. Shared platform code
+  must not depend on protocol, config, server or GUI. See docs/architecture.md.
 - React/TypeScript owns presentation only. Never execute agents from the UI.
 - Local and SSH hosts use the same server protocol. Server has no GUI dependency.
 - Claude stream-json details belong only in server/agents/claude.rs.
@@ -27,11 +30,24 @@ DEVELOPMENT.md before changing build or runtime contracts.
 - `make cache-info`: print target directory and optional sccache status.
 - Direct cargo/npm commands used by these targets and their focused test variants
   are supported for diagnosis. `cargo generate-lockfile` bootstraps dependencies.
+- Windows desktop: `scripts/desktop.ps1 check|test|build|dev|package` prepares the locked
+  sidecar Tauri requires, then runs the selected step. Windows peer authentication
+  uses the same user SID without an elevation filter; retain OS access checks.
+  Run ordinary-user tests and the separate `scripts/test-windows-elevated.ps1` gate.
+  `package` produces an unsigned x64 per-user NSIS installer and provenance;
+  `scripts/verify-windows-package.ps1` inspects embedded binaries without installing.
 
 ## Quality and safety
 - For UI work, read docs/design-system.md and reuse apps/desktop/src/tokens.css.
   Keep shared control styles consistent; validate native focus and disabled states.
-- Deny warnings in Clippy. No unsafe Rust in our crates.
+- Deny warnings in Clippy. All crates forbid unsafe Rust except two reviewed
+  boundaries: `latte-work-windows-security/src/win32.rs` (control-channel security,
+  owned Jobs, ConPTY and NTFS project restoration) and
+  `latte-work-windows-webview/src/win32.rs` (WebView2 find and
+  capture). Both crates default to `deny(unsafe_code)` and allow it only on their
+  private win32 module; retain `unsafe_op_in_unsafe_fn` and
+  `undocumented_unsafe_blocks` as deny. See the corresponding SAFETY.md files.
+  Do not expand the exceptions to callers.
 - Add focused tests for protocol, persistence, approval, cancellation, reconnect,
   and path-boundary changes. Final-binary tests use a deterministic CLI fixture;
   real Claude and native UI smoke evidence must be reported separately.

@@ -1,6 +1,6 @@
 # Latte Work
 
-A small desktop workspace for coding agents, with local and SSH projects.
+A desktop workspace for coding agents, with local and SSH projects.
 
 **Tauri 2 · React · Rust**. The first integration is the installed **Claude Code
 CLI**, using its structured stream-json protocol and native session history.
@@ -12,51 +12,57 @@ make setup
 make dev
 ```
 
-Install and sign in to `claude` on each execution host before sending a task.
-Create a project, select this computer or an SSH host, and choose its folder
-(local system picker or remote directory browser). Then create a task and send
-a prompt. You can also enter an absolute path. File
-inspection and Git changes are available in the collapsible right panel.
+On Windows, install locked frontend dependencies and launch directly from PowerShell 7:
 
-The desktop automatically starts the bundled local server. Every connection to
-the same host user shares **one server instance**. That server manages all
-projects and multiple independent agent processes. Closing the desktop does not
-stop host tasks. The same server binary and protocol are used over SSH.
+```powershell
+npm ci
+pwsh -NoProfile -File scripts/desktop.ps1 dev
+```
 
-## Version 0.1
+Install and sign in to Claude on each execution host before sending a task.
+Windows requires native `claude.exe`; interactive terminals require PowerShell 7
+(`pwsh.exe`). Create a project, select this computer or an SSH host, choose its
+folder, then create a conversation and send a prompt.
 
-- Local/SSH host connections and persistent project registration.
-- Three resizable columns, project/session navigation, streaming Markdown.
-- Claude CLI tool events, explicit permission responses, cancellation and resume.
-- SQLite event replay, request deduplication, reconnect, interrupted-state recovery.
-- Read-only text files and staged/unstaged Git diff, with bounded output.
-- macOS desktop bundle; headless server for macOS/Linux.
+The desktop starts the bundled local server. Connections using the same host user
+and state directory share one daemon, which owns projects, persistent history and
+independent Agent processes. Closing the window hides it; explicit Quit cleans up
+this App's owned resources. A transport disconnect does not stop accepted host tasks.
+Windows SSH connects to a same-user daemon started independently outside SSH;
+Unix SSH can start the daemon on demand. See [SSH setup](docs/remote.md).
 
-The UI displays permission requests made by Claude; the CLI's existing allow
-rules still apply. Register only projects you trust: print mode loads their
-Claude configuration. The app does not bypass CLI permissions or manage login.
+## Capabilities
+
+- Native desktop on macOS and Windows; headless server on macOS, Linux and Windows.
+- Local and SSH projects, persistent conversations and bounded history replay.
+- Claude tool events, explicit single-use approval, cancellation and native resume.
+- Request deduplication, reconnect and honest interrupted/unknown state after crashes.
+- Host-owned terminal tabs, read-only file previews and project-scoped Git review.
+- Frozen per-turn changes and guarded Undo; Windows Undo supports eligible local
+  NTFS regular files.
+- App-owned Provider configuration, per-host Agent associations, and per-turn
+  model, effort and permission choices. Claude accepts Anthropic Messages;
+  OpenAI configurations can be saved but have no implemented Agent adapter.
+- Unsigned macOS packaging and Windows x64 per-user NSIS installation.
+
+The CLI's existing permission rules still apply. Register only projects you trust:
+Claude loads their configuration. Latte Work does not manage CLI login or provide
+an Agent sandbox. Unsupported agents and capabilities fail explicitly.
 
 ## Build and verify
 
 ```sh
 make ci           # formatting, Clippy, tests, frontend build, docs
-make build        # debug .app and server
-make package      # release .app (no Developer ID signing) and server
+make build        # native desktop and server debug build
+make package      # unsigned native application and standalone release server
 make cache-info   # Cargo output path and optional sccache statistics
 ```
 
-See [development](DEVELOPMENT.md), [architecture](docs/architecture.md),
-[SSH setup](docs/remote.md), [UI design system](docs/design-system.md), and
-[verification](docs/verification.md).
+See [development](DEVELOPMENT.md) for prerequisites, PowerShell commands, test
+boundaries and package provenance; [architecture](docs/architecture.md) for runtime
+contracts; [Provider configuration](docs/providers.md), [UI design](docs/design-system.md)
+and [theme import/export](docs/themes.md) for their respective workflows.
 
-Not included in v0.1: integrated terminal, file editing, automatic remote binary
-installation, other agent implementations, auto-updater, signing/notarization,
-Windows support, or guaranteed continuation after a host daemon crashes.
-
-模型服务在「设置 → Provider」统一管理，支持 Anthropic Messages、
-OpenAI Chat Completions、OpenAI Responses 配置。在「设置 → 连接与 Agent」中关联兼容的
-Provider；Claude Code 仅接受 Anthropic Messages，远端关联通过 SSH 同步。
-详见 [Provider 与 Agent 配置](docs/providers.md)。
-
-Provider 可配置默认模型和多个可选模型。在输入框底部选择本轮模型，下一次发送时生效；
-会话记住已提交的选择，不影响其他会话。远程项目使用远端已同步的模型列表。
+Automatic remote binary installation, Windows Service deployment, Windows MSI/ARM
+installers, signing/notarization, updater publication and guaranteed continuation of
+in-flight work after a daemon crash are outside the current support profile.

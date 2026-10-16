@@ -54,18 +54,36 @@ App 关联。未关联的环境显式沿用 CLI，忽略目标 Server 中的旧 
 
 ## 凭据与迁移
 
-Provider 和关联保存在 Tauri `app_config_dir()/providers.json`。macOS 默认路径为
-`~/Library/Application Support/co.latte.work/providers.json`。目录权限 700、文件权限 600，
+Provider 和关联在 Unix 保存在 Tauri `app_config_dir()/providers.json`，macOS 默认路径为
+`~/Library/Application Support/co.latte.work/providers.json`。Unix 目录权限 700、文件权限 600。
+Windows 保存在 `app_config_dir()/private-providers/providers.json`，仅专属子目录设为受保护的
+当前用户 SID 独占 DACL（不因令牌提权而拒绝）；混存其他 App 文件的根目录权限不变。现存文件先验证同一打开句柄的
+owner、DACL 和非 reparse 属性，再读取；祖先路径拒绝 junction/reparse，验证期间固定目录句柄。
+写入前重新验证私有目录及现存目标，临时文件通过私有权限校验后才写入凭据并原子替换。
 内容未加密，主机用户可读。通过有界文件锁串行化多个 App 进程的修改，每次操作重新读取，
 使用临时文件和原子替换保存，配置大小上限 128 KiB。
 
-App 文件不存在时，直接读取 `~/.local/share/latte-work/providers.json`，将 Provider 定义、
+新 App 文件不存在时，Windows 优先从旧 `app_config_dir()/providers.json` 迁移；
+没有旧 App 文件才读取 `~/.local/share/latte-work/providers.json`。Unix 直接从该 Server 路径迁移。
+Windows 的旧文件也必须在读出凭据前通过私有权限及路径检查；不安全对象显式失败，不自动修复，
+不读取、删除或覆盖原文件，也不创建空配置。用户可保留备份后自行恢复当前用户 owner 和
+仅该用户 FullControl 的 DACL，再重试；若目录本身含 junction，则需先恢复普通本地目录路径。
+迁移将 Provider 定义、
 凭据、本机关联和 SSH 主机关联一次性迁移到 App 配置。迁移不启动旧 Server，也不修改原文件；
 schema 1 的全局选择仅在指向现有 Anthropic Provider 时保留为本机 Claude 关联；
 OpenAI Provider 或已失效的选择沿用旧版行为，不创建关联，保留各主机的 CLI 默认配置。
 Provider 定义及凭据仍完整迁移。无旧配置时创建空 App 配置，之后不重复导入。
+新文件一旦存在就具有权威性；修改或删除 Provider 不会从保留的旧文件重新导入。
 无效旧文件会报错并保留原文件，不写空配置覆盖它。后续旧版 App 对 Server 配置的修改不会
 自动同步回新版 App。
+
+Windows Server 的兼容持久配置使用 `%LOCALAPPDATA%/latte-work/private/providers.json`，
+临时 Claude 启动配置位于 `private/launch/`，附件位于独立私有 `paste-tmp/`。
+普通 `state.sqlite` 沿用父目录 ACL；自定义 `--state-dir` 不自动获得默认用户目录的隐私保证。
+Server 顶层旧 `providers.json` 显式报迁移错误，不从未经验证的位置自动读入或移动；
+这与 App 上述只读导入规则不同。恢复前保留原文件，按错误指明的位置处理 owner、唯一用户
+FullControl 与非 reparse 路径，再重试；不要为排错放宽整个状态目录或删除数据库。
+Unix Server 保留原有顶层文件和 0700/0600 权限契约。
 
 列表仅返回凭据是否存在，编辑留空保留原值；改地址或认证方式需重新填写凭据。
 凭据只经过原生层及认证通道，不进入 WebView、事件或请求账本；运行中的目标 CLI 可读取
