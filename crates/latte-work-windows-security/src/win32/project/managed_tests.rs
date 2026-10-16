@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::descriptor_semantics;
 use std::os::windows::ffi::OsStringExt;
 
 const ATTEMPT: &str = "b644b328-e249-4e75-95c8-372931139ab0";
@@ -32,8 +33,10 @@ fn new_root_manifest_and_attempt_are_private_and_reopen_by_registered_identity()
     let user = current_identity().unwrap();
     verify_directory(root.directories.last().unwrap(), &user).unwrap();
     let descriptor = security_text(root.directories.last().unwrap()).unwrap();
-    assert!(descriptor.starts_with(&format!("O:{}", user.sid)));
-    assert!(descriptor.contains(&format!("D:P(A;OICI;FA;;;{})", user.sid)));
+    assert_eq!(
+        descriptor_semantics(&descriptor),
+        descriptor_semantics(&format!("O:{0}D:P(A;OICI;FA;;;{0})", user.sid))
+    );
     root.write_owner_manifest_new(b"{\"version\":1}", 1024)
         .unwrap();
     assert_eq!(root.read_owner_manifest(1024).unwrap(), b"{\"version\":1}");

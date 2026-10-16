@@ -3,11 +3,32 @@ use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
-use std::io;
+use std::{fmt, io};
 use tokio::process::{Child, Command};
 
 #[derive(Debug)]
 pub(super) struct Tree(Option<Pid>);
+
+#[derive(Debug)]
+struct SignalError {
+    signal: Signal,
+    pgid: Pid,
+    source: Errno,
+}
+impl fmt::Display for SignalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "killpg({}, PGID={}) failed: errno {}: {}",
+            self.signal, self.pgid, self.source as i32, self.source
+        )
+    }
+}
+impl std::error::Error for SignalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Tree)> {
     let child = command.process_group(0).kill_on_drop(true).spawn()?;
@@ -23,7 +44,14 @@ impl Tree {
         };
         match killpg(pid, signal) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+            Err(error) => Err(io::Error::new(
+                io::Error::from_raw_os_error(error as i32).kind(),
+                SignalError {
+                    signal,
+                    pgid: pid,
+                    source: error,
+                },
+            )),
         }
     }
     pub(super) fn request_termination(&self) -> io::Result<bool> {

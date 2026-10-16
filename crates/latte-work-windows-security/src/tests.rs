@@ -61,7 +61,7 @@ fn sddl(path: &Path) -> String {
 
 // Resolve SDDL aliases (including RID500's LA) without relaxing any owner,
 // control flag, or ACE assertion. This stays independent of the native verifier.
-fn descriptor_semantics(descriptor: &str) -> String {
+pub(crate) fn descriptor_semantics(descriptor: &str) -> String {
     inspect(
         r#"$ErrorActionPreference='Stop'
 $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($env:LATTE_SECURITY_TEST_TARGET)

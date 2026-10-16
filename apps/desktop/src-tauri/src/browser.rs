@@ -249,8 +249,16 @@ pub async fn browser_site_data(
         uuid::Uuid::parse_str(&token).map_err(|_| "网站数据确认已失效")?;
         query["token"] = token.into();
     }
-    let (result, _) =
-        super::browser_native::run(&browser, "site-data", &query.to_string(), false).await?;
+    let session = state.find_session(&id)?;
+    let (result, _) = super::browser_native::run(
+        &browser,
+        "site-data",
+        &query.to_string(),
+        false,
+        false,
+        &session,
+    )
+    .await?;
     // Clearing only removes the records bound to this view's one-shot token.
     // Reload this page; other site tabs retain their normal navigation state.
     if result.get("cleared").and_then(serde_json::Value::as_bool) == Some(true)
@@ -278,9 +286,16 @@ pub async fn browser_site_info(
         .app_handle()
         .get_webview(&label(&id)?)
         .ok_or("浏览器标签已关闭")?;
-    let (info, _) =
-        super::browser_native::run(&browser, "site-info", if icon { "icon" } else { "" }, false)
-            .await?;
+    let session = view.app_handle().state::<Tools>().find_session(&id)?;
+    let (info, _) = super::browser_native::run(
+        &browser,
+        "site-info",
+        if icon { "icon" } else { "" },
+        false,
+        false,
+        &session,
+    )
+    .await?;
     let url = info
         .get("url")
         .and_then(serde_json::Value::as_str)
@@ -339,6 +354,12 @@ pub struct Tools {
     operation: tokio::sync::Mutex<()>,
     suppressed: std::sync::Mutex<std::collections::HashMap<String, String>>,
     find_terms: std::sync::Mutex<std::collections::HashMap<String, FindState>>,
+}
+impl Tools {
+    fn find_session(&self, id: &str) -> Result<super::browser_native::FindSession, String> {
+        let mut terms = self.find_terms.lock().map_err(|e| e.to_string())?;
+        Ok(terms.entry(id.to_owned()).or_default().session.clone())
+    }
 }
 #[derive(Clone, Default)]
 struct FindState {
@@ -450,7 +471,9 @@ pub async fn browser_preview(view: Webview, id: String) -> Result<tauri::ipc::Re
         .app_handle()
         .get_webview(&label(&id)?)
         .ok_or("浏览器标签已关闭")?;
-    let (_, bytes) = super::browser_native::run(&browser, "preview", "", false).await?;
+    let session = view.app_handle().state::<Tools>().find_session(&id)?;
+    let (_, bytes) =
+        super::browser_native::run(&browser, "preview", "", false, false, &session).await?;
     Ok(tauri::ipc::Response::new(bytes.ok_or("网页画面暂不可用")?))
 }
 #[tauri::command]
@@ -546,6 +569,34 @@ pub async fn open_external_url(view: Webview, url: String) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn page_tools_retain_find_query_and_share_the_tabs_cancellation() {
+        let tools = Tools::default();
+        let session = tools.find_session("tab").unwrap();
+        let request = session.begin();
+        let revision = {
+            let mut terms = tools.find_terms.lock().unwrap();
+            let state = terms.get_mut("tab").unwrap();
+            let revision = state.begin();
+            state.complete(revision, Some("needle".into()));
+            revision
+        };
+
+        let retained = tools.find_session("tab").unwrap();
+        assert!(request.check().is_ok());
+        {
+            let terms = tools.find_terms.lock().unwrap();
+            let state = terms.get("tab").unwrap();
+            assert_eq!(state.query.as_deref(), Some("needle"));
+            assert_eq!(state.revision, revision);
+        }
+        retained.cancel();
+        assert!(request.check().is_err());
+        let replacement = session.begin();
+        retained.cancel();
+        assert!(replacement.check().is_err());
+    }
     #[cfg(windows)]
     #[test]
     fn current_find_failure_clears_query_without_cancelling_native_cleanup() {

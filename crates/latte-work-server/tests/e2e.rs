@@ -15,6 +15,7 @@ use std::{
 struct Host {
     directory: tempfile::TempDir,
     process: Child,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 fn private_state_directory(prefix: &str) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
@@ -33,23 +34,50 @@ impl Host {
     }
     async fn start_with_environment(env: &[(&str, &std::ffi::OsStr)]) -> Self {
         let directory = private_state_directory("lw-");
+        let environment = env
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).to_owned()))
+            .collect::<Vec<_>>();
+        let process = Self::spawn(directory.path(), &environment);
+        let host = Self {
+            directory,
+            process,
+            environment,
+        };
+        wait_ready(host.directory.path(), Duration::from_secs(10)).await;
+        host
+    }
+    fn spawn(directory: &Path, environment: &[(std::ffi::OsString, std::ffi::OsString)]) -> Child {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py");
-        let process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+        Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
             .env("LATTE_WORK_AGENT_ENV", "inherit")
             .arg("serve")
             .arg("--state-dir")
-            .arg(directory.path())
+            .arg(directory)
             .env("LATTE_WORK_CLAUDE", fixture)
-            .env("CLAUDE_CONFIG_DIR", directory.path().join("claude-config"))
-            .envs(env.iter().copied())
+            .env("CLAUDE_CONFIG_DIR", directory.join("claude-config"))
+            .envs(environment.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .unwrap();
-        let host = Self { directory, process };
-        wait_ready(host.directory.path(), Duration::from_secs(10)).await;
-        host
+            .unwrap()
+    }
+    async fn wait_for_successful_exit(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.process.try_wait().unwrap() {
+                assert!(status.success(), "upgrade daemon exit: {status}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "upgrade daemon did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    async fn restart_after_upgrade(&mut self) {
+        self.wait_for_successful_exit().await;
+        self.process = Self::spawn(self.directory.path(), &self.environment);
+        wait_ready(self.directory.path(), Duration::from_secs(10)).await;
     }
     async fn client(&self) -> Client {
         Client::local(
@@ -739,7 +767,11 @@ async fn provider_catalog_local_binding_and_remote_sync_use_host_protocol() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let local = Host { directory, process };
+    let local = Host {
+        directory,
+        process,
+        environment: Vec::new(),
+    };
     wait_ready(local.directory.path(), Duration::from_secs(10)).await;
     let mut c = local.client().await;
     let draft = ProviderDraft {
@@ -2005,17 +2037,19 @@ async fn terminal_project(client: &mut Client, path: &Path) -> String {
     }
 }
 async fn terminal_write(client: &mut Client, id: &str, data: &[u8]) {
-    assert!(matches!(
-        ask(
-            client,
-            Request::WriteTerminal {
-                terminal_id: id.into(),
-                data: data.to_vec()
-            }
-        )
-        .await,
-        Response::Ok
-    ));
+    let response = ask(
+        client,
+        Request::WriteTerminal {
+            terminal_id: id.into(),
+            data: data.to_vec(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, Response::Ok),
+        "WriteTerminal ({} bytes): {response:?}",
+        data.len()
+    );
 }
 async fn terminal_until(client: &mut Client, id: &str, cursor: &mut f64, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2561,6 +2595,131 @@ async fn lifecycle(path: &Path, request: serde_json::Value) -> serde_json::Value
     .unwrap()
 }
 
+async fn upgrade_poll_all(
+    client: &mut Client,
+    id: &str,
+) -> (Status, Vec<latte_work_protocol::Event>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut after = 0.0;
+        let mut all = Vec::new();
+        for _ in 0..100 {
+            let Response::Events {
+                session,
+                events,
+                has_more,
+            } = ask(
+                client,
+                Request::Poll {
+                    session_id: id.into(),
+                    after,
+                },
+            )
+            .await
+            else {
+                panic!("upgrade reconciliation must return events")
+            };
+            for event in &events {
+                assert!(event.seq > after, "Poll cursor did not advance");
+                after = event.seq;
+            }
+            assert!(
+                !has_more || !events.is_empty(),
+                "empty unfinished Poll page"
+            );
+            all.extend(events);
+            if !has_more {
+                return (session.status, all);
+            }
+        }
+        panic!("upgrade reconciliation exceeded 100 Poll pages")
+    })
+    .await
+    .expect("upgrade reconciliation Poll timeout")
+}
+
+fn upgrade_execution_files(host: &Host, project: &Path) -> Vec<Option<Vec<u8>>> {
+    use std::io::Read;
+    const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
+    let name: String = project
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    [
+        project.join("fixture-agent-pid"),
+        project.join("approved.txt"),
+        host.directory
+            .path()
+            .join("claude-config/projects")
+            .join(name)
+            .join("11111111-1111-4111-8111-111111111111.jsonl"),
+    ]
+    .iter()
+    .map(|path| match std::fs::File::open(path) {
+        Ok(file) => {
+            let metadata = file.metadata().unwrap();
+            assert!(
+                metadata.len() <= MAX_EVIDENCE_BYTES,
+                "fixture evidence too large"
+            );
+            let mut bytes = Vec::new();
+            file.take(MAX_EVIDENCE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(
+                bytes.len() as u64 <= MAX_EVIDENCE_BYTES,
+                "fixture evidence too large"
+            );
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("fixture evidence {}: {error}", path.display()),
+    })
+    .collect()
+}
+
+fn assert_upgrade_closed_transport(client: &Client, error: &anyhow::Error) {
+    let eof = error.to_string() == "Host 连接已关闭"
+        && error.root_cause().to_string() == "Host 连接已关闭";
+    let broken_pipe = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+    });
+    assert!(eof || broken_pipe, "unexpected Send error: {error:#}");
+    assert!(client.is_broken(), "closed transport must be invalidated");
+}
+
+async fn reconcile_unadmitted_upgrade_send(
+    host: &mut Host,
+    id: &str,
+    old_server_id: &str,
+    request_id: &str,
+    baseline: &(Status, Vec<latte_work_protocol::Event>),
+) {
+    host.restart_after_upgrade().await;
+    let mut client = host.client().await;
+    assert!(matches!(
+        ask(&mut client, Request::Hello { version: VERSION }).await,
+        Response::Hello { version: VERSION, server_id, .. } if server_id != old_server_id
+    ));
+    // Reconcile only through reads. Never replay Send or open an agent to resolve EOF.
+    let (status, events) = upgrade_poll_all(&mut client, id).await;
+    assert_eq!(status, baseline.0);
+    assert_ne!(status, Status::Unknown);
+    assert!(!events.iter().any(|event| matches!(
+        &event.event,
+        EventKind::User { request_id: recorded, .. } if recorded == request_id
+    )));
+    // Exact history equality also rules out new approval, tool and output events.
+    assert_eq!(
+        serde_json::to_value(events).unwrap(),
+        serde_json::to_value(&baseline.1).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn upgrade_refuses_tasks_and_terminals_then_drains_existing_clients() {
     use serde_json::json;
@@ -2616,15 +2775,35 @@ async fn upgrade_refuses_tasks_and_terminals_then_drains_existing_clients() {
     terminal_write(&mut client, &terminal_id, b"printf 'upgrade:%s\\n' alive\n").await;
     terminal_until(&mut client, &terminal_id, &mut 0.0, "upgrade:alive").await;
     ask(&mut client, Request::CloseTerminal { terminal_id }).await;
+    let baseline = upgrade_poll_all(&mut client, &id).await;
+    assert_eq!(baseline.0, Status::Stopped);
+    let files = upgrade_execution_files(&host, project.path());
     assert_eq!(lifecycle(dir, prepare).await["kind"], "upgrade_ready");
-    assert!(
-        matches!(send(&mut client, &id, "must-not-start", "hello").await, Response::Error { code, .. } if code == "server_upgrading")
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while host.process.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let sent = client
+        .request(Request::Send {
+            permission_mode: None,
+            provider: None,
+            session_id: id.clone(),
+            request_id: "must-not-start".into(),
+            text: "hello".into(),
+            model: None,
+            effort: None,
+        })
+        .await;
+    match sent {
+        Ok(Response::Error { code, .. }) => assert_eq!(code, "server_upgrading"),
+        Err(error) => assert_upgrade_closed_transport(&client, &error),
+        other => panic!("post-upgrade Send: {other:?}"),
     }
+    reconcile_unadmitted_upgrade_send(
+        &mut host,
+        &id,
+        status["server_id"].as_str().unwrap(),
+        "must-not-start",
+        &baseline,
+    )
+    .await;
+    assert_eq!(upgrade_execution_files(&host, project.path()), files);
 }
 
 #[tokio::test]
@@ -2774,22 +2953,44 @@ async fn upgrade_legacy_daemon_returns_actionable_error_without_stopping_it() {
 #[tokio::test]
 async fn upgrade_racing_send_either_preserves_task_or_rejects_before_launch() {
     use serde_json::json;
-    let host = Host::start().await;
+    let mut host = Host::start().await;
     let mut client = host.client().await;
     let project = tempfile::tempdir().unwrap();
     let id = session(&mut client, project.path()).await;
+    let baseline = upgrade_poll_all(&mut client, &id).await;
+    assert_eq!(baseline.0, Status::Ready);
+    let files = upgrade_execution_files(&host, project.path());
+    assert!(files.iter().all(Option::is_none));
     let status = lifecycle(host.directory.path(), json!({"method":"server_status"})).await;
     let (upgrade, sent) = tokio::join!(
         lifecycle(
             host.directory.path(),
             json!({"method":"prepare_upgrade", "server_id":status["server_id"]})
         ),
-        send(&mut client, &id, "race-upgrade", "approve")
+        client.request(Request::Send {
+            permission_mode: None,
+            provider: None,
+            session_id: id.clone(),
+            request_id: "race-upgrade".into(),
+            text: "approve".into(),
+            model: None,
+            effort: None,
+        })
     );
     match sent {
-        Response::Accepted { duplicate: false } => {
+        Ok(Response::Accepted { duplicate: false }) => {
             assert_eq!(upgrade["code"], "upgrade_blocked");
-            wait(&mut client, &id, Status::Waiting).await;
+            let events = wait(&mut client, &id, Status::Waiting).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.event,
+                        EventKind::User { request_id, .. } if request_id == "race-upgrade"
+                    ))
+                    .count(),
+                1
+            );
             ask(
                 &mut client,
                 Request::Cancel {
@@ -2799,12 +3000,73 @@ async fn upgrade_racing_send_either_preserves_task_or_rejects_before_launch() {
             .await;
             wait(&mut client, &id, Status::Stopped).await;
         }
-        Response::Error { code, .. } => {
+        Ok(Response::Error { code, .. }) => {
             assert_eq!(code, "server_upgrading");
+            assert_eq!(upgrade["kind"], "upgrade_ready");
+        }
+        Err(error) => {
+            assert_upgrade_closed_transport(&client, &error);
             assert_eq!(upgrade["kind"], "upgrade_ready");
         }
         other => panic!("{other:?}"),
     }
+    if upgrade["kind"] == "upgrade_ready" {
+        reconcile_unadmitted_upgrade_send(
+            &mut host,
+            &id,
+            status["server_id"].as_str().unwrap(),
+            "race-upgrade",
+            &baseline,
+        )
+        .await;
+        assert_eq!(upgrade_execution_files(&host, project.path()), files);
+    }
+}
+
+#[tokio::test]
+async fn upgrade_closed_client_reconciles_an_unadmitted_request_without_replay() {
+    use serde_json::json;
+    let mut host = Host::start().await;
+    let mut client = host.client().await;
+    let project = tempfile::tempdir().unwrap();
+    let id = session(&mut client, project.path()).await;
+    let baseline = upgrade_poll_all(&mut client, &id).await;
+    assert_eq!(baseline.0, Status::Ready);
+    let files = upgrade_execution_files(&host, project.path());
+    assert!(files.iter().all(Option::is_none));
+    let old_server_id = client.server_id().to_owned();
+    assert_eq!(
+        lifecycle(
+            host.directory.path(),
+            json!({"method":"prepare_upgrade", "server_id":old_server_id})
+        )
+        .await["kind"],
+        "upgrade_ready"
+    );
+    host.wait_for_successful_exit().await;
+    // This ID has never been sent. A closed old client cannot admit it to a daemon.
+    let error = client
+        .request(Request::Send {
+            permission_mode: None,
+            provider: None,
+            session_id: id.clone(),
+            request_id: "upgrade-after-exit".into(),
+            text: "approve".into(),
+            model: None,
+            effort: None,
+        })
+        .await
+        .expect_err("the old daemon has successfully exited");
+    assert_upgrade_closed_transport(&client, &error);
+    reconcile_unadmitted_upgrade_send(
+        &mut host,
+        &id,
+        &old_server_id,
+        "upgrade-after-exit",
+        &baseline,
+    )
+    .await;
+    assert_eq!(upgrade_execution_files(&host, project.path()), files);
 }
 
 #[tokio::test]
@@ -3959,17 +4221,18 @@ async fn persistent_sessions_survive_turns_transport_and_interrupt_until_explici
     assert!(!project.path().join("approved.txt").exists());
     assert_eq!(agent_pid(project.path()), pid);
     for _ in 0..2 {
-        assert!(matches!(
-            ask(
-                &mut client,
-                Request::CloseAgentSession {
-                    session_id: id.clone(),
-                    only_if_idle: None
-                }
-            )
-            .await,
-            Response::Ok
-        ));
+        let response = ask(
+            &mut client,
+            Request::CloseAgentSession {
+                session_id: id.clone(),
+                only_if_idle: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, Response::Ok),
+            "CloseAgentSession: {response:?}"
+        );
     }
     assert!(
         matches!(ask(&mut client, Request::Session { session_id: id.clone() }).await, Response::Session { session } if session.agent_session_open == Some(false))
@@ -4466,7 +4729,7 @@ async fn subagents_native_commands_snapshot_reconnect_and_close_share_one_protoc
     );
     send(&mut client, &id, "background-child", "background").await;
     wait(&mut client, &id, Status::Completed).await;
-    ask(
+    let response = ask(
         &mut client,
         Request::CloseAgentSession {
             session_id: id.clone(),
@@ -4474,6 +4737,10 @@ async fn subagents_native_commands_snapshot_reconnect_and_close_share_one_protoc
         },
     )
     .await;
+    assert!(
+        matches!(response, Response::Ok),
+        "CloseAgentSession: {response:?}"
+    );
     assert!(
         matches!(ask(&mut client, Request::Subagents {session_id:id}).await, Response::Subagents {tasks,..} if tasks.iter().all(|task| !task.status.active()) && tasks.iter().any(|task| task.native_id=="bg-task" && task.status==SubagentStatus::Stopped))
     );

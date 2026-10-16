@@ -16,14 +16,122 @@ fn fixture(mode: &str, dir: &Path) -> Command {
         .stderr(Stdio::null());
     command
 }
-async fn ready(dir: &Path) {
+
+const FIXTURE_STDERR_LIMIT: usize = 16 * 1024;
+const STDERR_TRUNCATED: &str = "\n[stderr truncated at 16384 bytes]";
+
+async fn fixture_status_with_stderr(
+    command: &mut Command,
+    run: impl AsyncFnOnce(&mut Child) -> io::Result<ExitStatus>,
+) -> (io::Result<ExitStatus>, String) {
+    let mut child = match command.stderr(Stdio::piped()).kill_on_drop(true).spawn() {
+        Ok(child) => child,
+        Err(error) => return (Err(error), String::new()),
+    };
+    let mut stderr = child.stderr.take().expect("piped child stderr missing");
+    let mut bytes = Vec::with_capacity(FIXTURE_STDERR_LIMIT);
+    let mut truncated = false;
+    let (status, stderr_result, cleanup_result) = {
+        let drain = async {
+            let mut chunk = [0; 4096];
+            loop {
+                let count = stderr.read(&mut chunk).await?;
+                if count == 0 {
+                    return io::Result::Ok(());
+                }
+                let retained = count.min(FIXTURE_STDERR_LIMIT - bytes.len());
+                bytes.extend_from_slice(&chunk[..retained]);
+                truncated |= retained < count;
+            }
+        };
+        tokio::pin!(drain);
+        let (status, drained) = {
+            let running = run(&mut child);
+            tokio::pin!(running);
+            tokio::select! {
+                status = &mut running => (status, None),
+                result = &mut drain => (running.await, Some(result)),
+            }
+        };
+        let cleanup_result = if status.is_err() {
+            // Resolve child ownership before any caller assertion can panic.
+            match child.start_kill() {
+                Ok(()) => fixture_wait(&mut child, Duration::from_secs(3))
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        let stderr_result = match drained {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(1), &mut drain)
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "stderr drain timed out"))
+                .and_then(|result| result),
+        };
+        (status, stderr_result, cleanup_result)
+    };
+    let mut diagnostic = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        diagnostic.push_str(STDERR_TRUNCATED);
+    }
+    if let Err(error) = stderr_result {
+        diagnostic.push_str(&format!("\n[stderr collection failed: {error}]"));
+    }
+    if let Err(error) = cleanup_result {
+        diagnostic.push_str(&format!("\n[fixture cleanup failed: {error}]"));
+    }
+    (status, diagnostic)
+}
+
+async fn fixture_wait(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+    tokio::time::timeout(timeout, child.wait())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fixture wait timed out"))?
+}
+
+#[tokio::test]
+async fn fixture_stderr_preserves_failure_and_drains_past_capture_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (status, stderr) =
+        fixture_status_with_stderr(&mut fixture("stderr-failure", dir.path()), async |child| {
+            fixture_wait(child, Duration::from_secs(5)).await
+        })
+        .await;
+    assert!(!status.unwrap().success(), "{stderr}");
+    assert!(stderr.starts_with("fixture failure detail\n"), "{stderr}");
+    assert!(stderr.ends_with(STDERR_TRUNCATED), "{stderr}");
+    assert_eq!(stderr.len(), FIXTURE_STDERR_LIMIT + STDERR_TRUNCATED.len());
+}
+
+#[tokio::test]
+async fn fixture_stderr_timeout_reaps_child_and_preserves_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let (status, stderr) =
+        fixture_status_with_stderr(&mut fixture("stderr-timeout", dir.path()), async |child| {
+            fixture_ready(dir.path()).await?;
+            fixture_wait(child, Duration::from_millis(100)).await
+        })
+        .await;
+    assert_eq!(status.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert_eq!(stderr, "fixture timeout detail\n");
+    released(dir.path()).await;
+}
+
+async fn fixture_ready(dir: &Path) -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(8), async {
         while !dir.join("ready").exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("child never became ready");
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "child never became ready"))
+}
+
+async fn ready(dir: &Path) {
+    fixture_ready(dir).await.expect("child never became ready");
 }
 async fn released(dir: &Path) {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -261,6 +369,19 @@ fn child_fixture() {
             "flood" => {
                 println!("{}", "x".repeat(16_384));
             }
+            "stderr-failure" => {
+                use std::io::Write;
+                let mut stderr = std::io::stderr().lock();
+                stderr.write_all(b"fixture failure detail\n").unwrap();
+                stderr.write_all(&[b'x'; 128 * 1024]).unwrap();
+                panic!("fixture failed after stderr flood");
+            }
+            "stderr-timeout" => {
+                let _lock = FileLock::try_acquire(&dir.join("alive.lock")).unwrap();
+                eprintln!("fixture timeout detail");
+                std::fs::write(dir.join("ready"), b"").unwrap();
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
             "supervisor" => {
                 let _child = ManagedChild::spawn(&mut fixture("tree", &dir)).unwrap();
                 ready(&dir).await;
@@ -292,18 +413,21 @@ async fn termination_notification_runs_owned_cleanup() {
         unistd::Pid,
     };
     let dir = tempfile::tempdir().unwrap();
-    let mut host = fixture("signal", dir.path())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    ready(dir.path()).await;
-    kill(Pid::from_raw(host.id().unwrap() as i32), Signal::SIGTERM).unwrap();
+    let (status, stderr) =
+        fixture_status_with_stderr(&mut fixture("signal", dir.path()), async |host| {
+            fixture_ready(dir.path()).await?;
+            let pid = host
+                .id()
+                .ok_or_else(|| io::Error::other("host PID missing"))?;
+            kill(Pid::from_raw(pid as i32), Signal::SIGTERM)?;
+            fixture_wait(host, Duration::from_secs(5)).await
+        })
+        .await;
+    let status =
+        status.unwrap_or_else(|error| panic!("signal fixture failed: {error}; stderr:\n{stderr}"));
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), host.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success()
+        status.success(),
+        "signal fixture exited with {status}; stderr:\n{stderr}"
     );
     assert!(dir.path().join("stopped").exists());
     released(dir.path()).await;
