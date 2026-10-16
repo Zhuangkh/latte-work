@@ -15,7 +15,10 @@ use std::{
     },
 };
 use widestring::U16CString;
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, SECURITY_IDENTIFICATION};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, READ_CONTROL,
+    SECURITY_IDENTIFICATION,
+};
 
 pub(crate) type Listener = PipeListener<Bytes, Bytes>;
 pub(crate) type Stream = DuplexPipeStream<Bytes>;
@@ -70,11 +73,21 @@ fn open_pipe_file(name: &str, overlapped: bool) -> io::Result<std::fs::File> {
     options
         .read(true)
         .write(true)
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL)
         .security_qos_flags(SECURITY_IDENTIFICATION);
     if overlapped {
         options.custom_flags(FILE_FLAG_OVERLAPPED);
     }
-    options.open(name)
+    let file = options.open(name)?;
+    // Pipe names are enumerable and can be occupied by another local user. Check
+    // the opened instance before returning any handle that can carry secrets.
+    latte_work_windows_security::verify_pipe_server(file.as_handle()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("IPC security validation failed [server owner/DACL]: {error}"),
+        )
+    })?;
+    Ok(file)
 }
 
 pub(crate) fn verify_peer(stream: &Stream) -> io::Result<u32> {

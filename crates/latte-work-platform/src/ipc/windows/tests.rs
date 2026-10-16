@@ -1,7 +1,67 @@
 use super::*;
 use crate::ipc::{self, Endpoint as PublicEndpoint};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const LIMIT: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn spoofed_permissive_pipe_is_rejected_before_protocol_or_secret_bytes() {
+    use interprocess::os::windows::{
+        named_pipe::{PipeListenerOptions, pipe_mode::Bytes},
+        security_descriptor::SecurityDescriptor,
+    };
+    use widestring::U16CString;
+
+    tokio::time::timeout(LIMIT, async {
+        for synchronous in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let endpoint = PublicEndpoint::prepare(root.path()).unwrap();
+            let sid = latte_work_windows_security::current_user_sid().unwrap();
+            // A counterfeit endpoint with the expected name and permissive ACL.
+            // A foreign owner is separately covered at the native handle boundary.
+            let sddl =
+                U16CString::from_str(format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;WD)")).unwrap();
+            let descriptor = SecurityDescriptor::deserialize(&sddl).unwrap();
+            let attacker = PipeListenerOptions::new()
+                .path(endpoint.address())
+                .security_descriptor(Some(descriptor))
+                .accept_remote(false)
+                .create_tokio_duplex::<Bytes>()
+                .unwrap();
+            let send = async {
+                let secret = b"hello prompt provider-secret";
+                if synchronous {
+                    let mut file = control::connect_file_once(&endpoint.address())?;
+                    std::io::Write::write_all(&mut file, secret)
+                } else {
+                    let mut stream = endpoint.connect(LIMIT).await?;
+                    stream.write_all(secret).await
+                }
+            };
+            let receive = async {
+                let mut stream = attacker.accept().await.unwrap();
+                let mut byte = [0];
+                stream.read(&mut byte).await
+            };
+            let (received, sent) = tokio::join!(receive, send);
+            let error = sent.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("server owner/DACL"), "{error}");
+            assert!(!ipc::daemon_absent(&error));
+            assert!(
+                matches!(received, Ok(0))
+                    || received.as_ref().is_err_and(|error| matches!(
+                        error.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::UnexpectedEof
+                    )),
+                "spoofed pipe received protocol or secret bytes: {received:?}"
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
 
 #[tokio::test]
 async fn case_and_extended_path_aliases_share_endpoint_and_singleton() {
@@ -88,6 +148,10 @@ $acl.AddAccessRule($rule)
     );
     let error = endpoint.connect(LIMIT).await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        error.to_string().contains("control directory owner/DACL"),
+        "{error}"
+    );
     assert!(!ipc::daemon_absent(&error));
     assert!(endpoint.try_lock_server().is_err());
     assert!(endpoint.try_lock_upgrade().is_err());

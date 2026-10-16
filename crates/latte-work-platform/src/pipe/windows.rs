@@ -1,5 +1,5 @@
 //! One-shot private pipes. The listener reuses the control-channel DACL and
-//! authenticates the same non-elevated user before handing out a stream, so a
+//! authenticates the same user before handing out a stream, so a
 //! different local process cannot read a transient handshake secret.
 use crate::control;
 use std::{
@@ -48,7 +48,7 @@ impl PrivatePipe {
     }
 
     /// Accept one authenticated client. The stream is returned only after the
-    /// kernel-reported peer token matches the current non-elevated user.
+    /// kernel-reported peer token matches the current user.
     pub async fn accept_once(&self) -> io::Result<PrivateStream> {
         let stream = self.listener.accept().await?;
         control::verify_peer(&stream)?;

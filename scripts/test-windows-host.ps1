@@ -1,4 +1,4 @@
-# Build as the runner, execute native tests as an ordinary user.
+# Build as the runner; Host checks elevated same-user behavior before the ordinary-user suite.
 # Account provisioning is restricted to disposable GitHub Actions Windows runners.
 [CmdletBinding()]
 param(
@@ -36,7 +36,11 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit 0
 }
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') {
-    throw 'Run locally as a non-elevated user; test-account provisioning is CI-only'
+    throw 'Run this ordinary-user suite locally without elevation; use test-windows-elevated.ps1 for elevated acceptance. Test-account provisioning is CI-only'
+}
+if ($Suite -eq 'Host') {
+    & (Join-Path $PSScriptRoot 'test-windows-elevated.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'Elevated same-user acceptance failed' }
 }
 
 $userName = 'latte-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)

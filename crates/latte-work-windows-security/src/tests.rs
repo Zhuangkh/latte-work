@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    io::Read,
+    io::{Read, Write},
     os::windows::io::AsHandle,
     process::{Command, Stdio},
     thread,
@@ -64,7 +64,10 @@ fn private_file_rejects_a_different_expected_owner_before_reading() {
     let root = tempfile::tempdir().unwrap();
     let private = ControlDirectory::create_or_validate(&root.path().join("private")).unwrap();
     let path = private.path().join("credential.json");
-    std::fs::write(&path, b"fixture-secret").unwrap();
+    create_private_file(&path)
+        .unwrap()
+        .write_all(b"fixture-secret")
+        .unwrap();
     let file = open_private_file(&path).unwrap();
     let mut expected = win32::current_identity().unwrap();
     // Exercise the actual native descriptor reader without taking ownership or
@@ -80,6 +83,42 @@ fn private_file_rejects_a_different_expected_owner_before_reading() {
     assert!(std::fs::rename(&path, private.path().join("moved")).is_err());
     drop(file);
     assert_eq!(std::fs::read(&path).unwrap(), b"fixture-secret");
+}
+
+#[test]
+fn private_file_creation_uses_token_user_and_never_repairs_existing_objects() {
+    let root = tempfile::tempdir().unwrap();
+    let user = current_user_sid().unwrap();
+    let oracle = inspect(
+        "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        root.path(),
+        root.path(),
+    );
+    assert_eq!(user, oracle);
+    let private = ControlDirectory::create_or_validate(&root.path().join("private")).unwrap();
+    let path = private.path().join("credential.json");
+    let mut file = create_private_file(&path).unwrap();
+    verify_private_file(&file).unwrap();
+    file.write_all(b"fixture-secret").unwrap();
+    drop(file);
+    let descriptor = inspect(
+        "[IO.File]::GetAccessControl($env:LATTE_SECURITY_TEST_PATH).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner)",
+        &path,
+        &path,
+    );
+    assert_eq!(descriptor, format!("O:{user}D:P(A;;FA;;;{user})"));
+    assert_eq!(
+        create_private_file(&path).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    let mut reopened = open_private_file(&path).unwrap();
+    let mut content = String::new();
+    reopened.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "fixture-secret");
+    // A broad ordinary parent cannot be used to create a purported private file.
+    let outside = root.path().join("outside.json");
+    assert!(create_private_file(&outside).is_err());
+    assert!(!outside.exists());
 }
 
 #[test]
@@ -259,5 +298,8 @@ fn native_unicode_and_extended_length_paths_work() {
 #[test]
 fn file_handle_cannot_be_used_as_peer_identity() {
     let file = tempfile::tempfile().unwrap();
-    assert!(verify_pipe_peer(file.as_handle()).is_err());
+    let error = verify_pipe_peer(file.as_handle()).unwrap_err();
+    assert!(error.to_string().contains("GetNamedPipeInfo"), "{error}");
+    let error = verify_pipe_server(file.as_handle()).unwrap_err();
+    assert!(error.to_string().contains("GetNamedPipeInfo"), "{error}");
 }

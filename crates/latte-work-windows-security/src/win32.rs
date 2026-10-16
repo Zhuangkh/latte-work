@@ -13,15 +13,13 @@ use std::{
     mem::{offset_of, size_of},
     os::windows::{
         ffi::OsStrExt,
-        io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
+        io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
     },
     path::Path,
     ptr::{NonNull, null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{
-        ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
-    },
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
         Authorization::{
@@ -30,8 +28,8 @@ use windows_sys::Win32::{
         },
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
         GetTokenInformation, IsValidAcl, IsValidSid, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+        OWNER_SECURITY_INFORMATION, PSID, RevertToSelf, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -43,13 +41,10 @@ use windows_sys::Win32::{
     System::{
         Pipes::{
             GetNamedPipeClientProcessId, GetNamedPipeInfo, GetNamedPipeServerProcessId,
-            PIPE_SERVER_END,
+            ImpersonateNamedPipeClient, PIPE_SERVER_END,
         },
         SystemServices::ACCESS_ALLOWED_ACE_TYPE,
-        Threading::{
-            GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-            PROCESS_QUERY_LIMITED_INFORMATION,
-        },
+        Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},
     },
 };
 
@@ -242,40 +237,38 @@ impl Drop for LocalMemory {
 
 pub(crate) struct Identity {
     pub(crate) sid: String,
-    elevated: bool,
 }
-impl Identity {
-    pub(crate) fn require_non_elevated(&self) -> io::Result<()> {
-        if self.elevated {
-            Err(denied(
-                "control channel requires non-elevated process tokens",
-            ))
-        } else {
-            Ok(())
-        }
-    }
+
+fn operation_error(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
 pub(crate) fn current_identity() -> io::Result<Identity> {
     // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, valid for this call.
     let process = unsafe { GetCurrentProcess() };
     identity_from_process(process)
+        .map_err(|error| operation_error("current process identity", error))
 }
 
-// Only accepts the current process pseudo-handle or an owned OpenProcess result below.
+// Only accepts the current process pseudo-handle or an owned process token below.
 fn identity_from_process(process: HANDLE) -> io::Result<Identity> {
     let mut raw = null_mut();
     // SAFETY: process is live, raw is writable; no handle inheritance or mutation requested.
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(operation_error(
+            "OpenProcessToken(TOKEN_QUERY)",
+            io::Error::last_os_error(),
+        ));
     }
     // SAFETY: successful OpenProcessToken transfers a unique valid token handle.
     let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    identity_from_token(token.as_raw_handle())
+}
+
+fn identity_from_token(token: HANDLE) -> io::Result<Identity> {
     let mut needed = 0;
     // SAFETY: documented size query writes only needed with a null, zero-length buffer.
-    let first = unsafe {
-        GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut needed)
-    };
+    let first = unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed) };
     let error = io::Error::last_os_error();
     if first != 0 || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
         return Err(io::Error::other(format!("cannot size TokenUser: {error}")));
@@ -289,7 +282,7 @@ fn identity_from_process(process: HANDLE) -> io::Result<Identity> {
     // The allocation stays fixed until the embedded SID has been converted to text.
     if unsafe {
         GetTokenInformation(
-            token.as_raw_handle(),
+            token,
             TokenUser,
             user.as_mut_ptr().cast(),
             capacity,
@@ -297,7 +290,10 @@ fn identity_from_process(process: HANDLE) -> io::Result<Identity> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(operation_error(
+            "GetTokenInformation(TokenUser)",
+            io::Error::last_os_error(),
+        ));
     }
     if needed > capacity || (needed as usize) < size_of::<TOKEN_USER>() {
         return Err(io::Error::other("invalid TokenUser result size"));
@@ -311,29 +307,7 @@ fn identity_from_process(process: HANDLE) -> io::Result<Identity> {
     // SAFETY: the SID address lies in user storage and available bounds its remainder.
     let sid = unsafe { bounded_sid_text(sid, needed as usize - offset)? };
 
-    // TokenElevation is fixed-size; avoid the zero-size query which may return BAD_LENGTH.
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut returned = 0;
-    // SAFETY: a correctly aligned fixed-size output with the exact documented structure size.
-    if unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenElevation,
-            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if returned as usize != size_of::<TOKEN_ELEVATION>() {
-        return Err(io::Error::other("invalid TokenElevation result size"));
-    }
-    Ok(Identity {
-        sid,
-        elevated: elevation.TokenIsElevated != 0,
-    })
+    Ok(Identity { sid })
 }
 
 /// # Safety
@@ -378,9 +352,10 @@ unsafe fn sid_text(sid: PSID) -> io::Result<String> {
     Err(io::Error::other("SID string exceeds limit"))
 }
 
-fn directory_descriptor(user: &Identity) -> io::Result<LocalMemory> {
+fn private_descriptor(user: &Identity, directory: bool) -> io::Result<LocalMemory> {
+    let flags = if directory { "OICI" } else { "" };
     let text = wide(OsStr::new(&format!(
-        "O:{}D:P(A;OICI;FA;;;{})",
+        "O:{}D:P(A;{flags};FA;;;{})",
         user.sid, user.sid
     )))?;
     let mut raw = null_mut();
@@ -419,7 +394,7 @@ fn require_protected(descriptor: &LocalMemory) -> io::Result<()> {
 }
 
 pub(crate) fn create_directory(path: &Path, user: &Identity) -> io::Result<()> {
-    let descriptor = directory_descriptor(user)?;
+    let descriptor = private_descriptor(user, true)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0.as_ptr(),
@@ -435,6 +410,43 @@ pub(crate) fn create_directory(path: &Path, user: &Identity) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn create_private_file(path: &Path, user: &Identity) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, GENERIC_WRITE},
+        Storage::FileSystem::{CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE},
+    };
+    let descriptor = private_descriptor(user, false)?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0.as_ptr(),
+        bInheritHandle: 0,
+    };
+    let path = wide(path.as_os_str())?;
+    // SAFETY: path, explicit owner/DACL and non-inheritable attributes remain live
+    // throughout atomic CREATE_NEW. Existing objects are neither opened nor changed.
+    let raw = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    if raw.is_null() {
+        return Err(io::Error::other("CreateFileW returned a null handle"));
+    }
+    // SAFETY: successful CREATE_NEW transfers this unique handle exactly once.
+    let file = unsafe { File::from_raw_handle(raw) };
+    verify_private_file(&file, user)?;
+    Ok(file)
 }
 
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
@@ -506,7 +518,7 @@ pub(crate) fn directory_identity(file: &File) -> io::Result<crate::DirectoryIden
 }
 
 pub(crate) fn verify_directory(file: &File, user: &Identity) -> io::Result<()> {
-    verify_storage_acl(file, user, true)
+    verify_storage_acl(file.as_handle(), user, true)
 }
 
 pub(crate) fn verify_private_file(file: &File, user: &Identity) -> io::Result<()> {
@@ -517,10 +529,14 @@ pub(crate) fn verify_private_file(file: &File, user: &Identity) -> io::Result<()
             "private file must be regular and not a reparse point",
         ));
     }
-    verify_storage_acl(file, user, false)
+    verify_storage_acl(file.as_handle(), user, false)
 }
 
-fn verify_storage_acl(file: &File, user: &Identity, directory: bool) -> io::Result<()> {
+fn verify_storage_acl(
+    handle: BorrowedHandle<'_>,
+    user: &Identity,
+    directory: bool,
+) -> io::Result<()> {
     let mut owner = null_mut();
     let mut dacl: *mut ACL = null_mut();
     let mut raw_descriptor = null_mut();
@@ -528,7 +544,7 @@ fn verify_storage_acl(file: &File, user: &Identity, directory: bool) -> io::Resu
     // single LocalAlloc descriptor, immediately owned below. No mutations occur.
     let status = unsafe {
         GetSecurityInfo(
-            file.as_raw_handle(),
+            handle.as_raw_handle(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
@@ -622,7 +638,10 @@ fn pipe_peer_pid(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(operation_error(
+            "GetNamedPipeInfo",
+            io::Error::last_os_error(),
+        ));
     }
     let mut pid = 0;
     // SAFETY: kernel-reported pipe end selects the matching peer query. pid is writable.
@@ -634,7 +653,12 @@ fn pipe_peer_pid(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
         }
     };
     if result == 0 {
-        return Err(io::Error::last_os_error());
+        let operation = if flags & PIPE_SERVER_END != 0 {
+            "GetNamedPipeClientProcessId"
+        } else {
+            "GetNamedPipeServerProcessId"
+        };
+        return Err(operation_error(operation, io::Error::last_os_error()));
     }
     if pid == 0 {
         return Err(denied("pipe peer PID unavailable"));
@@ -642,31 +666,117 @@ fn pipe_peer_pid(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
     Ok(pid)
 }
 
+struct RevertToSelfGuard;
+impl Drop for RevertToSelfGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard exists only after ImpersonateNamedPipeClient succeeds.
+        let _ = unsafe { RevertToSelf() };
+    }
+}
+
+fn pipe_client_identity(pipe: BorrowedHandle<'_>) -> io::Result<Identity> {
+    // SAFETY: the handle is a live server end of a named pipe and the client
+    // was admitted by its user-only pipe DACL. Identification-level SQOS keeps
+    // this limited to reading the client's identity; it grants no client access.
+    if unsafe { ImpersonateNamedPipeClient(pipe.as_raw_handle()) } == 0 {
+        return Err(operation_error(
+            "ImpersonateNamedPipeClient",
+            io::Error::last_os_error(),
+        ));
+    }
+    let _revert = RevertToSelfGuard;
+    let mut raw = null_mut();
+    // SAFETY: GetCurrentThread is a valid pseudo-handle; raw is writable.
+    if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) } == 0 {
+        return Err(operation_error(
+            "OpenThreadToken(TOKEN_QUERY)",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: successful OpenThreadToken transfers a unique valid token handle.
+    let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    identity_from_token(token.as_raw_handle())
+}
+
+pub(crate) fn verify_pipe_server(pipe: BorrowedHandle<'_>) -> io::Result<()> {
+    verify_pipe_server_for_user(pipe, &current_identity()?)
+}
+
+fn verify_pipe_server_for_user(pipe: BorrowedHandle<'_>, user: &Identity) -> io::Result<()> {
+    // Validate the kernel handle type before querying its security descriptor.
+    // The descriptor belongs to this pipe instance, not to its enumerable name.
+    pipe_peer_pid(pipe)?;
+    verify_storage_acl(pipe, user, false)
+}
+
 pub(crate) fn verify_pipe_peer(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
     let current = current_identity()?;
-    current.require_non_elevated()?;
     let pid = pipe_peer_pid(pipe)?;
-    // SAFETY: PID is obtained from the live pipe, not protocol data; query-only access.
-    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if raw.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful OpenProcess returns a unique owned handle.
-    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
-    let peer = identity_from_process(process.as_raw_handle())?;
-    peer.require_non_elevated()?;
+    let peer = pipe_client_identity(pipe)?;
     if peer.sid != current.sid {
         return Err(denied("control peer belongs to another user"));
     }
-    let mut exit_code = 0;
-    // SAFETY: process handle remains live and output is valid.
-    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit_code) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if exit_code != STILL_ACTIVE as u32 || pipe_peer_pid(pipe)? != pid {
-        return Err(denied(
-            "control peer exited or changed during authentication",
-        ));
+    // Re-read the kernel peer PID after impersonation. The pipe handle itself is
+    // the liveness boundary; no OpenProcess/OpenProcessToken cross-integrity
+    // query is needed, so a medium SSH bridge can connect to a high Server.
+    if pipe_peer_pid(pipe)? != pid {
+        return Err(denied("control peer changed during authentication"));
     }
     Ok(pid)
+}
+
+#[cfg(test)]
+mod pipe_server_tests {
+    use super::*;
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::{
+        Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX},
+        System::Pipes::{CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS},
+    };
+
+    #[test]
+    fn opened_pipe_server_owner_must_match_expected_user() {
+        let current = current_identity().unwrap();
+        let descriptor = private_descriptor(&current, false).unwrap();
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0.as_ptr(),
+            bInheritHandle: 0,
+        };
+        let name = format!(r"\\.\pipe\latte-work-owner-test-{}", std::process::id());
+        let wide_name = wide(OsStr::new(&name)).unwrap();
+        // SAFETY: the terminated name and descriptor remain live throughout
+        // creation; the non-inheritable instance is immediately owned below.
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide_name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                1024,
+                1024,
+                0,
+                &attributes,
+            )
+        };
+        assert_ne!(raw, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+        // SAFETY: CreateNamedPipeW returned one valid uniquely owned handle.
+        let _server = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let client = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL)
+            .open(name)
+            .unwrap();
+        verify_pipe_server(client.as_handle()).unwrap();
+        // Model a client whose expected user differs from this real pipe owner.
+        // This does not require privileges to assign a foreign owner or logon.
+        let foreign = Identity {
+            sid: "S-1-5-21-111-222-333-444".to_owned(),
+        };
+        assert_ne!(foreign.sid, current.sid);
+        let error = verify_pipe_server_for_user(client.as_handle(), &foreign).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("owned exclusively"), "{error}");
+    }
 }

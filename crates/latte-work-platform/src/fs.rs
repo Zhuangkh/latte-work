@@ -104,10 +104,12 @@ impl PrivateDir {
     pub fn tempfile(&self, prefix: &str, suffix: &str) -> io::Result<NamedTempFile> {
         // Builder prefixes/suffixes must not redirect creation outside the private directory.
         file_name(&format!("{prefix}temporary{suffix}"))?;
-        let file = tempfile::Builder::new()
-            .prefix(prefix)
-            .suffix(suffix)
-            .tempfile_in(&self.path)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix).suffix(suffix);
+        #[cfg(unix)]
+        let file = builder.tempfile_in(&self.path)?;
+        #[cfg(windows)]
+        let file = builder.make_in(&self.path, latte_work_windows_security::create_private_file)?;
         backend::protect_open_file(file.as_file())?;
         Ok(file)
     }

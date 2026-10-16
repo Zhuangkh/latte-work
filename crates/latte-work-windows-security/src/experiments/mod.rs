@@ -115,7 +115,7 @@ fn pwsh(script: &str, dir: &Path) -> String {
 }
 
 fn require_ordinary_user() {
-    crate::current_user_sid().expect("run experiments as a non-elevated Windows user");
+    crate::current_user_sid().expect("Windows process user SID must be readable");
 }
 
 fn mark(dir: &Path, name: &str, value: impl AsRef<[u8]>) {

@@ -64,7 +64,9 @@ impl Endpoint {
         self.directory.path().join("upgrade.lock")
     }
     pub(super) fn verify(&self) -> io::Result<()> {
-        self.directory.verify().map_err(security_error)?;
+        self.directory
+            .verify()
+            .map_err(|error| security_error("control directory owner/DACL", error))?;
         if self.directory.identity()? != self.identity {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -82,7 +84,6 @@ impl Endpoint {
                 Ok(raw) => {
                     let stream = Stream(raw);
                     self.verify()?;
-                    control::verify_peer(&stream.0).map_err(security_error)?;
                     return Ok(stream);
                 }
                 Err(error) if error.raw_os_error() == Some(231) => {
@@ -119,7 +120,8 @@ impl Listener {
     pub(super) async fn accept(&self, endpoint: &Endpoint) -> io::Result<Stream> {
         let stream = Stream(self.0.accept().await?);
         endpoint.verify()?;
-        control::verify_peer(&stream.0).map_err(security_error)?;
+        control::verify_peer(&stream.0)
+            .map_err(|error| security_error("client identity (server side)", error))?;
         Ok(stream)
     }
 }
@@ -159,9 +161,9 @@ impl AsyncWrite for Stream {
         Poll::Ready(Ok(()))
     }
 }
-fn security_error(error: io::Error) -> io::Error {
+fn security_error(stage: &str, error: io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        format!("IPC security validation failed: {error}"),
+        format!("IPC security validation failed [{stage}]: {error}"),
     )
 }

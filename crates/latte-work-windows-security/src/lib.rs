@@ -60,7 +60,6 @@ impl ControlDirectory {
     /// Recheck the pinned leaf's current ACL before another connection/admission.
     pub fn verify(&self) -> io::Result<()> {
         let user = win32::current_identity()?;
-        user.require_non_elevated()?;
         win32::verify_directory(
             self._handles.last().expect("validated non-root directory"),
             &user,
@@ -70,7 +69,6 @@ impl ControlDirectory {
     fn open(path: &Path, create: bool) -> io::Result<Self> {
         let path = path::control_path(path)?;
         let user = win32::current_identity()?;
-        user.require_non_elevated()?;
         let mut current = PathBuf::new();
         let mut handles = Vec::new();
         for component in path.components() {
@@ -148,7 +146,6 @@ pub fn file_identity(file: &File) -> io::Result<DirectoryIdentity> {
 #[cfg(windows)]
 pub fn verify_private_file(file: &File) -> io::Result<()> {
     let user = win32::current_identity()?;
-    user.require_non_elevated()?;
     win32::verify_private_file(file, &user)
 }
 
@@ -181,17 +178,38 @@ pub fn open_private_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// SID of the current non-elevated process user, for the separate pipe DACL.
+/// Create a new private file with an explicit user owner and protected user-only
+/// DACL before any content can be written. Parent must be a verified private
+/// directory; existing files are never opened, truncated or repaired.
 #[cfg(windows)]
-pub fn current_user_sid() -> io::Result<String> {
-    let user = win32::current_identity()?;
-    user.require_non_elevated()?;
-    Ok(user.sid)
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let path = path::control_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("private file needs a parent"))?;
+    let _guard = ControlDirectory::open_verified(parent)?;
+    win32::create_private_file(&path, &win32::current_identity()?)
 }
 
-/// Authenticate the peer of a connected local named pipe before protocol traffic.
-/// The endpoint role and peer PID come from the kernel, never from caller-supplied
-/// protocol data. Both process tokens must belong to the same non-elevated user.
+/// SID of the current process user, for the separate pipe DACL.
+/// Elevation does not change the same-user policy.
+#[cfg(windows)]
+pub fn current_user_sid() -> io::Result<String> {
+    Ok(win32::current_identity()?.sid)
+}
+
+/// Authenticate the server of an opened local named pipe before protocol traffic.
+/// Its actual handle must have the current user as owner and an exact user-only
+/// full-control DACL. No peer process/token query or protocol exchange is needed.
+#[cfg(windows)]
+pub fn verify_pipe_server(pipe: BorrowedHandle<'_>) -> io::Result<()> {
+    win32::verify_pipe_server(pipe)
+}
+
+/// Authenticate the client from the server end of a connected local named pipe.
+/// The peer PID and impersonated token come from the kernel, never from caller
+/// protocol data. Both process tokens must belong to the same user. Windows
+/// access checks still apply; no privilege or integrity-level bypass is attempted.
 #[cfg(windows)]
 pub fn verify_pipe_peer(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
     win32::verify_pipe_peer(pipe)
