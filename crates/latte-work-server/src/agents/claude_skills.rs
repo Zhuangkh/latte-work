@@ -2,7 +2,6 @@
 //! Skill locations: <https://code.claude.com/docs/en/skills#choose-where-skills-load>
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::SkillInfo;
-use std::os::unix::fs::OpenOptionsExt;
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -17,10 +16,9 @@ fn component(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 fn read(path: &Path, limit: u64) -> Result<String> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK)
-        .open(path)?;
+    // Skill folders and in-directory entry links are resolved by inspect first.
+    // Open the resolved leaf without following a replacement link.
+    let file = latte_work_platform::fs::open_regular_file(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.len() > limit {
         bail!("Skill 元数据超出读取范围");
@@ -114,6 +112,11 @@ pub fn find(project: &Path, name: &str) -> Result<Option<SkillInfo>> {
             crate::agent_environment::variable("HOME")
                 .map(|home| PathBuf::from(home).join(".claude"))
         })
+        .or_else(|| {
+            latte_work_platform::dirs::home_dir()
+                .ok()
+                .map(|p| p.join(".claude"))
+        })
         .context("无法确定 Agent 配置目录")?;
     find_in(project, &config, name)
 }
@@ -128,7 +131,8 @@ fn find_in(project: &Path, config: &Path, name: &str) -> Result<Option<SkillInfo
         if !index.exists() {
             return Ok(None);
         }
-        let index: serde_json::Value = serde_json::from_str(&read(&index, 256 * 1024)?)?;
+        let index: serde_json::Value =
+            serde_json::from_str(&read(&index.canonicalize()?, 256 * 1024)?)?;
         let mut matches = Vec::new();
         if let Some(plugins) = index.get("plugins").and_then(|p| p.as_object()) {
             for (key, installs) in plugins.iter().take(256) {
@@ -224,24 +228,30 @@ mod tests {
             assert!(find_in(root, root, name).is_err());
         }
         skill(&root.join("actual"), "---\ndescription: linked\n---");
-        std::fs::create_dir_all(root.join("skills")).unwrap();
-        std::os::unix::fs::symlink(root.join("actual"), root.join("skills/linked")).unwrap();
-        assert_eq!(
-            find_in(root, root, "linked").unwrap().unwrap().description,
-            "linked"
-        );
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("skills")).unwrap();
+            std::os::unix::fs::symlink(root.join("actual"), root.join("skills/linked")).unwrap();
+            assert_eq!(
+                find_in(root, root, "linked").unwrap().unwrap().description,
+                "linked"
+            );
+        }
         skill(
             &root.join("skills/large"),
             &"a".repeat(FILE_LIMIT as usize + 1),
         );
         assert!(find_in(root, root, "large").is_err());
-        std::fs::create_dir_all(root.join("skills/escape")).unwrap();
-        std::os::unix::fs::symlink(
-            root.join("actual/SKILL.md"),
-            root.join("skills/escape/SKILL.md"),
-        )
-        .unwrap();
-        assert!(find_in(root, root, "escape").is_err());
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("skills/escape")).unwrap();
+            std::os::unix::fs::symlink(
+                root.join("actual/SKILL.md"),
+                root.join("skills/escape/SKILL.md"),
+            )
+            .unwrap();
+            assert!(find_in(root, root, "escape").is_err());
+        }
         assert!(find_in(root, root, "missing").unwrap().is_none());
     }
     #[test]
@@ -267,5 +277,43 @@ mod tests {
             "Plugin review"
         );
         assert!(find_in(root, root, "other:review").unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn linked_skill_folders_are_supported_but_entry_escape_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let actual = root.join("actual");
+        skill(&actual, "---\ndescription: linked\n---");
+        let linked = root.join("skills/linked");
+        let escape = root.join("skills/escape/SKILL.md");
+        std::fs::create_dir_all(escape.parent().unwrap()).unwrap();
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:LATTE_SKILL_LINK -Target $env:LATTE_SKILL_TARGET | Out-Null; New-Item -ItemType Junction -Path $env:LATTE_SKILL_ESCAPE -Target $env:LATTE_SKILL_TARGET | Out-Null"])
+            .env("LATTE_SKILL_LINK", &linked)
+            .env("LATTE_SKILL_TARGET", &actual)
+            .env("LATTE_SKILL_ESCAPE", &escape);
+        let (status, _) = latte_work_platform::process::output(
+            &mut command,
+            std::time::Duration::from_secs(10),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            find_in(root, root, "linked").unwrap().unwrap().description,
+            "linked"
+        );
+        assert!(find_in(root, root, "escape").is_err());
+        assert!(read(&actual, FILE_LIMIT).is_err());
+        assert!(latte_work_platform::fs::open_regular_file(&linked).is_err());
+        assert_eq!(
+            std::fs::read_to_string(actual.join("SKILL.md")).unwrap(),
+            "---\ndescription: linked\n---"
+        );
+        std::fs::remove_dir(escape).unwrap();
+        std::fs::remove_dir(linked).unwrap();
     }
 }

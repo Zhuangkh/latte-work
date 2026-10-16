@@ -183,12 +183,7 @@ async fn inventory(
             if kind.is_dir() {
                 directories.push(path);
             } else if kind.is_file() {
-                paths.push(
-                    path.strip_prefix(root)?
-                        .to_str()
-                        .context("文件路径不是 UTF-8")?
-                        .to_owned(),
-                );
+                paths.push(relative);
             } else {
                 truncated = true;
             }
@@ -1218,6 +1213,7 @@ mod tests {
             );
         }
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn ordinary_inventory_is_bounded_and_does_not_follow_symlinks() {
         let dir = tempfile::tempdir().unwrap();

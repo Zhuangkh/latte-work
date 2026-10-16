@@ -16,6 +16,8 @@ pub use win32::project::{
     ManagedRecoveryRoot, ProjectMetadata, ProjectPath, PublishedFile, RecoveryDir, StagedFile,
     delete_file, project_metadata,
 };
+#[cfg(windows)]
+pub use win32::session::NativeSessionFile;
 
 #[cfg(windows)]
 use std::{

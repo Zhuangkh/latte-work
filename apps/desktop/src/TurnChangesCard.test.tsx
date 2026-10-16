@@ -216,10 +216,12 @@ it("keeps the Windows Undo reason visible for an empty saved snapshot", () => {
 it("enables ordinary-directory Undo when the server supplies complete eligible changes", async () => {
   mocks.request.mockResolvedValue({
     kind: "turn_changes",
-    changes: { ...changes, undo: "reverted", undo_unavailable: null },
+    changes: { ...changes, undo: "reverted" },
   });
-  render(<TurnChangesCard {...props} changes={{ ...changes, undo_unavailable: null }} />);
-  const undo = screen.getByRole("button", { name: "撤销" }) as HTMLButtonElement;
+  render(<TurnChangesCard {...props} />);
+  const undo = screen.getByRole("button", {
+    name: "撤销",
+  }) as HTMLButtonElement;
   expect(undo.disabled).toBe(false);
   fireEvent.click(undo);
   expect(mocks.request).toHaveBeenCalledExactlyOnceWith("local", {

@@ -59,6 +59,63 @@ fn sddl(path: &Path) -> String {
     )
 }
 
+// Resolve SDDL aliases (including RID500's LA) without relaxing any owner,
+// control flag, or ACE assertion. This stays independent of the native verifier.
+fn descriptor_semantics(descriptor: &str) -> String {
+    inspect(
+        r#"$ErrorActionPreference='Stop'
+$descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($env:LATTE_SECURITY_TEST_TARGET)
+$descriptor.Owner.Value
+[int]$descriptor.ControlFlags
+if ($null -eq $descriptor.DiscretionaryAcl) { 'null'; return }
+$descriptor.DiscretionaryAcl.Count
+foreach ($ace in $descriptor.DiscretionaryAcl) {
+    if ($ace -isnot [Security.AccessControl.CommonAce]) { throw 'Expected a common ACE' }
+    [int]$ace.AceType
+    [int]$ace.AceFlags
+    $ace.AccessMask
+    $ace.SecurityIdentifier.Value
+    $ace.OpaqueLength
+}
+"#,
+        Path::new(""),
+        Path::new(descriptor),
+    )
+}
+
+#[test]
+fn sddl_semantics_resolve_local_administrator_alias_and_preserve_acl_checks() {
+    let administrator = inspect(
+        "[Security.Principal.SecurityIdentifier]::new('LA').Value",
+        Path::new(""),
+        Path::new(""),
+    );
+    assert!(administrator.ends_with("-500"));
+    for flags in ["", "OICI"] {
+        assert_eq!(
+            descriptor_semantics(&format!("O:LAD:P(A;{flags};FA;;;LA)")),
+            descriptor_semantics(&format!(
+                "O:{administrator}D:P(A;{flags};FA;;;{administrator})"
+            )),
+        );
+    }
+
+    let expected = descriptor_semantics("O:LAD:P(A;OICI;FA;;;LA)");
+    for invalid in [
+        "O:SYD:P(A;OICI;FA;;;LA)",
+        "O:LAD:P(A;OICI;FA;;;SY)",
+        "O:LAD:P(A;OICI;FR;;;LA)",
+        "O:LAD:(A;OICI;FA;;;LA)",
+        "O:LAD:P(A;;FA;;;LA)",
+        "O:LAD:P(D;OICI;FA;;;LA)",
+        "O:LAD:P(A;OICI;FA;;;LA)(A;;FR;;;WD)",
+        "O:LAD:P",
+        "O:LAD:NO_ACCESS_CONTROL",
+    ] {
+        assert_ne!(descriptor_semantics(invalid), expected, "{invalid}");
+    }
+}
+
 #[test]
 fn private_file_rejects_a_different_expected_owner_before_reading() {
     let root = tempfile::tempdir().unwrap();
@@ -106,7 +163,10 @@ fn private_file_creation_uses_token_user_and_never_repairs_existing_objects() {
         &path,
         &path,
     );
-    assert_eq!(descriptor, format!("O:{user}D:P(A;;FA;;;{user})"));
+    assert_eq!(
+        descriptor_semantics(&descriptor),
+        descriptor_semantics(&format!("O:{user}D:P(A;;FA;;;{user})"))
+    );
     assert_eq!(
         create_private_file(&path).unwrap_err().kind(),
         io::ErrorKind::AlreadyExists
@@ -129,7 +189,8 @@ fn private_leaf_inherits_nothing_and_pins_until_drop() {
     let user = current_user_sid().unwrap();
     let guard = ControlDirectory::create_or_validate(&path).unwrap();
     assert!(guard.path().is_dir());
-    assert_eq!(sddl(&path), format!("O:{user}D:P(A;OICI;FA;;;{user})"));
+    let expected = descriptor_semantics(&format!("O:{user}D:P(A;OICI;FA;;;{user})"));
+    assert_eq!(descriptor_semantics(&sddl(&path)), expected);
     // This regression distinguishes the ordinary parent (previously passed by
     // mistake) from the new leaf whose DACL must contain SE_DACL_PROTECTED.
     assert_eq!(sddl(root.path()), before);
@@ -137,7 +198,7 @@ fn private_leaf_inherits_nothing_and_pins_until_drop() {
     assert!(std::fs::remove_dir(&path).is_err());
     drop(guard);
     let reopened = ControlDirectory::create_or_validate(&path).unwrap();
-    assert_eq!(sddl(&path), format!("O:{user}D:P(A;OICI;FA;;;{user})"));
+    assert_eq!(descriptor_semantics(&sddl(&path)), expected);
     drop(reopened);
     let reopened = ControlDirectory::open_verified(&path).unwrap();
     drop(reopened);

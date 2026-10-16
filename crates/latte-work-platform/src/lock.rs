@@ -22,6 +22,14 @@ impl FileLock {
     }
 }
 
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Closing alone can retain the lock while a duplicated Unix descriptor is alive.
+        // Teardown is best-effort and must not panic; the owned handle still closes next.
+        let _ = self._file.unlock();
+    }
+}
+
 fn open(path: &Path) -> io::Result<File> {
     match path.symlink_metadata() {
         Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
@@ -68,6 +76,38 @@ mod tests {
         assert!(path.is_file());
         // Windows locks also block reads through other handles until release.
         assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+        let _reacquired = FileLock::try_acquire(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_guard_releases_lock_while_duplicate_remains_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.lock");
+        let held = FileLock::try_acquire(&path).unwrap();
+        let duplicate = held._file.try_clone().unwrap();
+        assert!(matches!(
+            FileLock::try_acquire(&path),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(held);
+        let _reacquired = FileLock::try_acquire(&path).unwrap();
+        drop(duplicate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_duplicate_does_not_release_live_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.lock");
+        let held = FileLock::try_acquire(&path).unwrap();
+        let duplicate = held._file.try_clone().unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            FileLock::try_acquire(&path),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(held);
         let _reacquired = FileLock::try_acquire(&path).unwrap();
     }
 

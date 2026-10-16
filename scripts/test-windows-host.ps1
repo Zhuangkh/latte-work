@@ -39,8 +39,29 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') {
     throw 'Run this ordinary-user suite locally without elevation; use test-windows-elevated.ps1 for elevated acceptance. Test-account provisioning is CI-only'
 }
 if ($Suite -eq 'Host') {
-    & (Join-Path $PSScriptRoot 'test-windows-elevated.ps1')
-    if ($LASTEXITCODE -ne 0) { throw 'Elevated same-user acceptance failed' }
+    # Managed-root fixtures reject short aliases in every ancestor. Expand only
+    # this harness-owned directory, never paths supplied by the security tests.
+    $elevatedTemp = Join-Path $env:RUNNER_TEMP ('latte-elevated-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $elevatedTemp | Out-Null
+    $elevatedTemp = (Get-Item -LiteralPath $elevatedTemp).FullName
+    $tempAcl = [Security.AccessControl.DirectorySecurity]::new()
+    $tempAcl.SetOwner($identity.User)
+    $tempAcl.SetAccessRuleProtection($true, $false)
+    $tempAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity.User, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    Set-Acl -LiteralPath $elevatedTemp -AclObject $tempAcl
+    $originalTemp = $env:TEMP
+    $originalTmp = $env:TMP
+    try {
+        $env:TEMP = $elevatedTemp
+        $env:TMP = $elevatedTemp
+        Write-Host "Elevated fixture TEMP/TMP: $elevatedTemp"
+        & (Join-Path $PSScriptRoot 'test-windows-elevated.ps1')
+        if ($LASTEXITCODE -ne 0) { throw 'Elevated same-user acceptance failed' }
+    } finally {
+        $env:TEMP = $originalTemp
+        $env:TMP = $originalTmp
+        # Runner teardown owns this fixture directory, like ordinary-user logs.
+    }
 }
 
 $userName = 'latte-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)

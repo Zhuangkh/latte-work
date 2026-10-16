@@ -76,7 +76,7 @@ async fn permission_output(binary: &Path, args: &[&str]) -> Result<(bool, String
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = latte_work_platform::process::ManagedChild::spawn(&mut command)
-        .context("无法读取 Agent 权限选项")?;
+        .context("无法读取 Agent 权限选项（启动进程失败）")?;
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stdout = child
             .stdout
@@ -92,21 +92,37 @@ async fn permission_output(binary: &Path, args: &[&str]) -> Result<(bool, String
         tokio::try_join!(
             stdout.read_to_end(&mut bytes),
             stderr.read_to_end(&mut diagnostic)
-        )?;
+        )
+        .context("读取 Agent 权限选项输出失败")?;
         if bytes.len() + diagnostic.len() > LIMIT as usize {
             bail!("Agent 帮助输出超出限制");
         }
         Ok((
-            child.wait().await?.success(),
-            String::from_utf8(bytes)?,
-            String::from_utf8(diagnostic)?,
+            child
+                .wait()
+                .await
+                .context("等待 Agent 权限探测进程退出失败")?
+                .success(),
+            String::from_utf8(bytes).context("Agent 帮助输出不是 UTF-8")?,
+            String::from_utf8(diagnostic).context("Agent 参数诊断不是 UTF-8")?,
         ))
     })
     .await
     .context("读取 Agent 权限选项超时")
     .and_then(|result| result);
-    child.close(Duration::ZERO).await?;
-    result
+    // Successful root exit also closes descendants; errors retain bounded cleanup.
+    let cleanup = child
+        .close(Duration::ZERO)
+        .await
+        .context("Agent 权限探测进程树清理未确认");
+    match (result, cleanup) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            let message = format!("{error:#}；{cleanup:#}");
+            Err(error.context(message))
+        }
+    }
 }
 
 fn modes_from_help(help: &str) -> Result<Vec<latte_work_protocol::AgentPermissionMode>> {
@@ -1801,6 +1817,90 @@ fn parse_commands(value: &Value) -> Result<Vec<latte_work_protocol::AgentSlashCo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "owned subprocess fixture; launched only by permission regressions"]
+    fn permission_stderr_fixture() {
+        eprintln!(
+            "error: option '--permission-mode <mode>' argument 'latteWorkPermissionProbe' is invalid. Allowed choices are default, acceptEdits, plan."
+        );
+        std::process::exit(2);
+    }
+
+    #[test]
+    #[ignore = "owned subprocess fixture; launched only by permission regressions"]
+    fn permission_oversized_fixture() {
+        println!("{}", "x".repeat(70 * 1024));
+        eprintln!("{}", "x".repeat(70 * 1024));
+    }
+
+    #[test]
+    #[ignore = "owned subprocess fixture; launched only by permission regressions"]
+    fn permission_below_limit_fixture() {
+        println!("{}", "x".repeat(70 * 1024));
+        eprintln!("small diagnostic");
+    }
+
+    #[tokio::test]
+    async fn permission_probe_reads_stderr_from_a_managed_native_child() {
+        let (success, _, diagnostic) = super::permission_output(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--exact",
+                "agents::claude::tests::permission_stderr_fixture",
+                "--ignored",
+                "--nocapture",
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(!success);
+        let modes = super::modes_from_diagnostic(&diagnostic).unwrap();
+        assert_eq!(
+            modes
+                .iter()
+                .map(|mode| mode.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "acceptEdits", "plan"]
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_probe_rejects_combined_stdout_stderr_over_limit() {
+        let error = super::permission_output(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--exact",
+                "agents::claude::tests::permission_oversized_fixture",
+                "--ignored",
+                "--nocapture",
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Agent 帮助输出超出限制"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_probe_accepts_combined_stdout_stderr_below_limit() {
+        let (success, help, diagnostic) = super::permission_output(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--exact",
+                "agents::claude::tests::permission_below_limit_fixture",
+                "--ignored",
+                "--nocapture",
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(success);
+        assert!(help.contains(&"x".repeat(70 * 1024)));
+        assert!(diagnostic.contains("small diagnostic"));
+    }
+
     fn handoff(agent: &mut super::Claude, request_id: &str) -> String {
         use super::*;
         let actions = agent

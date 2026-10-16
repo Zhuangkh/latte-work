@@ -6,6 +6,8 @@ pub(crate) mod console;
 mod experiments;
 #[path = "win32/project.rs"]
 pub(crate) mod project;
+#[path = "win32/session.rs"]
+pub(crate) mod session;
 use std::{
     ffi::{OsStr, c_void},
     fs::File,

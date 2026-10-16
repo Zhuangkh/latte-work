@@ -1359,12 +1359,11 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 prepared.record_intent(&mut turn);
                 turn.changes.undo = TurnUndoStatus::Unknown;
                 db(&database, |d| d.update_turn(&session_id, &turn))?;
-                let restored = prepared
+                let _restored = prepared
                     .restore()
                     .context("撤销未能全部完成，状态待核对；请检查工作区，系统不会自动重试")?;
                 turn.changes.undo = TurnUndoStatus::Reverted;
                 db(&database, |d| d.update_turn(&session_id, &turn))?;
-                drop(restored);
                 Ok::<_, anyhow::Error>(turn.changes)
             })
             .await??;

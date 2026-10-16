@@ -14,6 +14,9 @@ mod backend;
 
 #[cfg(windows)]
 pub use backend::directory_identity;
+/// Existing same-user native Agent data; preserves the source ACL policy.
+#[cfg(windows)]
+pub use latte_work_windows_security::NativeSessionFile;
 #[cfg(windows)]
 pub use latte_work_windows_security::open_private_file;
 /// Windows project restore primitives retain project permissions, distinct from PrivateDir.
@@ -25,6 +28,13 @@ pub mod project {
     };
 }
 pub(crate) use backend::open_lock_file;
+
+/// Open an existing regular file for reading without following the leaf link.
+/// Never creates or truncates it. Windows rejects device/stream path spellings.
+/// This does not impose an owner policy or pin ancestors; callers own the path boundary.
+pub fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    backend::open_regular_file(path)
+}
 
 /// Ordinary application state; Windows inherits ACLs, Unix retains 0700.
 pub fn prepare_state_dir(path: &Path) -> io::Result<PathBuf> {

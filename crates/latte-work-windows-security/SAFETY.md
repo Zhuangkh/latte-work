@@ -52,6 +52,15 @@ lint has been weakened.
   existing Provider files before reading them.
 - `file_identity(&File)` exposes the full volume serial/128-bit file ID from an
   already-open handle. This is identity metadata only, not an ACL authentication API.
+- `NativeSessionFile::open(path, append)` pins every ordinary ancestor and opens
+  an existing non-reparse transcript with read access and optional append-only
+  access. It checks the actual handle's owner against the process user, without
+  requiring or changing private-storage DACLs. The full volume/file ID must be
+  readable before returning. Ancestors and the leaf deny replacement throughout
+  the guard lifetime; read/write sharing allows a native Agent to keep appending.
+  This is same-user admission, not a promise that another ACL-authorized writer
+  cannot change transcript contents. Missing, UNC/ambiguous, reparse and
+  unsupported-identity paths fail without creation or permission repair.
 - `open_private_file(path)` pins each ordinary ancestor while opening the leaf
   with `FILE_FLAG_OPEN_REPARSE_POINT`, read access and read-only sharing. It validates
   the same handle's regular-file attribute, owner and DACL before returning it;

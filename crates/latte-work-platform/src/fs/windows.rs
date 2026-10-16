@@ -13,6 +13,24 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[path = "windows/tests.rs"]
 mod tests;
 
+pub(super) fn open_regular_file(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    let path = latte_work_windows_security::local_path(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_link(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file must be regular, not a reparse point",
+        ));
+    }
+    Ok(file)
+}
+
 pub(super) type Guard = ControlDirectory;
 pub(super) fn validate_path(path: &Path) -> io::Result<()> {
     latte_work_windows_security::local_path(path).map(|_| ())

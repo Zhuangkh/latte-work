@@ -56,6 +56,20 @@ pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+pub(super) fn open_regular_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file must be regular",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

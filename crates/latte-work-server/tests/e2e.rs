@@ -16,15 +16,23 @@ struct Host {
     directory: tempfile::TempDir,
     process: Child,
 }
+fn private_state_directory(prefix: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .unwrap();
+    Endpoint::open(directory.path())
+        .expect("fixture state directory must be private before startup");
+    directory
+}
 impl Host {
     async fn start() -> Self {
         Self::start_with_environment(&[]).await
     }
     async fn start_with_environment(env: &[(&str, &std::ffi::OsStr)]) -> Self {
-        let directory = tempfile::Builder::new()
-            .prefix("lw-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let directory = private_state_directory("lw-");
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py");
         let process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
             .env("LATTE_WORK_AGENT_ENV", "inherit")
@@ -711,10 +719,7 @@ async fn provider_catalog_local_binding_and_remote_sync_use_host_protocol() {
     let state = serde_json::to_string(&remote.directory.path().to_string_lossy()).unwrap();
     std::fs::write(&ssh,format!("#!/usr/bin/env python3\nimport os,sys\nif 'offline-fixture' in sys.argv: sys.exit(1)\nos.execv({bin},[{bin},'connect','--state-dir',{state}])\n")).unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let directory = tempfile::Builder::new()
-        .prefix("lw-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let directory = private_state_directory("lw-");
     let process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
         .args(["serve", "--state-dir"])
         .arg(directory.path())
@@ -2626,10 +2631,7 @@ async fn upgrade_refuses_tasks_and_terminals_then_drains_existing_clients() {
 async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clients() {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let directory = tempfile::Builder::new()
-        .prefix("lw-upgrade-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let directory = private_state_directory("lw-upgrade-");
     let dir = directory.path().to_path_buf();
     // A deterministic old-daemon fixture holds the same real singleton lock.
     let guard = std::fs::OpenOptions::new()
@@ -2731,10 +2733,7 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
 #[tokio::test]
 async fn upgrade_legacy_daemon_returns_actionable_error_without_stopping_it() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let directory = tempfile::Builder::new()
-        .prefix("lw-legacy-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let directory = private_state_directory("lw-legacy-");
     let listener = tokio::net::UnixListener::bind(directory.path().join("control.sock")).unwrap();
     let old = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();

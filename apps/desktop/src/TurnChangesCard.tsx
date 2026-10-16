@@ -65,13 +65,7 @@ export function TurnChangesCard({
       if (mounted.current) setBusy(false);
     }
   }
-  if (
-    !summary.entries.length &&
-    !summary.truncated &&
-    !summary.unavailable &&
-    !changes.undo_unavailable
-  )
-    return null;
+  if (!summary.entries.length && !changes.undo_unavailable) return null;
   let heading = `已编辑 ${summary.entries.length} 个文件`;
   if (summary.unavailable) heading = "本轮变更未能记录";
   else if (!summary.entries.length) heading = "本轮修改无法撤销";
@@ -83,7 +77,7 @@ export function TurnChangesCard({
         </span>
         <div className="turn-changes-heading">
           <strong>{heading}</strong>
-          {!summary.unavailable && (
+          {summary.entries.length > 0 && !summary.unavailable && (
             <span className="change-totals">
               <b>+{summary.added}</b>
               <em>-{summary.removed}</em>
