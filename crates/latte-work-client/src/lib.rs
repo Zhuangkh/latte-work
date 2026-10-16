@@ -108,6 +108,9 @@ impl Client {
             Request::Send {
                 permission_mode: Some(_),
                 ..
+            } | Request::SendQueued {
+                permission_mode: Some(_),
+                ..
             }
         ) && !self.permission_settings
         {
@@ -315,6 +318,9 @@ where
     let agent = match &request {
         Request::Models { agent, .. } => agent.clone(),
         Request::Send { session_id, .. }
+        | Request::SendQueued { session_id, .. }
+        | Request::DispatchQueuedMessage { session_id, .. }
+        | Request::ResumeMessageQueue { session_id, .. }
         | Request::OpenAgentSession { session_id, .. }
         | Request::SubagentHistory { session_id, .. } => {
             match target
@@ -341,7 +347,12 @@ async fn request_with_snapshot(
     request: Request,
     snapshot: Option<latte_work_protocol::ProviderSnapshot>,
 ) -> Result<Response> {
-    let is_send = matches!(&request, Request::Send { .. });
+    let is_send = matches!(&request, Request::Send { .. } | Request::SendQueued { .. });
+    let is_queue_control = matches!(
+        &request,
+        Request::ResumeMessageQueue { .. } | Request::DispatchQueuedMessage { .. }
+    );
+    let is_models = matches!(&request, Request::Models { .. });
     let is_open = matches!(&request, Request::OpenAgentSession { .. });
     let is_history = matches!(&request, Request::SubagentHistory { .. });
     let request = match request {
@@ -370,6 +381,52 @@ async fn request_with_snapshot(
             model,
             effort,
             permission_mode,
+            provider: Some(
+                snapshot
+                    .map(latte_work_protocol::TurnProvider::Snapshot)
+                    .unwrap_or(latte_work_protocol::TurnProvider::Cli),
+            ),
+        },
+        Request::SendQueued {
+            session_id,
+            request_id,
+            text,
+            model,
+            effort,
+            permission_mode,
+            ..
+        } => Request::SendQueued {
+            session_id,
+            request_id,
+            text,
+            model,
+            effort,
+            permission_mode,
+            provider: Some(
+                snapshot
+                    .map(latte_work_protocol::TurnProvider::Snapshot)
+                    .unwrap_or(latte_work_protocol::TurnProvider::Cli),
+            ),
+        },
+        Request::DispatchQueuedMessage {
+            interrupt,
+            session_id,
+            request_id,
+            revision,
+            ..
+        } => Request::DispatchQueuedMessage {
+            interrupt,
+            session_id,
+            request_id,
+            revision,
+            provider: Some(
+                snapshot
+                    .map(latte_work_protocol::TurnProvider::Snapshot)
+                    .unwrap_or(latte_work_protocol::TurnProvider::Cli),
+            ),
+        },
+        Request::ResumeMessageQueue { session_id, .. } => Request::ResumeMessageQueue {
+            session_id,
             provider: Some(
                 snapshot
                     .map(latte_work_protocol::TurnProvider::Snapshot)
@@ -405,8 +462,9 @@ async fn request_with_snapshot(
     };
     let response = target.lock().await.request(request).await?;
     match response {
-        Response::Models { .. } if !is_send => Ok(response),
-        Response::Accepted { .. } if is_send => Ok(response),
+        Response::Models { .. } if is_models => Ok(response),
+        Response::Accepted { .. } | Response::MessageQueued { .. } if is_send => Ok(response),
+        Response::MessageQueue { .. } if is_queue_control => Ok(response),
         Response::Ok if is_open => Ok(response),
         Response::SubagentHistory { .. } if is_history => Ok(response),
         Response::Error { .. } => Ok(response),

@@ -36,7 +36,8 @@ pub async fn run(
             let path = directory.join("result.json");
             loop {
                 if let Ok(meta) = std::fs::metadata(&path) {
-                    if meta.len() > 4096 { return Err("浏览器响应过大".to_string()); }
+                    let limit = match operation { "site-info" => 128 * 1024, "site-data" => 8192, _ => 4096 };
+                    if meta.len() > limit { return Err("浏览器响应过大".to_string()); }
                     return std::fs::read(&path).map_err(|e| e.to_string());
                 }
                 tokio::time::sleep(Duration::from_millis(30)).await;
@@ -44,9 +45,10 @@ pub async fn run(
         }).await.map_err(|_| "浏览器操作超时，请重试")??;
         let value: Value = serde_json::from_slice(&response).map_err(|e| e.to_string())?;
         if let Some(error) = value.get("error").and_then(Value::as_str) { return Err(error.to_string()); }
-        let image = if operation == "capture" {
-            let path = directory.join("capture.png");
-            if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 { return Err("截图过大".into()); }
+        let image = if matches!(operation, "capture" | "preview") {
+            let preview = operation == "preview";
+            let path = directory.join(if preview { "preview.jpg" } else { "capture.png" });
+            if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > (if preview { 8 } else { 64 }) * 1024 * 1024 { return Err("截图过大".into()); }
             Some(std::fs::read(path).map_err(|e| e.to_string())?)
         } else { None };
         Ok((value, image))

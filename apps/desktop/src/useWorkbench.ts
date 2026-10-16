@@ -52,6 +52,12 @@ import {
   writeCatalog,
   type HostedProject,
 } from "./projectCatalog";
+import {
+  orderProjects,
+  readProjectOrder,
+  writeProjectOrder,
+  moveProjectOrder,
+} from "./projectOrder";
 
 import {
   pinnedSessions,
@@ -184,14 +190,24 @@ export function useWorkbench() {
   const [serverId, setServerId] = useState("");
   const [agent, setAgent] = useState<AgentInfo>();
   const [catalog, setCatalog] = useState(readCatalog);
+  const [projectOrder, setProjectOrder] = useState(readProjectOrder);
+  useEffect(() => writeProjectOrder(projectOrder), [projectOrder]);
   const [hostErrors, setHostErrors] = useState<Record<string, string>>({});
   const [hostConnectionVersions, setHostConnectionVersions] = useState<
     Record<string, number>
   >({});
-  const projects = hostedProjects(
-    catalog,
-    hosts.map((h) => h.id),
+  const projects = orderProjects(
+    hostedProjects(
+      catalog,
+      hosts.map((h) => h.id),
+    ),
+    projectOrder,
   );
+  function moveProject(source: string, target: string, after: boolean) {
+    setProjectOrder((old) =>
+      moveProjectOrder(old, projects, source, target, after),
+    );
+  }
   const [projectId, setProjectId] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState("");
@@ -275,6 +291,11 @@ export function useWorkbench() {
     null,
   );
   const [error, setError] = useState("");
+  const [admissionNotice, setAdmissionNotice] = useState<{
+    host: string;
+    session: string;
+    text: string;
+  }>();
   const [agentSessionTransitions, setAgentSessionTransitions] = useState<
     Record<string, AgentSessionTransition>
   >({});
@@ -810,7 +831,14 @@ export function useWorkbench() {
   }
   async function sessionAction(targetHostId: string, action: Request) {
     const result = await request(targetHostId, action);
-    if (action.method === "close_agent_session" && result.kind === "ok") {
+    if (
+      (action.method === "close_agent_session" && result.kind === "ok") ||
+      (action.method === "archive_session" &&
+        action.archived &&
+        result.kind === "session" &&
+        result.session.archived &&
+        result.session.agent_session_open === false)
+    ) {
       const key = JSON.stringify([targetHostId, action.session_id]);
       openedEvidence.current.delete(key);
       setAgentSessionTransitions((old) => {
@@ -1071,8 +1099,8 @@ export function useWorkbench() {
         effort,
         permission_mode,
       };
-      await request(hostId, {
-        method: "send",
+      const admission = await request(hostId, {
+        method: "send_queued",
         session_id: target.id,
         request_id: id,
         text,
@@ -1080,19 +1108,31 @@ export function useWorkbench() {
         effort,
         permission_mode,
       });
+      if (admission.kind !== "accepted" && admission.kind !== "message_queued")
+        throw new Error("消息未确认接收，请更新 Server 并核对状态");
+      setAdmissionNotice(
+        admission.duplicate
+          ? {
+              host: hostId,
+              session: target.id,
+              text: "已核对原请求，此消息此前已被接收，没有重复发送。",
+            }
+          : undefined,
+      );
       if (pendingSend.current?.id === id) pendingSend.current = undefined;
       if (
         selection.current.hostId !== hostId ||
         selection.current.projectId !== projectId
       )
         return true;
-      setSessions((previous) =>
-        previous.map((s) =>
-          s.id === target.id
-            ? { ...s, status: "running", model, effort, permission_mode }
-            : s,
-        ),
-      );
+      if (admission.kind === "accepted" && !admission.duplicate)
+        setSessions((previous) =>
+          previous.map((s) =>
+            s.id === target.id
+              ? { ...s, status: "running", model, effort, permission_mode }
+              : s,
+          ),
+        );
       setError("");
       return true;
     } catch (e) {
@@ -1306,6 +1346,11 @@ export function useWorkbench() {
   return {
     hosts,
     passwordPrompt,
+    admissionNotice:
+      admissionNotice?.host === hostId && admissionNotice.session === sessionId
+        ? admissionNotice.text
+        : undefined,
+    dismissAdmissionNotice: () => setAdmissionNotice(undefined),
     submitPassword,
     cancelPasswordPrompt,
     hostId,
@@ -1339,6 +1384,7 @@ export function useWorkbench() {
     serverId,
     agent,
     projects,
+    moveProject,
     hostErrors,
     projectId,
     sessions,

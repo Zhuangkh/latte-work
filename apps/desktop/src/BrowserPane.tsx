@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ArrowLeft, ArrowRight, ExternalLink, RotateCw } from "lucide-react";
@@ -13,6 +14,9 @@ import {
 import { browserAddress, webLink } from "./browserLinks";
 import { recordBrowserVisit, updateBrowserVisitTitle } from "./browserHistory";
 import { BrowserTools } from "./BrowserTools";
+import { BrowserSiteInfo, type SiteInfo } from "./BrowserSiteInfo";
+import { rememberSiteIcon } from "./SiteIcon";
+import { browserPreview } from "./browserPreview";
 type BrowserTab = Extract<WorkspaceTab, { kind: "browser" }>;
 export function BrowserPane({
   workspaceId,
@@ -33,6 +37,10 @@ export function BrowserPane({
   const pageTitle = useRef({ url: "", title: "" });
   const [error, setError] = useState("");
   const [ready, setReady] = useState(false);
+  const [preview, setPreview] = useState<{
+    page: string;
+    image: string;
+  } | null>(null);
   const queue = useRef<Promise<unknown>>(Promise.resolve());
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -70,6 +78,8 @@ export function BrowserPane({
       return;
     }
     let disposed = false;
+    let metadataVersion = 0;
+    let metadataUrl = initial.current;
     setReady(false);
     const listeners = [
       listen<{ id: string; url: string; title?: string; record?: boolean }>(
@@ -78,6 +88,27 @@ export function BrowserPane({
           if (disposed || payload.id !== nativeId) return;
           const url = payload.url === "about:blank" ? "" : webLink(payload.url);
           if (url === null) return;
+          if (metadataUrl !== url || payload.record === true) {
+            metadataVersion++;
+            metadataUrl = url;
+          }
+          const version = metadataVersion;
+          if (url && payload.record === true) {
+            void invoke<SiteInfo>("browser_site_info", {
+              id: nativeId,
+              icon: true,
+            })
+              .then((info) => {
+                if (
+                  !disposed &&
+                  info &&
+                  version === metadataVersion &&
+                  webLink(info.url) === url
+                )
+                  rememberSiteIcon(url, info.icon);
+              })
+              .catch(() => undefined);
+          }
           if (payload.title) pageTitle.current = { url, title: payload.title };
           if (url)
             try {
@@ -151,7 +182,16 @@ export function BrowserPane({
     let frame = 0;
     let last = "";
     type Bounds = { x: number; y: number; width: number; height: number };
-    let latest: Bounds | null = null;
+    let latest: { bounds: Bounds | null; overlay: boolean } = {
+      bounds: null,
+      overlay: false,
+    };
+    let picture: Awaited<ReturnType<typeof browserPreview>> | null = null;
+    const clearPicture = () => {
+      setPreview(null);
+      picture?.release();
+      picture = null;
+    };
     let sending = false;
     const send = async () => {
       if (sending) return;
@@ -159,9 +199,41 @@ export function BrowserPane({
       try {
         let sent: string;
         do {
-          const bounds = latest;
-          sent = JSON.stringify(bounds);
+          const state = latest;
+          sent = JSON.stringify(state);
+          if (state.bounds && state.overlay && !picture) {
+            try {
+              const captured = (await enqueue(() =>
+                browserPreview(nativeId),
+              )) as Awaited<ReturnType<typeof browserPreview>>;
+              if (disposed || !latest.bounds || !latest.overlay) {
+                captured.release();
+                continue;
+              }
+              picture = captured;
+              // Commit decoded pixels before hiding the native surface.
+              flushSync(() =>
+                setPreview({ page: tab.url, image: captured.url }),
+              );
+            } catch (error) {
+              if (disposed) return;
+              // A failed capture must not replace a working page with a blank canvas.
+              window.dispatchEvent(
+                new CustomEvent("browser-overlay-unavailable", {
+                  detail: nativeId,
+                }),
+              );
+              setError(message(error));
+              await enqueue(() =>
+                invoke("browser_sync", { id: nativeId, bounds: latest.bounds }),
+              );
+              continue;
+            }
+          }
+          if (disposed) return;
+          const bounds = state.overlay ? null : state.bounds;
           await enqueue(() => invoke("browser_sync", { id: nativeId, bounds }));
+          if (!state.overlay) clearPicture();
         } while (!disposed && sent !== JSON.stringify(latest));
       } catch (e) {
         if (!disposed) setError(message(e));
@@ -173,25 +245,37 @@ export function BrowserPane({
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         if (disposed || quitting.current) return;
-        const overlay = [
-          ...document.querySelectorAll<HTMLElement>(
-            '[role="dialog"], [role="menu"], [role="listbox"], .status-center-popover, .task-overview-popover',
-          ),
-        ].some((element) => element.getBoundingClientRect().height > 0);
         const box = surface.current?.getBoundingClientRect();
+        const overlay =
+          !!box &&
+          [
+            ...document.querySelectorAll<HTMLElement>(
+              '[role="dialog"], [role="menu"], [role="listbox"], .status-center-popover, .task-overview-popover',
+            ),
+          ].some((element) => {
+            const rect = element.getBoundingClientRect();
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.left < box.right &&
+              rect.right > box.left &&
+              rect.top < box.bottom &&
+              rect.bottom > box.top
+            );
+          });
         const bounds =
           activeRef.current &&
           !!tab.url &&
-          !overlay &&
           box &&
           box.width > 0 &&
           box.height > 0
             ? { x: box.x, y: box.y, width: box.width, height: box.height }
             : null;
-        const signature = JSON.stringify(bounds);
+        const state = { bounds, overlay: !!bounds && overlay };
+        const signature = JSON.stringify(state);
         if (signature === last) return;
         last = signature;
-        latest = bounds;
+        latest = state;
         void send();
       });
     };
@@ -212,6 +296,7 @@ export function BrowserPane({
       resize.disconnect();
       mutations.disconnect();
       window.removeEventListener("resize", sync);
+      clearPicture();
       void enqueue(() =>
         invoke("browser_sync", { id: nativeId, bounds: null }),
       ).catch(() => undefined);
@@ -270,14 +355,23 @@ export function BrowserPane({
         >
           <RotateCw size={16} />
         </button>
-        <input
-          aria-label="网页地址"
-          value={address}
-          placeholder="输入域名或网页地址"
-          spellCheck={false}
-          onChange={(event) => setAddress(event.target.value)}
-          disabled={!ready}
-        />
+        <div className="browser-address">
+          <BrowserSiteInfo
+            key={tab.url}
+            id={nativeId}
+            url={tab.url}
+            active={active}
+            ready={ready}
+          />
+          <input
+            aria-label="网页地址"
+            value={address}
+            placeholder="输入域名或网页地址"
+            spellCheck={false}
+            onChange={(event) => setAddress(event.target.value)}
+            disabled={!ready}
+          />
+        </div>
         <button
           type="button"
           className="icon-button"
@@ -303,6 +397,14 @@ export function BrowserPane({
         />
       </form>
       <div ref={surface} className="browser-surface">
+        {preview && active && preview.page === tab.url && (
+          <img
+            className="browser-page-preview"
+            src={preview.image}
+            alt=""
+            aria-hidden="true"
+          />
+        )}
         {!tab.url && (
           <p className="muted">输入网页地址，或从对话中打开链接。</p>
         )}

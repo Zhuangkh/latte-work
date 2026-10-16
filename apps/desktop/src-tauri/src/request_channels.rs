@@ -15,10 +15,19 @@ pub fn lane(request: &Request) -> Lane {
         Request::OpenAgentSession { .. }
         | Request::CloseAgentSession { .. }
         | Request::Send { .. }
+        | Request::SendQueued { .. }
+        | Request::ResumeMessageQueue { .. }
+        | Request::TakeQueuedMessage { .. }
+        | Request::DispatchQueuedMessage { .. }
+        | Request::ReorderMessageQueue { .. }
+        | Request::EditQueuedMessage { .. }
+        | Request::CancelQueuedMessage { .. }
+        | Request::ClearMessageQueue { .. }
         | Request::Approve { .. }
         | Request::AnswerQuestion { .. }
         | Request::Cancel { .. } => Lane::Control,
-        Request::AgentCommands { .. }
+        Request::SkillInfo { .. }
+        | Request::AgentCommands { .. }
         | Request::AgentPermissions { .. }
         | Request::Models { .. }
         | Request::ReadFile { .. }

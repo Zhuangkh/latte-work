@@ -1,6 +1,6 @@
 import { webLink } from "./browserLinks";
 import { useSyncExternalStore } from "react";
-import type { Project, TerminalInfo, Subagent } from "./protocol";
+import type { FileEntry, Project, TerminalInfo, Subagent } from "./protocol";
 
 export type WorkspaceTab = {
   hostId?: string;
@@ -9,12 +9,14 @@ export type WorkspaceTab = {
 } & (
   | {
       id: string;
-      kind: "files" | "diff" | "subagents";
+      kind: "files" | "diff" | "subagents" | "taskInfo";
       requestId?: string;
       snapshotSessionId?: string;
       snapshotAt?: number | null;
       path?: string;
       file?: string;
+      reference?: FileEntry;
+      sessionId?: string;
     }
   | {
       id: string;
@@ -23,6 +25,14 @@ export type WorkspaceTab = {
       sessionId: string;
       title: string;
       file?: string;
+    }
+  | {
+      id: string;
+      kind: "artifact";
+      sessionId?: string;
+      path: string;
+      name: string;
+      directory: boolean;
     }
   | { id: string; kind: "subagent"; taskId: string; title: string }
   | { id: string; kind: "browser"; url: string; title: string }
@@ -99,9 +109,15 @@ export function readWorkspace(key: string): WorkspaceState {
         const valid =
           tab.kind === "files" ||
           tab.kind === "diff" ||
-          tab.kind === "subagents"
+          tab.kind === "subagents" ||
+          tab.kind === "taskInfo"
             ? (tab.path === undefined || typeof tab.path === "string") &&
               (tab.file === undefined || typeof tab.file === "string") &&
+              (tab.reference === undefined ||
+                (typeof tab.reference.path === "string" &&
+                  !!tab.reference.path &&
+                  typeof tab.reference.name === "string" &&
+                  typeof tab.reference.directory === "boolean")) &&
               (tab.kind !== "diff" ||
                 tab.requestId === undefined ||
                 (typeof tab.requestId === "string" &&
@@ -109,29 +125,34 @@ export function readWorkspace(key: string): WorkspaceState {
                   tab.requestId.length <= 256 &&
                   typeof tab.snapshotSessionId === "string" &&
                   !!tab.snapshotSessionId))
-            : tab.kind === "browser"
-              ? !!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
-                  tab.id,
-                ) &&
-                typeof tab.title === "string" &&
-                typeof tab.url === "string" &&
-                (tab.url === "" || webLink(tab.url) !== null)
-              : tab.kind === "turnChanges"
-                ? typeof tab.requestId === "string" &&
-                  !!tab.requestId &&
-                  tab.requestId.length <= 256 &&
-                  typeof tab.sessionId === "string" &&
-                  !!tab.sessionId &&
+            : tab.kind === "artifact"
+              ? typeof tab.path === "string" &&
+                !!tab.path &&
+                typeof tab.name === "string" &&
+                typeof tab.directory === "boolean"
+              : tab.kind === "browser"
+                ? !!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+                    tab.id,
+                  ) &&
                   typeof tab.title === "string" &&
-                  (tab.file === undefined || typeof tab.file === "string")
-                : tab.kind === "subagent"
-                  ? typeof tab.taskId === "string" &&
-                    !!tab.taskId &&
-                    typeof tab.title === "string"
-                  : tab.kind === "terminal" &&
-                    tab.terminal?.id === tab.id &&
-                    typeof tab.terminal.project_id === "string" &&
-                    typeof tab.terminal.title === "string";
+                  typeof tab.url === "string" &&
+                  (tab.url === "" || webLink(tab.url) !== null)
+                : tab.kind === "turnChanges"
+                  ? typeof tab.requestId === "string" &&
+                    !!tab.requestId &&
+                    tab.requestId.length <= 256 &&
+                    typeof tab.sessionId === "string" &&
+                    !!tab.sessionId &&
+                    typeof tab.title === "string" &&
+                    (tab.file === undefined || typeof tab.file === "string")
+                  : tab.kind === "subagent"
+                    ? typeof tab.taskId === "string" &&
+                      !!tab.taskId &&
+                      typeof tab.title === "string"
+                    : tab.kind === "terminal" &&
+                      tab.terminal?.id === tab.id &&
+                      typeof tab.terminal.project_id === "string" &&
+                      typeof tab.terminal.title === "string";
         if (valid) ids.add(tab.id);
         return valid;
       });
@@ -267,7 +288,14 @@ export function openWorkspaceResource(
           tab.id === kind
             ? kind === "diff"
               ? { id: kind, kind, ...location }
-              : { ...tab, ...location }
+              : tab.kind !== "files"
+                ? tab
+                : {
+                    ...tab,
+                    reference: undefined,
+                    sessionId: undefined,
+                    ...location,
+                  }
             : tab,
         )
       : [...state.tabs, { id: kind, kind, ...location }],
@@ -335,4 +363,62 @@ export function openBrowser(workspaceId: string, value = "", newTab = false) {
       conversationActive: false,
     };
   });
+}
+
+export function openTaskInfo(workspaceId: string) {
+  updateWorkspace(workspaceId, (state) => ({
+    tabs: state.tabs.some((tab) => tab.id === "taskInfo")
+      ? state.tabs
+      : [...state.tabs, { id: "taskInfo", kind: "taskInfo" }],
+    current: "taskInfo",
+    visible: true,
+    expanded: false,
+    conversationActive: false,
+  }));
+}
+
+/** Reuse the file browser, retaining the exact explicitly selected reference scope. */
+export function openArtifact(
+  workspaceId: string,
+  entry: FileEntry,
+  owner: { hostId?: string; project?: Project; sessionId?: string } = {},
+  selectedFile?: string,
+) {
+  const hostPath = (path: string) =>
+    path.startsWith("/") || !owner.project
+      ? path
+      : `${owner.project.path.replace(/\/$/, "")}/${path.replace(/^\.\//, "")}`.replace(
+          /\/\.$/,
+          "",
+        );
+  const reference =
+    entry.path.startsWith("/") || entry.directory
+      ? { ...entry, path: hostPath(entry.path) }
+      : undefined;
+  const file =
+    selectedFile !== undefined
+      ? reference
+        ? hostPath(selectedFile)
+        : selectedFile
+      : entry.directory
+        ? ""
+        : entry.path;
+  const tab: WorkspaceTab = {
+    id: "files",
+    kind: "files",
+    ...owner,
+    reference,
+    path: entry.directory
+      ? reference!.path
+      : file.split("/").slice(0, -1).join("/"),
+    file,
+  };
+  updateWorkspace(workspaceId, (state) => ({
+    tabs: state.tabs.some((item) => item.id === "files")
+      ? state.tabs.map((item) => (item.id === "files" ? tab : item))
+      : [...state.tabs, tab],
+    current: "files",
+    visible: true,
+    conversationActive: false,
+  }));
 }

@@ -156,3 +156,21 @@ it("reads all pages before claiming a final answer or folding the process", () =
   expect(screen.getByText("用时 3s").closest("details")!.open).toBe(false);
   expect(screen.queryByText(/显示上限/)).toBeNull();
 });
+
+it("keeps the original delegated prompt available above the folded process and final answer", () => {
+  render(
+    <SubagentTranscript
+      task={{ ...task, status: "completed", summary: "Final report" }}
+      events={events}
+      elapsed="3s"
+      prompt="Review the complete changes. Preserve this exact input."
+    />,
+  );
+  const instruction = screen.getByText("任务指令").closest("details")!;
+  expect(instruction.open).toBe(false);
+  fireEvent.click(screen.getByText("任务指令"));
+  expect(instruction.textContent).toContain(
+    "Review the complete changes. Preserve this exact input.",
+  );
+  expect(screen.getByText("Final report").closest("details")).toBeNull();
+});

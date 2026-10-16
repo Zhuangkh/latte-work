@@ -5,6 +5,8 @@
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <unistd.h>
+extern void latteBrowserSiteInfo(WKWebView *view, NSString *directory, BOOL includeIcon);
+extern void latteBrowserSiteData(WKWebView *view, NSString *directory, NSString *query);
 
 @interface LatteBrowserTools : NSObject <WKScriptMessageHandler>
 @end
@@ -18,6 +20,18 @@ static NSString *toolsRoot(void) {
 static BOOL macOSAtLeast(NSInteger major) {
     NSOperatingSystemVersion version = {major, 0, 0};
     return [NSProcessInfo.processInfo isOperatingSystemAtLeastVersion:version];
+}
+static NSString *browserApplicationName(void) {
+    // WKWebView's default macOS UA omits Version/Safari and freezes the
+    // AppleWebKit token. Use the installed system Safari's compatibility
+    // version rather than inventing a Chromium version or changing page APIs.
+    NSURL *url = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:@"com.apple.Safari"];
+    NSString *version = url ? [[NSBundle bundleWithURL:url] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] : nil;
+    if (![version isKindOfClass:NSString.class] || version.length > 32 ||
+        ![version rangeOfString:@"^[0-9]+(\\.[0-9]+){0,3}$" options:NSRegularExpressionSearch].length) {
+        return nil;
+    }
+    return [NSString stringWithFormat:@"Version/%@ Safari/605.1.15", version];
 }
 static void finishTool(NSString *directory, NSDictionary *result) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
@@ -41,7 +55,11 @@ static void finishTool(NSString *directory, NSDictionary *result) {
     [NSFileManager.defaultManager removeItemAtPath:file error:nil];
     WKWebView *view = message.webView;
     NSString *operation = request[@"operation"];
-    if ([operation isEqualToString:@"find"]) {
+    if ([operation isEqualToString:@"site-data"]) {
+        latteBrowserSiteData(view, directory, request[@"query"]);
+    } else if ([operation isEqualToString:@"site-info"]) {
+        latteBrowserSiteInfo(view, directory, [request[@"query"] isEqual:@"icon"]);
+    } else if ([operation isEqualToString:@"find"]) {
         NSString *query = request[@"query"];
         if (![query isKindOfClass:NSString.class] || query.length > 512) {
             finishTool(directory, @{@"error": @"查找内容过长"}); return;
@@ -64,21 +82,24 @@ static void finishTool(NSString *directory, NSDictionary *result) {
             modifiedSince:[NSDate dateWithTimeIntervalSince1970:0] completionHandler:^{
                 finishTool(directory, @{@"ok": @YES});
             }];
-    } else if ([operation isEqualToString:@"capture"]) {
+    } else if ([operation isEqualToString:@"capture"] || [operation isEqualToString:@"preview"]) {
+        BOOL preview = [operation isEqualToString:@"preview"];
         if (view.bounds.size.width <= 0 || view.bounds.size.height <= 0 ||
             view.bounds.size.width > 4096 || view.bounds.size.height > 4096) {
             finishTool(directory, @{@"error": @"截图区域过大或不可见"}); return;
         }
         WKSnapshotConfiguration *config = [WKSnapshotConfiguration new];
         config.rect = view.bounds;
-        config.snapshotWidth = @(view.bounds.size.width);
+        config.snapshotWidth = @(preview ? MIN(view.bounds.size.width,
+            2048 * MIN(1, view.bounds.size.width / view.bounds.size.height)) : view.bounds.size.width);
         [view takeSnapshotWithConfiguration:config completionHandler:^(NSImage *image, NSError *error) {
             if (error || !image) { finishTool(directory, @{@"error": @"网页截图失败"}); return; }
             CGImageRef cg = [image CGImageForProposedRect:NULL context:nil hints:nil];
             NSBitmapImageRep *bitmap = cg ? [[NSBitmapImageRep alloc] initWithCGImage:cg] : nil;
-            NSData *png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
-            if (!png || png.length > 64 * 1024 * 1024 ||
-                ![png writeToFile:[directory stringByAppendingPathComponent:@"capture.png"] atomically:YES]) {
+            NSData *imageData = [bitmap representationUsingType:preview ? NSBitmapImageFileTypeJPEG : NSBitmapImageFileTypePNG
+                properties:preview ? @{NSImageCompressionFactor:@0.9} : @{}];
+            if (!imageData || imageData.length > (preview ? 8 : 64) * 1024 * 1024 ||
+                ![imageData writeToFile:[directory stringByAppendingPathComponent:preview ? @"preview.jpg" : @"capture.png"] atomically:YES]) {
                 finishTool(directory, @{@"error": @"无法保存网页截图"}); return;
             }
             finishTool(directory, @{@"ok": @YES});
@@ -112,6 +133,8 @@ static void finishTool(NSString *directory, NSDictionary *result) {
             tools = [LatteBrowserTools new];
         });
         configuration.websiteDataStore = store;
+        NSString *applicationName = browserApplicationName();
+        if (applicationName) configuration.applicationNameForUserAgent = applicationName;
         [configuration.userContentController addScriptMessageHandler:tools name:@"latteBrowserTools"];
     }
     return [self latte_initWithFrame:frame configuration:configuration];

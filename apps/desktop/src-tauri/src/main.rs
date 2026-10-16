@@ -533,7 +533,12 @@ async fn host_request(
     .await?;
     let _agents = if matches!(
         request,
-        Request::Send { .. } | Request::OpenAgentSession { .. } | Request::CloseAgentSession { .. }
+        Request::Send { .. }
+            | Request::SendQueued { .. }
+            | Request::DispatchQueuedMessage { .. }
+            | Request::ResumeMessageQueue { .. }
+            | Request::OpenAgentSession { .. }
+            | Request::CloseAgentSession { .. }
     ) {
         Some(state.agent_admission.lock().await)
     } else {
@@ -542,7 +547,10 @@ async fn host_request(
     if state.quitting.load(Ordering::SeqCst) {
         return Err("正在退出，任务未发送".into());
     }
-    if let Request::OpenAgentSession { session_id, .. } = &request {
+    if let Request::OpenAgentSession { session_id, .. }
+    | Request::DispatchQueuedMessage { session_id, .. }
+    | Request::ResumeMessageQueue { session_id, .. } = &request
+    {
         state
             .turns
             .lock()
@@ -556,6 +564,11 @@ async fn host_request(
         None
     };
     if let Request::Send {
+        session_id,
+        request_id,
+        ..
+    }
+    | Request::SendQueued {
         session_id,
         request_id,
         ..
@@ -582,7 +595,11 @@ async fn host_request(
         None
     };
     let resource = match &request {
-        Request::OpenAgentSession { session_id, .. } | Request::Send { session_id, .. } => Some(
+        Request::OpenAgentSession { session_id, .. }
+        | Request::Send { session_id, .. }
+        | Request::SendQueued { session_id, .. }
+        | Request::DispatchQueuedMessage { session_id, .. }
+        | Request::ResumeMessageQueue { session_id, .. } => Some(
             latte_work_protocol::lifecycle::Resource::AgentSession(session_id.clone()),
         ),
         Request::CreateTerminal { terminal_id, .. } => Some(
@@ -600,6 +617,9 @@ async fn host_request(
         request,
         Request::Models { .. }
             | Request::Send { .. }
+            | Request::SendQueued { .. }
+            | Request::DispatchQueuedMessage { .. }
+            | Request::ResumeMessageQueue { .. }
             | Request::OpenAgentSession { .. }
             | Request::SubagentHistory { .. }
     ) {
@@ -918,10 +938,13 @@ fn main() {
             lifecycle::app_close_ready,
             browser::browser_create,
             browser::browser_sync,
+            browser::browser_site_info,
+            browser::browser_site_data,
             browser::browser_action,
             browser::browser_close,
             browser::browser_find,
             browser::browser_capture,
+            browser::browser_preview,
             browser::browser_clear_data,
             browser_downloads::browser_downloads,
             browser_downloads::browser_clear_downloads,

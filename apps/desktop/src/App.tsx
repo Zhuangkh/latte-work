@@ -1,4 +1,5 @@
 import { LinkHandling } from "./LinkHandling";
+import { TaskInfo } from "./TaskInfo";
 import { TaskOverview } from "./TaskOverview";
 import { useAppLifecycle } from "./appLifecycle";
 import { StatusCenter } from "./StatusCenter";
@@ -21,6 +22,7 @@ import { useSubagents } from "./useSubagents";
 import { latestTurnChanges } from "./transcript";
 import {
   openWorkspaceResource,
+  openTaskInfo,
   openTurnChanges,
   openSubagents,
   CONVERSATION_MIN_WIDTH,
@@ -91,7 +93,9 @@ export default function App() {
       workbench.workspace.tabs.some(
         (tab) =>
           tab.id === workbench.workspace.current &&
-          (tab.kind === "subagents" || tab.kind === "subagent"),
+          (tab.kind === "subagents" ||
+            tab.kind === "subagent" ||
+            tab.kind === "taskInfo"),
       ),
   );
   const lastTurn = latestTurnChanges(events);
@@ -163,6 +167,14 @@ export default function App() {
         ? { label: "重试", run: subagents.reload }
         : undefined,
     });
+  if (workbench.admissionNotice)
+    statusNotices.push({
+      id: `admission:${hostId}:${session?.id}`,
+      level: "info",
+      title: "消息此前已接收",
+      detail: workbench.admissionNotice,
+      action: { label: "知道了", run: workbench.dismissAdmissionNotice },
+    });
   useStatusNotices(statusNotices);
   const sidebarVisible = sidebarOpen || sidebarPreview.visible;
   const statusCenter =
@@ -188,6 +200,7 @@ export default function App() {
       subagents={subagents}
       openChanges={() => openWorkspaceResource(workbench.workspaceId, "diff")}
       openSubagents={showSubagents}
+      openInfo={() => openTaskInfo(workbench.workspaceId)}
     />
   );
   return (
@@ -391,6 +404,35 @@ export default function App() {
           sessionId={session?.id}
           lastTurnVersion={lastTurnVersion}
           overview={overview}
+          taskInfo={
+            <TaskInfo
+              key={workbench.workspaceId}
+              workspaceId={workbench.workspaceId}
+              active={
+                panel &&
+                workbench.workspace.current === "taskInfo" &&
+                !(
+                  workbench.workspace.expanded &&
+                  workbench.workspace.conversationActive
+                ) &&
+                workbench.modal !== "settings" &&
+                !workbench.passwordPrompt
+              }
+              running={
+                session?.status === "running" || session?.status === "waiting"
+              }
+              hostId={hostId}
+              project={project}
+              sessionId={session?.id}
+              connected={connected}
+              events={events}
+              subagents={subagents}
+              historyLoading={workbench.historyLoading}
+              hasEarlierHistory={workbench.hasEarlierHistory}
+              earlierHistoryLoading={workbench.earlierHistoryLoading}
+              loadEarlierHistory={workbench.loadEarlierHistory}
+            />
+          }
           conversationActions={conversationActions}
           statusCenter={!sidebarOpen ? collapsedStatusCenter : null}
           subagents={subagents}

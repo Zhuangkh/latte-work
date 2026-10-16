@@ -3,16 +3,18 @@ import { ChevronRight } from "lucide-react";
 import { ReplyActions } from "./ReplyActions";
 import type { Event } from "./protocol";
 import { activityTranscript, type ActivityItem } from "./activity";
+import { queuedInputReceipts } from "./transcript";
 
 /** Fold confirmed outcomes only; stopped turns retain their prose and approvals. */
 export function turnTranscript(events: Event[]) {
+  const receipts = queuedInputReceipts(events);
   const groups: Event[][] = [];
   for (const event of events) {
     if (event.event.kind === "user" || !groups.length) groups.push([]);
     groups.at(-1)!.push(event);
   }
   return groups.map((events) => {
-    let items = activityTranscript(events).filter(
+    let items = activityTranscript(events, receipts).filter(
       (item) =>
         !(
           item.type === "event" &&
@@ -21,7 +23,9 @@ export function turnTranscript(events: Event[]) {
             /^Provider：.* · 模型：/.test(item.value.text))
         ),
     );
-    const user = items[0]?.type === "user" ? items.shift() : undefined;
+    const first = items[0];
+    const user = first?.type === "user" && !first.handoff ? first : undefined;
+    if (user) items.shift();
     const end = [...events].reverse().find((e) => e.event.kind === "state");
     const completed =
       end?.event.kind === "state" && end.event.status === "completed";
@@ -68,6 +72,9 @@ export function turnTranscript(events: Event[]) {
           (item.value.kind === "approval" || item.value.kind === "question") &&
           !item.resolved,
       );
+    // Keep overlapping handoffs in chronological order, outside any disclosure,
+    // while preserving the completed response's ordinary final-answer actions.
+    const foldProcess = hasFinal && !items.some((item) => item.type === "user");
     return {
       key: `${events[0].session_id}:${events[0].seq}`,
       outcomeKey: end?.seq,
@@ -79,12 +86,12 @@ export function turnTranscript(events: Event[]) {
       elapsed,
       process: stopped
         ? items.filter(isTool)
-        : hasFinal
+        : foldProcess
           ? items.slice(0, finalIndex)
           : [],
       visible: stopped
         ? items.filter((item) => !isTool(item))
-        : hasFinal
+        : foldProcess
           ? items.slice(finalIndex)
           : items,
     };
@@ -112,7 +119,7 @@ export function TurnTranscript({
       key={turn.key}
       data-turn-key={turn.user ? turn.key : undefined}
     >
-      {turn.user && children(turn.user)}
+      {turn.user && !turn.user.hidden && children(turn.user)}
       {turn.process.length > 0 && (
         <ProcessDisclosure key={turn.outcomeKey}>
           <summary

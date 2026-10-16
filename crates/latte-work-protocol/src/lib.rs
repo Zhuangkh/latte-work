@@ -148,6 +148,10 @@ pub struct SubagentUpdate {
     pub id: String,
     pub tool_use_id: Option<String>,
     pub title: Option<String>,
+    /// Native agent role, when explicitly reported by the adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_type: Option<String>,
     pub status: Option<SubagentStatus>,
     pub summary: Option<String>,
     pub last_tool: Option<String>,
@@ -158,6 +162,9 @@ pub struct Subagent {
     pub native_id: String,
     pub tool_use_id: Option<String>,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_type: Option<String>,
     pub status: SubagentStatus,
     pub summary: Option<String>,
     pub last_tool: Option<String>,
@@ -181,6 +188,11 @@ pub enum EventKind {
         totals: Option<TurnUsage>,
     },
     User {
+        text: String,
+        request_id: String,
+    },
+    /// Persisted native-input handoff; does not claim execution has started.
+    QueuedMessageSent {
         text: String,
         request_id: String,
     },
@@ -340,7 +352,24 @@ impl std::fmt::Debug for ProviderDraft {
             .finish_non_exhaustive()
     }
 }
+/// Current installed skill metadata, read on the execution host without invoking it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub directory: String,
+}
 /// A command reported by the selected native Agent in the project context.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct QueuedMessage {
+    pub request_id: String,
+    pub text: String,
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub permission_mode: Option<String>,
+    pub revision: u32,
+    pub created_at: f64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AgentSlashCommand {
     pub name: String,
@@ -503,6 +532,60 @@ pub enum Request {
         #[ts(optional)]
         only_if_idle: Option<bool>,
     },
+    SendQueued {
+        #[serde(default)]
+        #[ts(optional)]
+        provider: Option<TurnProvider>,
+        session_id: String,
+        request_id: String,
+        text: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<Effort>,
+        #[serde(default)]
+        permission_mode: Option<String>,
+    },
+    MessageQueue {
+        session_id: String,
+    },
+    /// Compare the complete pending order before replacing it atomically.
+    ReorderMessageQueue {
+        session_id: String,
+        expected: Vec<String>,
+        order: Vec<String>,
+    },
+    TakeQueuedMessage {
+        session_id: String,
+        request_id: String,
+        revision: u32,
+    },
+    DispatchQueuedMessage {
+        #[serde(default)]
+        interrupt: bool,
+        session_id: String,
+        request_id: String,
+        revision: u32,
+        provider: Option<TurnProvider>,
+    },
+    EditQueuedMessage {
+        session_id: String,
+        request_id: String,
+        revision: u32,
+        text: String,
+    },
+    CancelQueuedMessage {
+        session_id: String,
+        request_id: String,
+        revision: u32,
+    },
+    ClearMessageQueue {
+        session_id: String,
+    },
+    ResumeMessageQueue {
+        session_id: String,
+        provider: Option<TurnProvider>,
+    },
     Send {
         #[serde(default)]
         #[ts(optional)]
@@ -580,6 +663,13 @@ pub enum Request {
         project_id: String,
         path: String,
     },
+    ReferenceAccess {
+        project_id: String,
+    },
+    RevokeReferenceAccess {
+        project_id: String,
+        path: String,
+    },
     ReadFile {
         project_id: String,
         path: String,
@@ -634,6 +724,10 @@ pub enum Request {
     TaskChangeDiff {
         session_id: String,
         path: String,
+    },
+    SkillInfo {
+        session_id: String,
+        name: String,
     },
     Sources {
         session_id: String,
@@ -801,6 +895,9 @@ pub enum Response {
     ChangeSummary {
         summary: ChangeSummary,
     },
+    SkillInfo {
+        skill: Option<SkillInfo>,
+    },
     Sources {
         entries: Vec<TaskSource>,
         truncated: bool,
@@ -827,6 +924,9 @@ pub enum Response {
         truncated: bool,
     },
     SubagentHistory {
+        #[serde(default)]
+        #[ts(optional)]
+        prompt: Option<String>,
         events: Vec<Event>,
         has_more: bool,
         after: Option<f64>,
@@ -908,6 +1008,17 @@ pub enum Response {
     Session {
         session: Session,
     },
+    QueuedMessageTaken {
+        entry: QueuedMessage,
+    },
+    MessageQueued {
+        duplicate: bool,
+    },
+    MessageQueue {
+        entries: Vec<QueuedMessage>,
+        paused: bool,
+        reason: Option<String>,
+    },
     Accepted {
         duplicate: bool,
     },
@@ -935,6 +1046,10 @@ pub enum Response {
     FileReference {
         entry: FileEntry,
     },
+    ReferenceAccess {
+        entries: Vec<FileEntry>,
+        truncated: bool,
+    },
     Directories {
         path: String,
         parent: Option<String>,
@@ -955,6 +1070,27 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subagent_roles_are_optional_for_old_history_and_preserved_on_the_wire() {
+        let old = serde_json::json!({
+            "id":"child", "native_id":"native", "tool_use_id":null,
+            "title":"Review changes", "status":"completed", "summary":null,
+            "last_tool":"Read", "started_at":1, "updated_at":2
+        });
+        let mut task: Subagent = serde_json::from_value(old).unwrap();
+        assert_eq!(task.agent_type, None);
+        task.agent_type = Some("review:code-reviewer".into());
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert_eq!(encoded["agent_type"], "review:code-reviewer");
+        let restored: Subagent = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.agent_type, task.agent_type);
+        let update: SubagentUpdate = serde_json::from_value(serde_json::json!({
+            "id":"child", "tool_use_id":null, "title":null,
+            "status":"completed", "summary":null, "last_tool":null
+        }))
+        .unwrap();
+        assert_eq!(update.agent_type, None);
+    }
     #[test]
     fn contract_uses_explicit_tag_and_rejects_unknown_method() {
         let request: Request = serde_json::from_str(r#"{"method":"hello","version":1}"#).unwrap();

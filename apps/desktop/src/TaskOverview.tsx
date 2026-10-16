@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Bot, GitCompareArrows } from "lucide-react";
+import { Bot, GitCompareArrows, Pin } from "lucide-react";
 import { request, message } from "./api";
 import type { Project } from "./protocol";
 import type { SubagentsState } from "./useSubagents";
@@ -14,6 +14,7 @@ export function TaskOverview({
   subagents,
   openChanges,
   openSubagents,
+  openInfo,
 }: {
   hostId: string;
   project?: Project;
@@ -21,6 +22,7 @@ export function TaskOverview({
   subagents: SubagentsState;
   openChanges: () => void;
   openSubagents: () => void;
+  openInfo: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -177,8 +179,18 @@ export function TaskOverview({
               top: rect.bottom + 8,
             }}
           >
-            <div className="task-overview-project">
-              {project?.name ?? "新任务"}
+            <div className="task-overview-heading">
+              <div className="task-overview-project">
+                {project?.name ?? "新任务"}
+              </div>
+              <button
+                className="icon-button"
+                aria-label="固定到右侧栏"
+                title="固定到右侧栏 · 任务摘要"
+                onClick={() => choose(openInfo)}
+              >
+                <Pin size={16} />
+              </button>
             </div>
             <button
               className="task-overview-row"

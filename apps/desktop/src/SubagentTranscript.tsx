@@ -28,14 +28,19 @@ export function SubagentTranscript({
   elapsed,
   incomplete = false,
   readingMore = false,
+  prompt,
 }: {
   task: Subagent;
   events: Event[];
   elapsed: string;
   incomplete?: boolean;
   readingMore?: boolean;
+  prompt?: string | null;
 }) {
-  const items = activityTranscript(events);
+  const allItems = activityTranscript(events);
+  const instruction =
+    prompt || allItems.find((item) => item.type === "user")?.text;
+  const items = allItems.filter((item) => item.type !== "user");
   if (!["running", "paused"].includes(task.status)) {
     for (const item of items) {
       const tools =
@@ -63,6 +68,17 @@ export function SubagentTranscript({
   const process = hasFinalText ? items.slice(0, finalIndex) : items;
   return (
     <div className="subagent-transcript">
+      {instruction && (
+        <details className="turn-process subagent-instruction">
+          <summary>
+            任务指令
+            <ChevronRight size={14} aria-hidden="true" />
+          </summary>
+          <div className="markdown">
+            <MessageContent text={instruction} />
+          </div>
+        </details>
+      )}
       {process.length > 0 &&
         (completed ? (
           <ProcessDisclosure key={`${task.id}:${task.status}`}>

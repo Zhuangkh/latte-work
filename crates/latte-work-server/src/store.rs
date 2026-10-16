@@ -12,7 +12,7 @@ use std::{
 use uuid::Uuid;
 
 pub struct Store {
-    db: Connection,
+    pub(crate) db: Connection,
 }
 pub fn now() -> f64 {
     SystemTime::now()
@@ -38,13 +38,16 @@ impl Store {
         CREATE TABLE IF NOT EXISTS subagent_history_sources(session_id TEXT NOT NULL,task_id TEXT NOT NULL,cursor TEXT NOT NULL,PRIMARY KEY(session_id,task_id),FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
         CREATE TABLE IF NOT EXISTS subagent_native_transcripts(session_id TEXT NOT NULL,task_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(session_id,task_id),FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
         CREATE INDEX IF NOT EXISTS events_session ON events(session_id,seq);
-        CREATE INDEX IF NOT EXISTS events_recent_activity ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('user','text','tool','tool_result','approval','approval_resolved','subagent');
         CREATE TABLE IF NOT EXISTS turn_changes(session_id TEXT NOT NULL REFERENCES sessions(id), request_id TEXT NOT NULL REFERENCES requests(id), baseline TEXT, data TEXT, PRIMARY KEY(session_id,request_id));
         CREATE TABLE IF NOT EXISTS task_baselines(session_id TEXT PRIMARY KEY REFERENCES sessions(id), data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS task_sources(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, data TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(session_id,id));
         CREATE TABLE IF NOT EXISTS observed_tools(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, PRIMARY KEY(session_id,id));
         CREATE TABLE IF NOT EXISTS reference_access(project_id TEXT NOT NULL REFERENCES projects(id), path TEXT NOT NULL, directory INTEGER NOT NULL, PRIMARY KEY(project_id,path));
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,text TEXT NOT NULL);")?;
+        let migration = db.unchecked_transaction()?;
+        migration.execute_batch("CREATE INDEX IF NOT EXISTS events_recent_activity_v2 ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('user','queued_message_sent','text','tool','tool_result','approval','approval_resolved','subagent');
+        DROP INDEX IF EXISTS events_recent_activity;")?;
+        migration.commit()?;
         let columns = db
             .prepare("PRAGMA table_info(requests)")?
             .query_map([], |r| r.get::<_, String>(1))?
@@ -64,7 +67,17 @@ impl Store {
         if !columns.iter().any(|name| name == "permission_mode") {
             db.execute("ALTER TABLE requests ADD COLUMN permission_mode TEXT", [])?;
         }
+        crate::message_queue::initialize(&db)?;
         let store = Self { db };
+        let forwarded = store
+            .db
+            .prepare("SELECT DISTINCT session_id FROM message_queue WHERE status='forwarded'")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in forwarded {
+            store.uncertain_forwarded(&id)?;
+            store.pause_queue(&id, Some("后台已重启，请核对已发送的消息"))?;
+        }
         // Native child processes cannot survive a daemon restart, even if the main
         // turn had already completed while background work continued.
         let child_sessions = store
@@ -257,7 +270,7 @@ impl Store {
         // The partial event index also supports histories created before this feature.
         let rows = self.db.prepare("WITH recent AS (
             SELECT s.id,s.data,COALESCE((SELECT e.at FROM events e WHERE e.session_id=s.id
-                AND json_extract(e.data,'$.kind') IN ('user','text','tool','tool_result','approval','approval_resolved','subagent')
+                AND json_extract(e.data,'$.kind') IN ('user','queued_message_sent','text','tool','tool_result','approval','approval_resolved','subagent')
                 ORDER BY e.seq DESC LIMIT 1),json_extract(s.data,'$.created_at')) AS updated_at
             FROM sessions s WHERE COALESCE(json_extract(s.data,'$.archived'),0)=0
                 AND s.project_id NOT IN (SELECT project_id FROM hidden_projects))
@@ -332,7 +345,9 @@ impl Store {
             .collect()
     }
     pub fn sync_live_native_title(&self, id: &str, title: &str) -> Result<Session> {
-        self.sync_native_title(id, title, false)
+        // Explicit native names remain authoritative after a previous manual
+        // rename. AI-generated titles use sync_native_title(..., false).
+        self.sync_native_title(id, title, true)
     }
     pub fn sync_native_title(&self, id: &str, title: &str, custom: bool) -> Result<Session> {
         let mut session = self.session(id)?;
@@ -426,6 +441,7 @@ impl Store {
                 id,
                 EventKind::Subagent {
                     update: SubagentUpdate {
+                        agent_type: None,
                         id: task.native_id,
                         tool_use_id: task.tool_use_id,
                         title: None,
@@ -556,7 +572,22 @@ impl Store {
         requested_source: Option<&str>,
         source_has_more: bool,
     ) -> Result<latte_work_protocol::Response> {
-        self.subagent(session_id, task_id)?;
+        let task = self.subagent(session_id, task_id)?;
+        // Read the original, already-redacted parent tool input independently of UI history pages.
+        let prompt: Option<String> = if let Some(tool) = task.tool_use_id {
+            self.db.query_row(
+                "SELECT json_extract(data,'$.input.prompt') FROM events WHERE session_id=?1 AND json_extract(data,'$.kind')='tool' AND json_extract(data,'$.name') IN ('Agent','Task') AND json_extract(data,'$.id')=?2 AND json_type(data,'$.input.prompt')='text' ORDER BY seq DESC LIMIT 1",
+                params![session_id, tool], |row| row.get(0),
+            ).optional()?.flatten()
+        } else {
+            None
+        };
+        if prompt
+            .as_ref()
+            .is_some_and(|text| text.len() > latte_work_protocol::MAX_FRAME / 2)
+        {
+            bail!("子智能体任务指令超出传输范围，内容未截断");
+        }
         if after.is_some_and(|v| !v.is_finite() || v < 0.0) {
             bail!("子智能体事件游标无效");
         }
@@ -584,6 +615,7 @@ impl Store {
             page.truncate(128);
             let after = page.last().map(|e| e.seq).or(after);
             return Ok(latte_work_protocol::Response::SubagentHistory {
+                prompt,
                 events: page,
                 has_more,
                 after,
@@ -609,7 +641,8 @@ impl Store {
                 has_more = true;
                 break;
             }
-            if size > latte_work_protocol::MAX_FRAME - 4096 {
+            if size + prompt.as_ref().map_or(0, String::len) > latte_work_protocol::MAX_FRAME - 8192
+            {
                 bail!("单条子智能体事件超出传输范围，内容未截断");
             }
             bytes += size;
@@ -626,6 +659,7 @@ impl Store {
             && ((cursor.has_more && !source_has_more)
                 || (cursor.pending_tail && !self.subagent(session_id, task_id)?.status.active()));
         Ok(latte_work_protocol::Response::SubagentHistory {
+            prompt,
             events,
             has_more,
             after,
@@ -711,6 +745,7 @@ impl Store {
                     native_id: update.id.clone(),
                     tool_use_id: update.tool_use_id.clone(),
                     title: "子智能体".into(),
+                    agent_type: None,
                     status: SubagentStatus::Unknown,
                     summary: None,
                     last_tool: None,
@@ -724,6 +759,9 @@ impl Store {
             }
             if let Some(title) = &update.title {
                 task.title = title.clone();
+            }
+            if let Some(agent_type) = &update.agent_type {
+                task.agent_type = Some(agent_type.clone());
             }
             if let Some(status) = update.status {
                 // Out-of-order progress cannot resurrect a confirmed terminal task.
@@ -882,7 +920,7 @@ impl Store {
     pub fn sources(&self, session: &str) -> Result<(Vec<latte_work_protocol::TaskSource>, bool)> {
         self.session(session)?;
         // Bounded lazy indexing supports older histories without inventing sources.
-        let history = self.db.prepare("SELECT data FROM events WHERE session_id=?1 AND json_extract(data,'$.kind') IN ('user','tool') ORDER BY seq DESC LIMIT 257")?.query_map([session], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let history = self.db.prepare("SELECT data FROM events WHERE session_id=?1 AND json_extract(data,'$.kind') IN ('user','queued_message_sent','tool') ORDER BY seq DESC LIMIT 257")?.query_map([session], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut partial = history.len() > 256;
         let tx = self.db.unchecked_transaction()?;
         for data in history.iter().take(256).rev() {
@@ -907,13 +945,62 @@ impl Store {
         ))
     }
     pub fn grant_reference(&self, project: &str, path: &str, directory: bool) -> Result<()> {
-        self.db.execute("INSERT INTO reference_access(project_id,path,directory) VALUES (?1,?2,?3) ON CONFLICT(project_id,path) DO UPDATE SET directory=excluded.directory", params![project,path,directory])?;
+        let changed = self.db.execute(
+            "INSERT INTO reference_access(project_id,path,directory)
+            SELECT ?1,?2,?3 WHERE (SELECT COUNT(*) FROM reference_access WHERE project_id=?1)<512
+            OR EXISTS(SELECT 1 FROM reference_access WHERE project_id=?1 AND path=?2)
+            ON CONFLICT(project_id,path) DO UPDATE SET directory=excluded.directory",
+            params![project, path, directory],
+        )?;
+        if changed == 0 {
+            bail!("可预览的项目外文件数量已达上限");
+        }
         Ok(())
+    }
+    pub fn reference_access(
+        &self,
+        project: &str,
+    ) -> Result<(Vec<latte_work_protocol::FileEntry>, bool)> {
+        self.project(project)?;
+        let mut query = self.db.prepare("SELECT path,directory FROM reference_access WHERE project_id=?1 ORDER BY path LIMIT 513")?;
+        let rows = query.query_map([project], |r| {
+            let path: String = r.get(0)?;
+            Ok(latte_work_protocol::FileEntry {
+                name: Path::new(&path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone()),
+                path,
+                directory: r.get(1)?,
+            })
+        })?;
+        let mut entries = Vec::new();
+        let mut bytes = 0;
+        let mut truncated = false;
+        for row in rows {
+            let entry = row?;
+            bytes += serde_json::to_vec(&entry)?.len();
+            if entries.len() == 512 || bytes > latte_work_protocol::MAX_FRAME / 2 {
+                truncated = true;
+                break;
+            }
+            entries.push(entry);
+        }
+        Ok((entries, truncated))
+    }
+    pub fn revoke_reference_access(&self, project: &str, path: &str) -> Result<bool> {
+        self.project(project)?;
+        // Delete the recorded canonical key even if the file was moved or removed.
+        let removed = self.db.execute(
+            "DELETE FROM reference_access WHERE project_id=?1 AND path=?2",
+            params![project, path],
+        )?;
+        Ok(removed != 0)
     }
     pub fn reference_allowed(&self, project: &str, target: &Path) -> Result<bool> {
         let rows = self
             .db
-            .prepare("SELECT path,directory FROM reference_access WHERE project_id=?1 LIMIT 512")?
+            .prepare("SELECT path,directory FROM reference_access WHERE project_id=?1 ORDER BY path LIMIT 512")?
             .query_map([project], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
             })?
@@ -1068,6 +1155,7 @@ impl Store {
             )?;
             index_event(&tx, id, &event)?;
         }
+        tx.execute("UPDATE message_queue SET status='dispatched' WHERE request_id=?1 AND session_id=?2 AND status IN ('pending','forwarded')", params![request_id,id])?;
         tx.commit()?;
         Ok(true)
     }
@@ -1309,7 +1397,170 @@ fn index_source(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn live_generated_titles_preserve_manual_names() {
+    fn concurrent_preview_grants_cannot_exceed_the_limit() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.db");
+        let store = Store::open(&path).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        for i in 0..511 {
+            store
+                .grant_reference(&project.id, &format!("/outside/{i}"), false)
+                .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|i| {
+                let path = path.clone();
+                let project = project.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let other = Store::open(&path).unwrap();
+                    barrier.wait();
+                    other
+                        .grant_reference(&project, &format!("/racing/{i}"), false)
+                        .is_ok()
+                })
+            })
+            .collect();
+        let granted = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(granted, 1);
+        assert_eq!(store.reference_access(&project.id).unwrap().0.len(), 512);
+    }
+    #[test]
+    fn activity_index_migration_keeps_history_and_survives_reopening() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let store = Store::open(&path).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        store
+            .event(
+                &session.id,
+                EventKind::Text {
+                    text: "preserved".into(),
+                },
+            )
+            .unwrap();
+        store.db.execute_batch("DROP INDEX events_recent_activity_v2; CREATE INDEX events_recent_activity ON events(session_id,seq);").unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .db
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE session_id=?1",
+                        [&session.id],
+                        |row| row.get::<_, u32>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(store.db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('events_recent_activity','events_recent_activity_v2')", [], |row| row.get::<_, u32>(0)).unwrap(), 1);
+        }
+    }
+    #[test]
+    fn retained_preview_access_lists_fit_the_wire_budget_even_with_long_paths() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("access.db")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        for i in 0..512 {
+            let path = format!("/{}{i}.md", "many\\folder/".repeat(300));
+            store.grant_reference(&project.id, &path, false).unwrap();
+        }
+        let (entries, truncated) = store.reference_access(&project.id).unwrap();
+        assert!(truncated && !entries.is_empty() && entries.len() < 512);
+        let response = latte_work_protocol::Response::ReferenceAccess { entries, truncated };
+        assert!(serde_json::to_vec(&response).unwrap().len() < latte_work_protocol::MAX_FRAME);
+    }
+    #[test]
+    fn retained_preview_access_is_bounded_durable_and_revocable_without_the_file() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.db");
+        let store = Store::open(&path).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        for i in 0..512 {
+            store
+                .grant_reference(&project.id, &format!("/outside/{i:03}"), true)
+                .unwrap();
+        }
+        assert!(
+            store
+                .grant_reference(&project.id, "/overflow", false)
+                .is_err()
+        );
+        store
+            .grant_reference(&project.id, "/outside/000", false)
+            .unwrap();
+        assert!(
+            !store
+                .reference_allowed(&project.id, Path::new("/outside/000/child.md"))
+                .unwrap()
+        );
+        assert!(
+            store
+                .reference_allowed(&project.id, Path::new("/outside/001/child.md"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .reference_allowed(&project.id, Path::new("/outside/001-other/child.md"))
+                .unwrap()
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let (entries, truncated) = store.reference_access(&project.id).unwrap();
+        assert_eq!(entries.len(), 512);
+        assert!(!truncated);
+        assert_eq!(entries[0].path, "/outside/000");
+        // Legacy versions could retain more than the new admission limit.
+        store.db.execute("INSERT INTO reference_access(project_id,path,directory) VALUES (?1,'/legacy-a',0),(?1,'/legacy-b',0)", [&project.id]).unwrap();
+        let (entries, truncated) = store.reference_access(&project.id).unwrap();
+        assert_eq!(entries.len(), 512);
+        assert!(truncated);
+        store
+            .revoke_reference_access(&project.id, "/legacy-a")
+            .unwrap();
+        store
+            .revoke_reference_access(&project.id, "/legacy-b")
+            .unwrap();
+        store
+            .revoke_reference_access(&project.id, "/outside/001")
+            .unwrap();
+        store
+            .revoke_reference_access(&project.id, "/outside/001")
+            .unwrap();
+        assert!(
+            !store
+                .reference_allowed(&project.id, Path::new("/outside/001/child.md"))
+                .unwrap()
+        );
+        store
+            .grant_reference(&project.id, "/overflow", false)
+            .unwrap();
+        assert!(store.reference_access("missing-project").is_err());
+        assert!(
+            store
+                .revoke_reference_access("missing-project", "/overflow")
+                .is_err()
+        );
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(
+            !store
+                .reference_allowed(&project.id, Path::new("/outside/001"))
+                .unwrap()
+        );
+    }
+    #[test]
+    fn native_names_follow_external_renames_while_generated_titles_preserve_manual_names() {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("titles.db")).unwrap();
@@ -1317,20 +1568,20 @@ mod tests {
         let session = store.create_session(project.id, "claude".into()).unwrap();
         assert_eq!(
             store
-                .sync_live_native_title(&session.id, "Generated")
+                .sync_native_title(&session.id, "Generated", false)
                 .unwrap()
                 .title,
             "Generated"
         );
         store.rename_session(&session.id, "Manual").unwrap();
         let current = store
-            .sync_live_native_title(&session.id, "Later generated")
+            .sync_native_title(&session.id, "Later generated", false)
             .unwrap();
         assert_eq!(current.title, "Manual");
         assert!(current.custom_title);
         assert_eq!(
             store
-                .sync_native_title(&session.id, "New manual", true)
+                .sync_live_native_title(&session.id, "New manual")
                 .unwrap()
                 .title,
             "New manual"
@@ -1354,6 +1605,7 @@ mod tests {
                     &session.id,
                     EventKind::Subagent {
                         update: SubagentUpdate {
+                            agent_type: None,
                             id: native.into(),
                             tool_use_id: Some(tool.into()),
                             title: None,
@@ -1429,6 +1681,7 @@ mod tests {
                 &session.id,
                 EventKind::Subagent {
                     update: SubagentUpdate {
+                        agent_type: None,
                         id: "child".into(),
                         tool_use_id: Some("p".into()),
                         title: None,
@@ -1532,6 +1785,7 @@ mod tests {
                 &session.id,
                 EventKind::Subagent {
                     update: SubagentUpdate {
+                        agent_type: None,
                         id: "child".into(),
                         tool_use_id: Some("p".into()),
                         title: None,
@@ -1688,8 +1942,20 @@ mod tests {
         let other = store
             .create_session(project.id.clone(), "claude".into())
             .unwrap();
+        store.event(&session.id, EventKind::Tool { id: "tool".into(), name: "Agent".into(), input: serde_json::json!({"prompt":"Inspect the exact changes. Original input."}) }).unwrap();
+        store
+            .event(
+                &other.id,
+                EventKind::Tool {
+                    id: "tool".into(),
+                    name: "Agent".into(),
+                    input: serde_json::json!({"prompt":"Wrong session"}),
+                },
+            )
+            .unwrap();
         let update = |id: &str, status| EventKind::Subagent {
             update: SubagentUpdate {
+                agent_type: (id == "tool:tool").then(|| "review:code-reviewer".into()),
                 id: id.into(),
                 tool_use_id: Some("tool".into()),
                 title: Some("检查代码".into()),
@@ -1718,13 +1984,23 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "tool:tool");
         assert_eq!(tasks[0].native_id, "native");
+        assert_eq!(tasks[0].agent_type.as_deref(), Some("review:code-reviewer"));
         assert!(store.subagents(&other.id).unwrap().0.is_empty());
         store.state(&session.id, Status::Completed, None).unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(
+            store.subagents(&session.id).unwrap().0[0]
+                .agent_type
+                .as_deref(),
+            Some("review:code-reviewer")
+        );
+        assert_eq!(
             store.subagents(&session.id).unwrap().0[0].status,
             SubagentStatus::Unknown
+        );
+        assert!(
+            matches!(store.subagent_history(&session.id, "tool:tool", None, None, false).unwrap(), latte_work_protocol::Response::SubagentHistory { prompt: Some(prompt), .. } if prompt == "Inspect the exact changes. Original input.")
         );
         store
             .end_subagents(&session.id, SubagentStatus::Stopped)
@@ -1739,12 +2015,19 @@ mod tests {
             store.subagents(&session.id).unwrap().0[0].status,
             SubagentStatus::Completed
         );
+        assert_eq!(
+            store.subagents(&session.id).unwrap().0[0]
+                .agent_type
+                .as_deref(),
+            Some("review:code-reviewer")
+        );
         for n in 0..130 {
             store
                 .event(
                     &session.id,
                     EventKind::Subagent {
                         update: SubagentUpdate {
+                            agent_type: None,
                             id: format!("child-{n}"),
                             tool_use_id: None,
                             title: None,

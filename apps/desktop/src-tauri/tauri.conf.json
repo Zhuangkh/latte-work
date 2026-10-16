@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data: blob:; media-src blob:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data: blob: https://*:*/favicon.ico http://*:*/favicon.ico; media-src blob:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'"
     }
   },
   "bundle": {

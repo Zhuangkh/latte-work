@@ -15,7 +15,11 @@ finish with project-owned ad-hoc signing and strict bundle verification. The CLI
 `make test-unit` runs Rust crate-local and frontend reducer tests.
 `make test-e2e` runs the final server binary through its real socket bridge with
 a deterministic Claude CLI fixture. `make test-doc` runs Rust documentation
-tests. `make test` runs all three layers; `make ci` also checks formatting,
+tests. On macOS, `make test-native` compiles and runs the standalone WebKit
+site-data boundary and localhost favicon transport harnesses. They use a disposable
+cookie store and loopback HTTP fixture, without browsing, login state or model calls.
+`make test` runs all three portable layers and includes `test-native` on macOS;
+`make ci` also checks formatting,
 generated protocol types, Clippy, workflow/shell scripts, the frontend build,
 and Rustdoc. `make setup` uses public npm registry URLs recorded in the lockfile.
 
@@ -23,7 +27,10 @@ GitHub Actions runs host check/Clippy, UT, final-binary E2E, and release builds
 on Linux and macOS. Frontend UT/build runs on Linux, macOS, and Windows;
 Windows also checks, lints, and tests the portable Rust protocol and client.
 The server uses Unix sockets and process groups, so Windows CI does not claim
-server or native desktop support. A separate macOS job builds the native app.
+server or native desktop support. A separate macOS job runs `make test-native`
+with a three-minute step deadline before building the native app. A failed native
+test fails that job and therefore `PR Gate`; successful compilation alone is not
+treated as native behavioral coverage.
 `PR Gate` fails when any dependent job fails, is cancelled, or is skipped.
 The repository ruleset must require `PR Gate` on `main` for this to block a
 merge; a workflow file alone does not activate that remote rule.
@@ -63,6 +70,14 @@ finish and terminals close. Restarting only the desktop leaves them running.
 
 Wire protocol changes: edit latte-work-protocol then run `make types` and
 `make fmt`. Desktop presentation must not import or reproduce Claude wire types.
+
+Archiving an idle task first closes any retained native session, reaps its owned
+process group, pauses pending messages and ends background subagents. Only a
+confirmed close allows the archive flag to be saved; failures keep it unarchived.
+Archive shares the exclusive execution-admission gate with undo, so another client
+cannot reopen or send between close and persistence. Archived tasks cannot create
+actors through queue actions either. Unarchive changes metadata only and does not
+open an Agent; running/waiting tasks must still be stopped before archiving.
 
 `recent_sessions` reads unarchived history across visible projects on the target host,
 100 rows per page with an activity-time/session-ID cursor. Activity comes from saved
@@ -111,6 +126,12 @@ serializes native output, durable turn admission, interruption and close. Native
 results finish turns without closing stdin. Task lifecycle and session-state
 messages stay in the Claude adapter. Configuration changes are rejected before
 admission when background work cannot safely be released. `Ready` must never implicitly send a prompt.
+
+Subagent roles are optional `agent_type` metadata in both updates and snapshots.
+The Claude adapter reads the explicit native `subagent_type` field from Agent/Task
+inputs or lifecycle updates; descriptions, tool names and `task_type` are not roles.
+Store merges preserve the role across native identity changes, progress, close and
+restart. Older records and Servers may omit it; the UI leaves it absent.
 
 Focused checks: `cargo test -p latte-work-server --bin latte-work-server --locked`
 for contract/adapter/runtime UT, followed by `make test-e2e` for real server/bridge
@@ -485,6 +506,10 @@ The child tab reads dedicated `subagent_history` forward pages. Full redacted
 stdout events and native child records persist separately from parent events,
 joined by the task's stable ID. The legacy `subagent_transcript` bounded snapshot
 remains available for old clients, but its limits do not govern the child UI.
+The additive optional `prompt` field reads the original, already-redacted parent
+Agent/Task tool input by session and tool-use ID, independently of loaded chat
+pages, and survives restart. Missing input stays absent; the UI exposes saved
+input in a separate “任务指令” disclosure above process and final output.
 History pages contain at most 128 events / roughly 256 KiB; a larger individual
 event remains intact within the protocol frame limit. The client reads successive
 pages while visible, including after completion, and joins the complete final
@@ -534,9 +559,72 @@ Hiding or closing a child tab never stops execution. Child result envelopes cann
 finish the parent turn. Trailing empty/duplicate success results while idle are
 ignored; result-only autonomous replies and actual failures remain visible.
 
+The Task Summary tab shows compact, read-only sections with uniform empty states.
+Each section has an independent disclosure button and a count that updates while
+collapsed. Child-agent status groups also collapse independently: completed children
+start collapsed, while active and other states start expanded. Explicit choices
+are cached by host/session for the current app run, bounded to 64 scopes; refresh
+and incoming events do not overwrite them. Collapsed content stays mounted to
+preserve nested state. Disclosure is presentation-only and does not change polling
+or execution. The separate refresh control never toggles disclosure; native button
+keyboard behavior and reduced-motion chevrons are preserved.
+Its append-only event projection reuses parsed records; prepended history and
+replaced records reset it. Unfinished streamed text is parsed on settlement, not
+on each token, and Markdown fences are stripped in a linear line scan. TodoWrite
+replaces its own snapshot while retaining TaskCreate records. Branch reviews are
+read on opening, settlement and explicit refresh, independent of streamed tool
+activity; the lightweight source inventory refreshes at most once every two seconds
+while running, with one read in flight. Authentication prompts suspend these reads.
+The single hover/focus background on each workspace tab includes its close control.
+Project names and history-scope paragraphs are not repeated in the inspector;
+the footer offers explicit earlier-history reads, with scope in its tooltip.
+Resource links reuse a visited page's declared favicon when available, otherwise
+load the corresponding HTTP(S) origin's `/favicon.ico`, without a referrer or a
+third-party icon service. Missing icons retain a link glyph without an error notice.
+Image loading is lazy; summary collection does not fetch page bodies to discover
+icons or titles. The main WebView CSP allows HTTP(S) favicon paths
+while keeping script, connect and frame policies unchanged. Titles still come from
+conversation labels or previously visited browser pages; untitled links show one
+compact address rather than repeating the hostname above the URL.
+
+`skill_info` resolves current installed Skill metadata on the execution host without
+starting an Agent, changing access or evaluating Skill body/template commands.
+The Claude implementation reads known personal/project folders (including linked
+skill folders) and namespaced installed-plugin records; unsupported, missing and
+ambiguous metadata are explicit. This is current-file metadata, not proof of the
+exact Skill version used in an earlier turn. Location reference:
+[Claude skills](https://code.claude.com/docs/en/skills#choose-where-skills-load).
+Metadata reads use two concurrent blocking workers, a three-second deadline,
+64 KiB Skill files, a 256 KiB plugin index, and bounded candidate counts. Clicking
+an available Skill selects its canonical directory through `resolve_reference`,
+then opens `SKILL.md` directly in the shared Files tab, with the directory tree.
+Task files use the same Files tab. An external file click resolves exactly that file;
+its preview does not browse or grant access to its parent. Explicit directory
+selections retain their canonical preview scope, separate from project browsing.
+Task Summary presents file names, paths and Skill descriptions with direct open actions;
+it does not expose retained permission scopes or authorization management. Hover only reads
+metadata and never grants directory access. Preview still enforces canonical containment,
+including escaping nested symlinks. The Server retains the `reference_access` metadata API
+for reading the project's canonical file/directory scopes.
+`revoke_reference_access` removes exactly that project's recorded scope even when
+the original path no longer exists; subsequent preview requests recheck permission.
+If no exact recorded key matches, existing absolute aliases are canonicalized with
+a five-second deadline outside the database lock before deletion. Missing paths
+remain idempotent. Admission checks and upserts share one SQL statement, so concurrent
+connections cannot exceed the 512-scope limit; activity-index replacement is transactional.
+Other explicit task sources or uploaded attachments may independently
+allow access. Retained grants are bounded to 512 per project; list responses also
+stay within half the wire-frame budget, accounting for JSON escaping. Older
+oversized lists are disclosed as truncated and can be reduced by revoking entries. Neither listing
+nor revocation opens an Agent or grants new access; older Servers fail explicitly.
+Local and SSH hosts share this additive request; older Servers must update for
+metadata. Failures do not fabricate descriptions or paths. Focused checks include
+`claude_skills` unit tests, `SkillRow`/`TaskInfo` frontend tests and the final-binary
+`skill_metadata_is_host_local_read_only_and_preview_requires_explicit_reference` test.
+
 The topbar Task Overview popover links to changes and subagents. The Sources
 section and source tabs are currently removed from the workspace UI. The source
-inventory and scoped preview APIs described below remain available on the host;
+inventory and scoped preview APIs described below also back the summary and Files tab;
 Composer references continue to use their existing add and send flow.
 The desktop owns a single `/agents` (子智能体) navigation entry for every Agent.
 Native commands carrying the `subagents` presentation hint, and the reserved
@@ -638,6 +726,48 @@ are rejected and an interrupted restoration requires manual workspace inspection
 
 ## Embedded browser
 
+Browser tabs use site favicons; a missing or failed image keeps a small link glyph
+without layout changes. On macOS, finished navigation reads at most eight declared
+icon URLs from the current document, then requests the first valid HTTP(S) icon
+with an origin `/favicon.ico` fallback. The native image transport uses ephemeral
+cookie-free and credential-free requests, accepts only supported image MIME types,
+limits each response to 64 KiB, follows at most three validated redirects without
+HTTPS downgrade, and applies two-second request / three-second resource deadlines.
+At most four icon collections run concurrently, with an eight-second completion
+deadline. A 64-entry in-memory cache contains only bounded image data, keyed by
+document URL; navigation fences discard stale results. No third-party icon service
+or website login credentials are used. Other platforms retain the origin fallback.
+
+The address field includes an anchored site-information entry. Its dialog shows
+the current domain/title and two entries: connection details and Cookie/website data.
+Copy URL and system-browser actions remain outside this dialog. Connection status
+comes from the native committed WebView's evaluated server trust and secure-content
+state, never from an HTTPS string alone; unavailable trust stays unknown. It does
+not claim to manage website permissions. Connection details include the committed
+native certificate subject and issuer when available (macOS 12+). Overlapping
+dialogs and menus retain a
+decoded viewport image behind the overlay before hiding the native surface; closing
+restores the live surface before releasing the image. Escape and outside click
+restore keyboard focus. Site-info
+uses the existing caller-checked, nonce-bound native bridge, with a 128 KiB response
+limit; it grants no page IPC access or additional filesystem permissions.
+
+Focused checks: `BrowserSiteInfo.test.tsx`, `SiteIcon.test.tsx`, `BrowserPane.test.tsx`
+and native desktop tests. On macOS, `python3 scripts/test-site-icons.py` compiles a
+temporary native harness and verifies the production image transport against a
+local HTTP fixture (size/MIME/redirect/authentication/timeout/header boundaries).
+Real site icons, native connection status and popup layout require separate UI smoke.
+
+Overlay previews use the same caller-checked, nonce-bound snapshot bridge without
+a save picker. Native JPEG output is limited to 2048 logical pixels on its longest
+side and 8 MiB; the UI receives binary data, decodes it with a 1.5-second deadline,
+and holds only a temporary Blob URL. The private bridge files are removed after the
+request. Images are not added to browser history, downloads or workspace state.
+Capture and geometry changes serialize per pane; late snapshots after close,
+navigation, tab hiding or unmount are discarded. Failed captures keep the live page
+and dismiss browser menu/site-information overlays rather than showing a blank page.
+Overlays outside the native page bounds do not request an image or hide the page.
+
 The browser toolbar's menu supports find, 25–300% page zoom, the system print/PDF
 panel, visible-viewport PNG snapshots, native downloads, searchable visit history,
 and explicitly confirmed data clearing. Native menu accelerators route through
@@ -653,7 +783,14 @@ Clearing download records preserves user-saved files.
 On macOS, `macos_browser.m` gives only incognito-constructed browser surfaces a
 shared profile separate from the workbench. macOS 14+ uses a persistent named
 WebKit data store; older macOS uses a shared session-only store. Existing default
-store website logins are not migrated. Find/snapshot/clear use a single-use nonce
+store website logins are not migrated. Browser-only configurations append
+`Version/<installed Safari version> Safari/605.1.15` through WebKit's
+`applicationNameForUserAgent`. The default macOS WKWebView UA lacks those tokens,
+which can trigger obsolete-browser detection even on a current WebKit. The version
+is read from the installed `com.apple.Safari` bundle, not hardcoded or replaced with
+a Chromium identity; absent or invalid metadata leaves WebKit's default unchanged.
+The main workbench UA is unaffected. This changes identification, not engine capabilities.
+Find/snapshot/clear use a single-use nonce
 bridge backed by a private per-process request directory, bound to the exact
 WebView, with bounded payloads and ten-second completion timeouts. Pages cannot
 pass paths or arbitrary commands; Rust remains free of unsafe code. Snapshots
@@ -681,10 +818,28 @@ created lazily when selected. Native IDs are per-mounted-pane, so first-send dra
 migration does not collide with a retained draft surface. Focused tests cover link
 routing, preference write failure, unsafe URL restoration and surface lifecycle.
 
+Site-data reads enumerate only the isolated browser profile, select matching WebKit
+records using their public-suffix-grouped domain names, and return domain/type
+metadata without cookie values. Subdomains can share a data scope; the UI names
+that scope before an explicit confirmation. The clear token expires after two
+minutes and is single-use, bound to the exact surface, URL, store, records and
+scope. The bridge limits reads to 4,096 records/cookies, eight selected records,
+32 types, 512 selected cookies and an 8 KiB response. Navigation and store changes
+reject stale operations. Clearing removes only the selected records, then explicitly
+deletes matching HTTP session cookies, and refreshes the current page without
+creating a new history visit. A failed or lost clear response is not replayed;
+the UI requires a fresh read. Other domains and the workbench data store are
+preserved. `python3 scripts/test-site-data.py` exercises this implementation against
+a real ephemeral WebKit cookie store without browsing or using a user profile.
+Native UI checks and the data-store test are recorded separately in
+`docs/validation/browser-site-info-2026-10-16.md`.
+
 ## Native session titles
 
 Agent-generated titles are host metadata, not UI-generated summaries. Claude's
-`session_title_changed` updates the saved Session without creating a turn.
+`session_title_changed` reports an explicit native session name (not an AI title).
+It updates the saved custom name without creating a turn, including a native-side
+rename after an earlier Latte rename.
 Manual Rename uses the running session's native `rename_session` control request
 and commits the displayed title only after acknowledgement. Rejection preserves
 the old title; timeout stays unconfirmed and does not replay the request. Closed
@@ -694,14 +849,20 @@ native session exists, the requested title is passed with `--name` at creation.
 
 Native metadata reads use the same host shell environment as execution, validate
 the exact native UUID, reject escaping/symlink session files, and read bounded
-64 KiB head/tail windows. Custom native titles take priority over generated titles.
-Metadata reads of closed sessions refresh sidebar/history titles; live sessions
-follow native events so stale transcript flushes cannot overwrite a rename.
-Closed-file reads are debounced per session/native identity for two seconds across
+incremental pages of at most 4 MiB per file. The 256-entry metadata index keeps
+only titles, offsets and a partial record of at most 64 KiB, not transcript text;
+it resets on file replacement or truncation. Reads continue until the current end
+before applying a title, so metadata in the middle is not lost or replaced with
+an older name during catch-up. Offline renames verify a bounded 64 KiB tail.
+Each refresh processes at most 16 files. Custom names take priority over AI titles.
+Metadata reads refresh closed sessions and unnamed live sessions, allowing
+AI titles to appear without closing an Agent. Named live sessions follow native
+events so stale transcript flushes cannot overwrite a rename.
+File reads are debounced per session/native identity for two seconds across
 all clients, with at most 2,048 entries. Repeated polls reuse the current database
 projection. External native renames appear at the next eligible metadata read;
 read results apply only if the native identity, title and custom-title state still
-match the original snapshot and no actor has opened in the meantime.
+match the original snapshot; named live actors remain protected from file reads.
 These semantics are shared by local and SSH hosts. Unsupported native live rename
 returns an error instead of silently renaming only the Latte record.
 
@@ -731,3 +892,113 @@ Questions and approvals share the existing 32-interaction and process time bound
 Old servers cannot accept structured answers; the client offers an explicit update
 message and optional skip, never an empty approval. Focused final-binary check:
 `user_questions_are_not_permissions_and_answers_are_bound_single_use_and_persisted`.
+
+## Persistent message queue
+
+`send_queued` is an explicit additive alternative to `send`; an idle session starts
+immediately, a busy session saves the prompt in the host's SQLite FIFO. The desktop
+uses this API and the same native provider injection for local and SSH hosts.
+`message_queued` acknowledges durable admission, not execution; the user event and
+request record are written only when the actor starts that turn. Starting a queued
+turn and retiring its pending row share a transaction. Original admission identities
+and cancellation tombstones prevent lost responses from re-enqueuing messages,
+including after editing. Transport reconnect never re-sends a prompt.
+
+Queue listing, revision-checked editing, removal, clearing and explicit resumption
+share the host protocol. Drag/keyboard reordering compares the complete pending
+request ID order and atomically persists its replacement. Stale, missing or duplicate
+IDs fail without mutation; a repeated identical order is idempotent. Dispatch always
+uses this saved order. The session actor serializes reorder/edits/cancellation against
+execution. Capacity is 16 pending messages / 512 KiB serialized content per session,
+with the existing 128 KiB per-prompt limit. Queue records contain prompts and launch
+option metadata, never Provider snapshots or credentials. A pending queue has one
+Provider identity; each item retains its model, effort and permission choices.
+Native launch configurations stay in bounded actor memory. Resumption must supply
+that original Provider identity again; changed credentials/settings fail explicitly.
+
+Normal completion drains the saved order even after the initiating client disconnects. Stop,
+close, failure and daemon restart retain the remaining queue in a paused state.
+Restart never replays the interrupted active request. After checking the current
+conversation, the user can resume the pending messages with fresh native configuration,
+or edit/remove them. Pending active queues veto idle shutdown; paused queues remain
+safe to close. Closing/clearing the queue does not stop the current turn.
+
+Focused validation: final-binary `message_queue_` tests cover FIFO, multi-client
+reconnect, reordering/restart persistence, edits/removal, request identity, stop/restart, bounded admission, session
+isolation, and credential-free persistence/configuration fencing. Native fixture
+smoke evidence is separate from real-model behavior.
+
+The queued-row send arrow uses `dispatch_queued_message` with `interrupt: false`.
+While a native turn is running, the server writes the selected prompt to that same
+Claude stream immediately; it never sends an interrupt or waits for the host queue
+head. A persisted `queued_message_sent` receipt carries the original text and request
+ID, distinct from the `user` execution-start event. The desktop immediately displays
+it with the shared user-message bubble, original send time, copy and attachment controls.
+For legacy histories with a later execution event, it correlates by session/request
+ID and text, keeping one visible bubble at delivery time. A history page without
+the receipt still displays the execution event normally. Handoffs never end an in-flight tool or disappear
+inside a completed turn's folded process. Legacy prose receipts remain readable;
+the UI does not infer request identity from their text. Native
+completion consumes inputs by their native UUID attribution (`user_message_uuids`,
+or `user_message_uuid`), with replay acknowledgements as compatibility evidence.
+One result can settle several inputs folded into the same turn. Handoffs do not
+create synthetic execution-start events or trigger another turn when a result arrives;
+only native output starts a native follow-up. Unconfirmed inputs remain held without
+replay and block host-held messages until native confirmation or explicit stop/close.
+Outstanding native inputs
+share the 16-message/512-KiB admission budget. Streamed handoffs cannot provide a
+safe independent filesystem boundary, so overlapping turn snapshots cannot be undone.
+
+Active native turns retain their 24-hour execution limit. Each handed-off input has
+an independent 24-hour confirmation deadline measured from its delivery, including
+after its original turn completes. New inputs do not extend older confirmation
+deadlines or the active turn limit. A confirmation timeout identifies unconfirmed
+delivery, preserves its receipt and pauses the queue without replay, instead of
+reporting that an already completed turn exceeded its execution limit.
+
+Reproduce the real CLI queue contract without a model service or login:
+`python3 scripts/smoke-claude-queue.py --binary target/debug/latte-work-server --claude ~/.local/bin/claude --output target/real-queue.json`.
+The local fixture provides only Anthropic API responses. The installed CLI must
+accept `--replay-user-messages` and generate its own replay/UUID receipts; the
+script captures those fields, checks two delivered inputs settle together with
+one native result and no duplicate execution-start event, and closes its isolated
+Server. CLI version, binary/source hashes and the observed UUID fields are saved
+separately from Python-CLI E2E evidence. This smoke is optional and outside CI.
+
+The extra menu's “停止当前并发送” explicitly requests `interrupt: true`. With no
+native backlog, it waits for both the native result and interrupt acknowledgement
+before starting the selected message. If native inputs were already handed off,
+stopping closes that process and marks their processing state uncertain; they are
+never replayed automatically. The selected host-held item then starts in the saved
+session. Stop, close, failure and restart also quarantine unconfirmed native inputs
+and preserve their original prompt receipts. Remaining host-held messages retain
+their order and the queue's original paused/running choice.
+
+Editing uses revision-bound `take_queued_message`: atomically retire the pending
+item and return its exact content. A repeated take reconciles a lost response.
+The client merges it into the session draft, preserving existing text and attached
+references, and focuses the composer. Submitting uses a new request ID and appends
+to the host queue. No in-place edit or automatic resend occurs.
+
+Sidebar project ordering is an App-only preference (`latte-work.project-order.v1`),
+keyed by the host/project pair rather than names or paths. Mixed-host ordering
+survives project catalog refresh and restart; new projects append, and temporarily
+absent hosts retain their saved slots. Pointer-based dragging shows a floating
+project and insertion line, scrolls at the navigation edges, and moves the entire
+project group without changing its expanded state or selected conversation.
+Escape, pointer cancellation, window blur and dropping outside the project list
+cancel the gesture. Option+Up/Down provides keyboard ordering. Only held primary
+mouse movement beyond the threshold starts a drag; accessibility clicks and
+ordinary hover must not become a drag or suppress project expansion. No Server
+mutation or Agent request is used to save this display order.
+
+Queue dispatch failures are checked after each activation, before considering the
+next item; auto-drain reads the current session status. A delayed immediate-send
+confirmation pauses the queue without classifying the native process as failed or
+killing it. Later interrupt acknowledgements cannot release the selected pending
+message without an explicit resume. A drag uses the latest visible queue order;
+removed source/target rows cancel the drop, and the Server still checks full CAS.
+Previously acknowledged requests produce an informational receipt on explicit
+reconciliation. Taken-for-edit and cancelled requests retain distinct explanations.
+The edit/clear queue protocol requests remain for existing clients and host tests;
+the desktop exposes take-to-edit and per-item deletion only.

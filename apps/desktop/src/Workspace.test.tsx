@@ -192,6 +192,7 @@ it("opens independent child tabs, reuses a selected child, retains the list and 
   };
   const view = render(<Workspace {...props} subagents={subagents} />);
   await act(async () => {});
+  fireEvent.click(screen.getByRole("button", { name: "完成 · 2" }));
   fireEvent.click(screen.getByRole("button", { name: /alpha.*已完成/ }));
   expect(
     screen.getByRole("tab", { name: "alpha" }).getAttribute("aria-selected"),
@@ -689,4 +690,15 @@ it("offers browser access without a project and defers saved project previews", 
     (screen.getByRole("button", { name: "浏览器" }) as HTMLButtonElement)
       .disabled,
   ).toBe(false);
+});
+it("focuses task information after pinning and closes its tab without host mutations", async () => {
+  const { openTaskInfo } = await import("./workspaceState");
+  render(<Workspace {...props} taskInfo={<p>任务摘要内容</p>} />);
+  act(() => openTaskInfo(props.workspaceId));
+  const tab = screen.getByRole("tab", { name: "任务摘要" });
+  expect(document.activeElement).toBe(tab);
+  expect(screen.getByText("任务摘要内容")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "关闭任务摘要" }));
+  expect(screen.queryByRole("tab", { name: "任务摘要" })).toBeNull();
+  expect(mocks.request).not.toHaveBeenCalled();
 });

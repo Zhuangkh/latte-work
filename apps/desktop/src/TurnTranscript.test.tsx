@@ -8,6 +8,7 @@ import {
   formatElapsed,
 } from "./TurnTranscript";
 import { MessageContent } from "./MessageContent";
+import { UserMessage } from "./UserMessage";
 afterEach(cleanup);
 const user = (text: string): EventKind => ({
   kind: "user",
@@ -29,6 +30,52 @@ const result: EventKind = {
 };
 const events = (...values: EventKind[]): Event[] =>
   values.map((event, seq) => ({ seq, session_id: "s", at: seq, event }));
+it("keeps sent queue bubbles visible after completion and deduplicates execution across groups", () => {
+  const rows = events(
+    user("original"),
+    tool,
+    { kind: "queued_message_sent", request_id: "queued", text: "follow up" },
+    result,
+    text("original final"),
+    state("completed"),
+    { kind: "user", request_id: "queued", text: "follow up" },
+    text("follow up final"),
+    state("completed"),
+  );
+  const view = render(
+    <TurnTranscript events={rows}>
+      {(item) =>
+        item.type === "user" ? (
+          <UserMessage text={item.text} at={item.at} />
+        ) : item.type === "assistant" ? (
+          <p>{item.text}</p>
+        ) : (
+          <p>tool</p>
+        )
+      }
+    </TurnTranscript>,
+  );
+  const bubble = screen.getByText("follow up");
+  expect(bubble.className).toBe("user-message");
+  expect(bubble.closest("details")).toBeNull();
+  expect(screen.getAllByText("follow up")).toHaveLength(1);
+  expect(screen.getByText("follow up final")).toBeTruthy();
+  expect(turnTranscript(rows)[0].process).toEqual([]);
+  expect(turnTranscript(rows)[1].user).toMatchObject({ hidden: true });
+  view.rerender(
+    <TurnTranscript events={rows.slice(2)}>
+      {(item) =>
+        item.type === "user" ? (
+          <UserMessage text={item.text} at={item.at} />
+        ) : (
+          <p>record</p>
+        )
+      }
+    </TurnTranscript>,
+  );
+  expect(screen.getAllByText("follow up")).toHaveLength(1);
+  expect(turnTranscript(rows.slice(2))[0].user).toBeUndefined();
+});
 it("folds only the process of each completed turn and keeps its final answer outside", () => {
   const rows = events(
     user("first"),

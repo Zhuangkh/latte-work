@@ -45,6 +45,56 @@ it("keeps the latest turn when an older turn's undo event arrives later", () => 
   expect(latestTurnChanges([])).toBeUndefined();
 });
 describe("durable transcript projection", () => {
+  it("shows a handoff immediately and hides only its matching later execution bubble", () => {
+    const receipt = {
+      ...e(2, {
+        kind: "queued_message_sent",
+        request_id: "queued",
+        text: "follow up",
+      }),
+      at: 2000,
+    };
+    const started = e(5, {
+      kind: "user",
+      request_id: "queued",
+      text: "follow up",
+    });
+    const before = [
+      e(1, { kind: "user", request_id: "head", text: "original" }),
+      receipt,
+    ];
+    const after = appendEvents(before, [
+      receipt,
+      e(3, { kind: "text", text: "finishing original" }),
+      started,
+    ]);
+    const visible = (rows: Event[]) =>
+      transcript(rows).filter((item) => item.type === "user" && !item.hidden);
+    expect(visible(before)).toHaveLength(2);
+    expect(visible(after)).toEqual(visible(before));
+    expect(visible(after)[1]).toMatchObject({
+      key: 2,
+      at: 2000,
+      text: "follow up",
+      handoff: true,
+    });
+    expect(visible([started])).toHaveLength(1);
+    expect(
+      visible([
+        receipt,
+        e(6, { kind: "user", request_id: "other", text: "follow up" }),
+      ]),
+    ).toHaveLength(2);
+    expect(
+      visible([receipt, { ...started, session_id: "other-session" }]),
+    ).toHaveLength(2);
+    expect(
+      visible([
+        receipt,
+        e(6, { kind: "user", request_id: "queued", text: "different" }),
+      ]),
+    ).toHaveLength(2);
+  });
   it("deduplicates replay while preserving token order", () => {
     const a = e(1, { kind: "text", text: "你" });
     const b = e(2, { kind: "text", text: "好" });

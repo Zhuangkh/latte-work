@@ -38,6 +38,8 @@ fn main() {
         TurnChanges::decl(),
         SourceKind::decl(),
         TaskSource::decl(),
+        SkillInfo::decl(),
+        QueuedMessage::decl(),
         AgentInfo::decl(),
         AgentPermissionMode::decl(),
         AgentSlashCommand::decl(),

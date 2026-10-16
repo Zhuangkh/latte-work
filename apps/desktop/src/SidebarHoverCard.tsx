@@ -17,12 +17,14 @@ import {
 } from "./agentSessionState";
 
 /** Read-only sidebar information; hovering never requests or opens an Agent. */
-function HoverCard({
+export function HoverCard({
   content,
   children,
+  disabled = false,
 }: {
   content: ReactNode;
   children: ReactElement<ComponentProps<"button">>;
+  disabled?: boolean;
 }) {
   const id = useId();
   const anchor = useRef<HTMLDivElement>(null);
@@ -35,6 +37,7 @@ function HoverCard({
     timer.current = null;
   }
   function show() {
+    if (disabled) return;
     cancelTimer();
     timer.current = setTimeout(() => setOpen(true), 350);
   }
@@ -47,6 +50,9 @@ function HoverCard({
     timer.current = setTimeout(() => setOpen(false), 100);
   }
   useEffect(() => cancelTimer, []);
+  useEffect(() => {
+    if (disabled) dismiss();
+  }, [disabled]);
   useLayoutEffect(() => {
     if (!open || !anchor.current || !card.current) return;
     const box = anchor.current.getBoundingClientRect();
@@ -180,6 +186,7 @@ export function ProjectHoverCard({
   total,
   opened,
   children,
+  disabled,
 }: {
   title: string;
   path: string;
@@ -187,9 +194,11 @@ export function ProjectHoverCard({
   total: number | null;
   opened: number | null;
   children: ReactElement<ComponentProps<"button">>;
+  disabled?: boolean;
 }) {
   return (
     <HoverCard
+      disabled={disabled}
       content={
         <>
           <div className="sidebar-hover-title">{title}</div>

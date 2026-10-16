@@ -52,6 +52,7 @@ it("opens a keyboard-accessible overview and routes to real changes, child list 
       subagents={state}
       openChanges={changes}
       openSubagents={children}
+      openInfo={vi.fn()}
     />,
   );
   const trigger = screen.getByRole("button", { name: "任务概览" });
@@ -99,6 +100,7 @@ it("fences late changes and scopes the overview to its host/project", async () =
     subagents: state,
     openChanges: vi.fn(),
     openSubagents: vi.fn(),
+    openInfo: vi.fn(),
   };
   const view = render(
     <TaskOverview {...props} hostId="local" project={project} />,
@@ -122,4 +124,23 @@ it("fences late changes and scopes the overview to its host/project", async () =
     },
   });
   await waitFor(() => expect(screen.getByText("0 个文件")).toBeTruthy());
+});
+it("pins the overview into task information and dismisses the popover", () => {
+  const openInfo = vi.fn();
+  render(
+    <TaskOverview
+      hostId="local"
+      connected={false}
+      subagents={state}
+      openChanges={vi.fn()}
+      openSubagents={vi.fn()}
+      openInfo={openInfo}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "任务概览" }));
+  const pin = screen.getByRole("button", { name: "固定到右侧栏" });
+  expect(document.activeElement).toBe(pin);
+  fireEvent.click(pin);
+  expect(openInfo).toHaveBeenCalledOnce();
+  expect(screen.queryByRole("dialog")).toBeNull();
 });

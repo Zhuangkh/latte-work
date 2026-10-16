@@ -390,3 +390,141 @@ it("does not report a clean worktree when the server cannot enumerate changes", 
   ).toContain("不支持");
   expect(screen.queryByText(/工作区干净/)).toBeNull();
 });
+
+it("opens a Skill's SKILL.md directly in the shared file browser and navigates its real tree", async () => {
+  const root = "/host/skills/review";
+  mocks.request.mockImplementation(async (_host, r) => {
+    expect(r.method).toBe("preview_source");
+    if (r.path === root)
+      return {
+        kind: "source_directory",
+        entries: [
+          { path: `${root}/SKILL.md`, name: "SKILL.md", directory: false },
+          { path: `${root}/notes.txt`, name: "notes.txt", directory: false },
+        ],
+        truncated: false,
+      };
+    const data = Array.from(
+      new TextEncoder().encode(
+        r.path.endsWith("SKILL.md") ? "Skill description" : "Supporting notes",
+      ),
+    );
+    return {
+      kind: "source_preview",
+      data,
+      next: data.length,
+      size: data.length,
+      has_more: false,
+      mime_type: "text/plain",
+    };
+  });
+  function SkillBrowser() {
+    const [file, setFile] = useState(`${root}/SKILL.md`);
+    return (
+      <WorkspaceFiles
+        hostId="ssh"
+        project={{ id: "p", name: "Project", path: "/project" }}
+        tab="files"
+        active
+        reference={{ path: root, name: "review", directory: true }}
+        sessionId="s"
+        path={root}
+        file={file}
+        navigate={(value) => setFile(value.file ?? "")}
+      />
+    );
+  }
+  render(<SkillBrowser />);
+  expect(await screen.findByText("Skill description")).toBeTruthy();
+  const tree = screen.getByRole("navigation", { name: "项目文件树" });
+  expect(
+    within(tree)
+      .getByRole("button", { name: "SKILL.md" })
+      .getAttribute("aria-current"),
+  ).toBe("page");
+  fireEvent.click(within(tree).getByRole("button", { name: "notes.txt" }));
+  expect(await screen.findByText("Supporting notes")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "自动换行" })).toBeTruthy();
+  expect(mocks.request).toHaveBeenCalledWith(
+    "ssh",
+    expect.objectContaining({ session_id: "s", path: `${root}/SKILL.md` }),
+  );
+});
+it("reads an explicitly selected external file without browsing its parent directory", async () => {
+  const path = "/private/tmp/report.md";
+  const data = Array.from(new TextEncoder().encode("Report body"));
+  mocks.request.mockResolvedValue({
+    kind: "source_preview",
+    data,
+    next: data.length,
+    size: data.length,
+    has_more: false,
+    mime_type: "text/plain",
+  });
+  render(
+    <WorkspaceFiles
+      hostId="ssh"
+      project={{ id: "p", name: "P", path: "/project" }}
+      tab="files"
+      active
+      path="/private/tmp"
+      file={path}
+      reference={{ path, name: "report.md", directory: false }}
+      sessionId="s"
+      navigate={vi.fn()}
+    />,
+  );
+  expect(await screen.findByText("Report body")).toBeTruthy();
+  expect(mocks.request).toHaveBeenCalledExactlyOnceWith("ssh", {
+    method: "preview_source",
+    project_id: "p",
+    session_id: "s",
+    path,
+    offset: 0,
+  });
+});
+
+it("releases a pending project read when switching to an external reference", async () => {
+  mocks.request.mockImplementation(async (_host, r) => {
+    if (r.method === "read_file") return new Promise(() => {});
+    if (r.method === "files") return { kind: "files", entries: [] };
+    return {
+      kind: "source_preview",
+      data: [79, 75],
+      size: 2,
+      next: 2,
+      has_more: false,
+      mime_type: "text/plain",
+    };
+  });
+  const base = {
+    hostId: "ssh",
+    project: { id: "p", name: "P", path: "/project" },
+    tab: "files" as const,
+    active: true,
+    path: "",
+    navigate: vi.fn(),
+  };
+  const view = render(<WorkspaceFiles {...base} file="pending.md" />);
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "刷新" }).hasAttribute("disabled"),
+    ).toBe(true),
+  );
+  view.rerender(
+    <WorkspaceFiles
+      {...base}
+      file="/tmp/report.md"
+      reference={{
+        name: "report.md",
+        path: "/tmp/report.md",
+        directory: false,
+      }}
+    />,
+  );
+  expect(await screen.findByText("OK")).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "刷新" }).hasAttribute("disabled"),
+  ).toBe(false);
+  expect(screen.queryByRole("button", { name: "返回所选目录" })).toBeNull();
+});

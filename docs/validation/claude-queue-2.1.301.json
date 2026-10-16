@@ -1,0 +1,80 @@
+{
+  "source_revision": "0ecf42aed8781457cf803b6067b3fbea8625d6ec",
+  "server_sha256": "a075561c7cf48d5a6bc051eb4d342e38746525d63c4b77817cf990cf99d8d7aa",
+  "platform": "Darwin arm64",
+  "native_uuid_receipts": [
+    {
+      "type": "command",
+      "replay_user_messages": false
+    },
+    {
+      "type": "command",
+      "replay_user_messages": false
+    },
+    {
+      "type": "command",
+      "replay_user_messages": true
+    },
+    {
+      "type": "command",
+      "replay_user_messages": false
+    },
+    {
+      "type": "command",
+      "replay_user_messages": false
+    },
+    {
+      "type": "user",
+      "isReplay": true,
+      "uuid": "820d39b1-6b11-44a9-98a6-bd59d0ec6a90"
+    },
+    {
+      "type": "user",
+      "uuid": "1045ec79-f665-4cfb-8812-0955b8de2c47"
+    },
+    {
+      "type": "user",
+      "isReplay": true,
+      "uuid": "e1ee3727-83f3-4e64-b4cd-7c4ca907d63d"
+    },
+    {
+      "type": "user",
+      "isReplay": true,
+      "uuid": "c09e9085-7bf2-46f7-b81e-96b270d6de8b"
+    },
+    {
+      "type": "result",
+      "uuid": "53688040-424f-40f1-865a-84252b51fec1",
+      "user_message_uuid": "c09e9085-7bf2-46f7-b81e-96b270d6de8b",
+      "user_message_uuids": [
+        "e1ee3727-83f3-4e64-b4cd-7c4ca907d63d",
+        "c09e9085-7bf2-46f7-b81e-96b270d6de8b"
+      ],
+      "subtype": "success"
+    }
+  ],
+  "claude": "2.1.301 (Claude Code)",
+  "state": "completed",
+  "busy": false,
+  "queue": [
+    [
+      "real-a",
+      "dispatched"
+    ],
+    [
+      "real-b",
+      "dispatched"
+    ]
+  ],
+  "local_upstream_requests": 2,
+  "execution_users": 1,
+  "handoff_receipts": 2,
+  "native_completions": 1,
+  "paid_model_calls": 0,
+  "source_dirty": true,
+  "source_files_sha256": {
+    "crates/latte-work-server/src/runtime.rs": "5c471b5581ba5cfd2c7486e7823c4e8659962a49d361107171251373134b1ce7",
+    "crates/latte-work-server/src/agents/claude.rs": "f6dfb809dd2967f76237f00eb6ab1f2d8565723412c346ae5e3fa0fcabca7c32",
+    "crates/latte-work-server/src/store.rs": "5700d936ddf0a2c1fe8c80b51d58be24d2dfd22cbb6c2a247fabdfc4c328d780"
+  }
+}

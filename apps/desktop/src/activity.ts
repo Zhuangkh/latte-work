@@ -1,5 +1,5 @@
 import type { Event, JsonValue } from "./protocol";
-import { transcript, type Item } from "./transcript";
+import { transcript, queuedInputReceipts, type Item } from "./transcript";
 
 export interface ToolActivity {
   key: number;
@@ -26,7 +26,10 @@ export type ActivityItem =
     };
 
 /** Pair by tool ID within a user turn, never by result arrival order. */
-export function activityTranscript(events: Event[]): ActivityItem[] {
+export function activityTranscript(
+  events: Event[],
+  receipts = queuedInputReceipts(events),
+): ActivityItem[] {
   const rows: ActivityItem[] = [];
   const attached = new Set<ToolActivity>();
   const pending = new Map<string, ToolActivity>();
@@ -47,7 +50,7 @@ export function activityTranscript(events: Event[]): ActivityItem[] {
     )
     .map(({ seq }) => seq);
   let terminalIndex = 0;
-  const projected = transcript(events);
+  const projected = transcript(events, receipts);
   for (const item of projected) {
     while (
       terminalIndex < terminal.length &&
@@ -56,7 +59,7 @@ export function activityTranscript(events: Event[]): ActivityItem[] {
       finish();
       terminalIndex++;
     }
-    if (item.type === "user") finish();
+    if (item.type === "user" && !item.handoff) finish();
     if (item.type !== "event") {
       rows.push(item);
       continue;

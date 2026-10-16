@@ -90,6 +90,16 @@ export function BrowserTools({
     if (restore) trigger.current?.focus();
   }, []);
   useEffect(() => {
+    const unavailable = (event: Event) => {
+      if ((event as CustomEvent<string>).detail !== id) return;
+      closeMenu();
+      setPanel(null);
+    };
+    window.addEventListener("browser-overlay-unavailable", unavailable);
+    return () =>
+      window.removeEventListener("browser-overlay-unavailable", unavailable);
+  }, [id, closeMenu]);
+  useEffect(() => {
     if (!active) {
       setMenu(false);
       setPanel(null);

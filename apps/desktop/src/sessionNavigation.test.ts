@@ -9,6 +9,29 @@ import {
   conversationMarkdown,
 } from "./sessionNavigation";
 import type { Session, Event } from "./protocol";
+it("copies a sent queued input once even after its execution starts", () => {
+  const rows: Event[] = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: "s",
+      event: {
+        kind: "queued_message_sent",
+        request_id: "q",
+        text: "follow up",
+      },
+    },
+    {
+      seq: 2,
+      at: 2,
+      session_id: "s",
+      event: { kind: "user", request_id: "q", text: "follow up" },
+    },
+  ];
+  expect(conversationMarkdown("title", rows)).toBe(
+    "# title\n\n## 用户\n\nfollow up",
+  );
+});
 const session = (id: string, pin: number | null = 1): Session => ({
   id,
   project_id: "p",

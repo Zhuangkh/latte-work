@@ -21,5 +21,7 @@ tempfile = "3"
 latte-work-client.workspace = true
 portable-pty = "0.9"
 filedescriptor = "0.8"
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 [lints]
 workspace = true

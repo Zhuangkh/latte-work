@@ -1,3 +1,4 @@
+import { referencePrompt } from "./referenceMessage";
 // @vitest-environment jsdom
 import {
   act,
@@ -654,7 +655,7 @@ it("keeps history concealed until it is fully loaded and positioned at the botto
   );
   await waitFor(() => expect(el.getAttribute("aria-busy")).toBe("false"));
   expect(el.scrollTop).toBe(2200);
-  expect(ready).toHaveBeenCalledOnce();
+  await waitFor(() => expect(ready).toHaveBeenCalledOnce());
   expect(screen.queryByText("正在加载")).toBeNull();
   expect(
     view.container.querySelector(".messages")?.getAttribute("aria-hidden"),
@@ -1023,4 +1024,95 @@ it("renders a question directly, submits once for its session and preserves pane
   );
   await act(async () => finish());
   expect(screen.queryByRole("form", { name: "待回答问题" })).toBeNull();
+});
+
+it("can queue a follow-up while the current turn runs and keeps a separate stop action", async () => {
+  const p = props();
+  render(
+    <Conversation
+      {...p}
+      session={{ ...session("a"), status: "running" }}
+      events={[]}
+    />,
+  );
+  const input = screen.getByRole("textbox", { name: "任务输入" });
+  fireEvent.change(input, { target: { value: "Next task" } });
+  fireEvent.click(await screen.findByRole("button", { name: "加入队列" }));
+  await waitFor(() =>
+    expect(p.send).toHaveBeenCalledWith(
+      "Next task",
+      null,
+      null,
+      null,
+      undefined,
+    ),
+  );
+  expect(p.cancel).not.toHaveBeenCalled();
+});
+
+it("takes a queued message into the composer, retains existing draft and references, and resubmits it as a new queued message", async () => {
+  const p = props();
+  const old = { name: "existing.txt", path: "existing.txt", directory: false };
+  const added = {
+    name: "input.pdf",
+    path: "/host/input.pdf",
+    directory: false,
+  };
+  const entry = {
+    request_id: "queued",
+    text: referencePrompt("Queued instruction", [added]),
+    model: null,
+    effort: null,
+    permission_mode: null,
+    revision: 0,
+    created_at: 1,
+  };
+  let pending = [entry];
+  mocks.request.mockImplementation(async (_, command) => {
+    if (command.method === "message_queue")
+      return {
+        kind: "message_queue",
+        entries: pending,
+        paused: false,
+        reason: null,
+      };
+    if (command.method === "take_queued_message") {
+      pending = [];
+      return { kind: "queued_message_taken", entry };
+    }
+    return { kind: "files", entries: [] };
+  });
+  const key = JSON.stringify(["local", "s"]);
+  p.drafts.update(key, {
+    text: "Existing draft",
+    references: { scope: "local:p:claude", entries: [old] },
+  });
+  render(
+    <Conversation {...p} session={{ ...session("s"), status: "running" }} />,
+  );
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "排队消息更多操作：Queued instruction",
+    }),
+  );
+  fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
+  await waitFor(() =>
+    expect(input().value).toBe("Existing draft\n\nQueued instruction"),
+  );
+  expect(document.activeElement).toBe(input());
+  expect(p.drafts.get(key).references.entries.map((e) => e.path)).toEqual([
+    "existing.txt",
+    "/host/input.pdf",
+  ]);
+  expect(p.send).not.toHaveBeenCalled();
+  await act(async () =>
+    fireEvent.click(screen.getByRole("button", { name: "加入队列" })),
+  );
+  expect(p.send).toHaveBeenCalledWith(
+    referencePrompt("Existing draft\n\nQueued instruction", [old, added]),
+    null,
+    null,
+    null,
+    undefined,
+  );
 });

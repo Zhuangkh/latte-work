@@ -68,9 +68,13 @@ export function removeBrowserVisit(id: string) {
 export function clearBrowserHistory() {
   save([]);
 }
-export function useBrowserHistory(report: (error: unknown) => void) {
+export function useBrowserHistory(
+  report: (error: unknown) => void,
+  active = true,
+) {
   const [items, setItems] = useState<BrowserVisit[]>([]);
   useEffect(() => {
+    if (!active) return;
     const reload = () => {
       try {
         setItems(readBrowserHistory());
@@ -88,6 +92,6 @@ export function useBrowserHistory(report: (error: unknown) => void) {
       window.removeEventListener(changed, reload);
       window.removeEventListener("storage", storage);
     };
-  }, [report]);
+  }, [report, active]);
   return items;
 }

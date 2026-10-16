@@ -4,6 +4,7 @@ import type { Event } from "./protocol";
 import { LIVE_POLL_MS, usePollingSnapshot } from "./usePollingSnapshot";
 const empty = {
   events: [] as Event[],
+  prompt: null as string | null,
   incomplete: false,
   readingMore: false,
   page: 0,
@@ -64,6 +65,7 @@ export function useSubagentTranscript(
       for (const event of response.events) cache.events.set(event.seq, event);
       return {
         events: [...cache.events.values()].sort((a, b) => a.seq - b.seq),
+        prompt: response.prompt ?? null,
         incomplete: response.incomplete,
         readingMore: response.has_more || response.source_has_more,
         page: ++cache.page,

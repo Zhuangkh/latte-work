@@ -44,6 +44,7 @@ import { AttachmentImage } from "./AttachmentImage";
 import { referenceKind } from "./referenceMessage";
 
 interface Props {
+  focusRequest?: number;
   referenceState?: { scope: string; entries: ComposerReference[] };
   onReferencesChange?: (value: {
     scope: string;
@@ -94,6 +95,9 @@ export function Composer(props: Props) {
   } = props;
   const root = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (props.focusRequest && !props.hidden) input.current?.focus();
+  }, [props.focusRequest, props.hidden]);
   useLayoutEffect(() => {
     const element = input.current;
     if (!element || hidden) return;

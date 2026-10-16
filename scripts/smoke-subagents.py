@@ -182,6 +182,7 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
         result, tasks = poll_until(lambda result, tasks: result['session']['status'] == 'completed' and len(tasks) == 1 and tasks[0]['status'] == 'completed')
         assert 'CHILD_FOREGROUND_OK' in tasks[0]['summary'], tasks
         assert tasks[0]['last_tool'] == 'Read', tasks
+        assert tasks[0].get('agent_type') == 'general-purpose', tasks
         assert not any(e['event']['kind'] == 'tool' and e['event']['name'] == 'Read' for e in result['events']), 'child tools leaked into the main transcript'
         assert not any(e['event']['kind'] == 'text' and 'CHILD_FOREGROUND_OK' in e['event']['text'] for e in result['events']), 'child text leaked into the main transcript'
         assert any(r['child'] for r in requests), requests
@@ -192,7 +193,7 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
         assert any(e['kind'] == 'tool_result' for e in child_events), child_events
         assert any(e['kind'] == 'text' and 'CHILD_PROCESS_PROGRESS' in e['text'] for e in child_events), child_events
         assert not any(e['event']['kind'] == 'text' and 'CHILD_PROCESS_PROGRESS' in e['event']['text'] for e in result['events']), result
-        print(json.dumps({'foreground_native_agent': True, 'child_tool_isolated': True}), flush=True)
+        print(json.dumps({'foreground_native_agent': True, 'child_tool_isolated': True, 'native_agent_type': tasks[0]['agent_type']}), flush=True)
         print(json.dumps({'native_child_process': True, 'child_events': len(child_events)}), flush=True)
 
         rpc({'method': 'send', 'session_id': sid, 'request_id': 'background', 'text': 'LW_PARENT_BACKGROUND', 'model': None, 'effort': None, 'permission_mode': permission_mode})
@@ -203,6 +204,7 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
         rpc({'method': 'hello', 'version': 1})
         restored = rpc({'method': 'subagents', 'session_id': sid})['tasks']
         assert any(t['status'] == 'running' for t in restored), restored
+        assert all(t.get('agent_type') == 'general-purpose' for t in restored), restored
         print(json.dumps({'background_after_parent_result': True, 'reconnect_snapshot': True}), flush=True)
         if args.pause_for_ui:
             print(json.dumps({'ui_root': str(root), 'release_file': str(root / 'release'), 'finish_file': str(root / 'finish')}), flush=True)
@@ -216,6 +218,7 @@ with tempfile.TemporaryDirectory(prefix='lw-sa-', dir='/tmp') as directory:
         background_task = next(t for t in tasks if t['title'] == 'Native background child')
         assert 'CHILD_BACKGROUND_OK' in background_task['summary'], tasks
         assert background_task['native_id'] != 'tool:call_parent_background', tasks
+        assert background_task.get('agent_type') == 'general-purpose', tasks
         background_process = rpc({'method': 'subagent_transcript', 'session_id': sid, 'task_id': background_task['id']})
         assert any(e['event']['kind'] == 'text' and 'CHILD_PROCESS_PROGRESS' in e['event']['text'] for e in background_process['events']), background_process
         print(json.dumps({'background_terminal_notification': True, 'task_ids_merged': True}), flush=True)

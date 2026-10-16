@@ -1,14 +1,131 @@
-//! Claude SDK session metadata: bounded head/tail reads and append-only offline rename.
+//! Claude session metadata: bounded incremental reads and append-only offline rename.
 //! Matches the official SDK customTitle > aiTitle > summary ordering. No transcript rewrite.
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
-    fs::OpenOptions,
+    collections::HashMap,
+    fs::{Metadata, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::Instant,
 };
 const WINDOW: u64 = 64 * 1024;
+const SCAN_BUDGET: u64 = 4 * 1024 * 1024;
+const INDEX_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct Titles {
+    custom: Option<String>,
+    generated: Option<String>,
+    summary: Option<String>,
+}
+impl Titles {
+    fn record(&mut self, line: &[u8]) {
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+        // Only native metadata records may name the parent session. User messages
+        // and tool payloads can contain identically named fields.
+        let slot = match value.get("type").and_then(Value::as_str) {
+            Some("custom-title") => (&mut self.custom, "customTitle"),
+            Some("ai-title") => (&mut self.generated, "aiTitle"),
+            Some("summary") => (&mut self.summary, "summary"),
+            _ => return,
+        };
+        if let Some(text) = value
+            .get(slot.1)
+            .and_then(Value::as_str)
+            .filter(|s| valid_title(s))
+        {
+            *slot.0 = Some(text.trim().to_owned());
+        }
+    }
+    fn title(&self) -> Option<Title> {
+        self.custom
+            .as_ref()
+            .map(|text| Title {
+                text: text.clone(),
+                custom: true,
+            })
+            .or_else(|| {
+                self.generated
+                    .as_ref()
+                    .or(self.summary.as_ref())
+                    .map(|text| Title {
+                        text: text.clone(),
+                        custom: false,
+                    })
+            })
+    }
+}
+struct TitleIndex {
+    identity: (u64, u64),
+    size: u64,
+    modified: (i64, i64),
+    offset: u64,
+    line: Vec<u8>,
+    oversized: bool,
+    titles: Titles,
+    touched: Instant,
+}
+impl TitleIndex {
+    fn new(meta: &Metadata) -> Self {
+        Self {
+            identity: (meta.dev(), meta.ino()),
+            size: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            offset: 0,
+            line: Vec::new(),
+            oversized: false,
+            titles: Titles::default(),
+            touched: Instant::now(),
+        }
+    }
+    fn read(&mut self, file: &mut std::fs::File, meta: &Metadata) -> Result<Option<Title>> {
+        if self.identity != (meta.dev(), meta.ino())
+            || meta.len() < self.size
+            || (meta.len() == self.size && self.modified != (meta.mtime(), meta.mtime_nsec()))
+        {
+            *self = Self::new(meta);
+        }
+        self.size = meta.len();
+        self.modified = (meta.mtime(), meta.mtime_nsec());
+        self.touched = Instant::now();
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::new();
+        file.take(SCAN_BUDGET.min(self.size - self.offset))
+            .read_to_end(&mut bytes)?;
+        for part in bytes.split_inclusive(|b| *b == b'\n') {
+            if !self.oversized && self.line.len() + part.len() <= WINDOW as usize {
+                self.line.extend_from_slice(part);
+            } else {
+                self.line.clear();
+                self.oversized = true;
+            }
+            if part.ends_with(b"\n") {
+                if !self.oversized {
+                    self.titles.record(&self.line);
+                }
+                self.line.clear();
+                self.oversized = false;
+            }
+        }
+        self.offset += bytes.len() as u64;
+        // A partial scan must never roll a confirmed name back to an older record.
+        // Subsequent metadata reads continue from this offset, not from the head.
+        Ok(
+            (self.offset == self.size && self.line.is_empty() && !self.oversized)
+                .then(|| self.titles.title())
+                .flatten(),
+        )
+    }
+}
+fn indexes() -> &'static Mutex<HashMap<PathBuf, TitleIndex>> {
+    static INDEXES: OnceLock<Mutex<HashMap<PathBuf, TitleIndex>>> = OnceLock::new();
+    INDEXES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 #[derive(Clone)]
 pub struct Title {
     pub text: String,
@@ -83,42 +200,55 @@ fn read_path(path: &Path) -> Result<Option<Title>> {
     if !metadata.is_file() {
         bail!("Claude 会话不是普通文件");
     }
-    let size = metadata.len();
-    let mut bytes = Vec::new();
-    (&mut file).take(WINDOW).read_to_end(&mut bytes)?;
-    if size > WINDOW {
-        file.seek(SeekFrom::Start(size.saturating_sub(WINDOW)))?;
-        bytes.push(b'\n');
-        (&mut file).take(WINDOW).read_to_end(&mut bytes)?;
+    let mut indexes = indexes()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("原生标题索引锁异常"))?;
+    if !indexes.contains_key(path)
+        && indexes.len() >= INDEX_LIMIT
+        && let Some(oldest) = indexes
+            .iter()
+            .filter(|(_, entry)| entry.offset == entry.size)
+            .min_by_key(|(_, entry)| entry.touched)
+            .map(|(key, _)| key.clone())
+    {
+        indexes.remove(&oldest);
     }
-    let mut custom = None;
-    let mut generated = None;
-    let mut summary = None;
-    for line in bytes.split(|b| *b == b'\n') {
-        let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            continue;
-        };
-        for (field, slot) in [
-            ("customTitle", &mut custom),
-            ("aiTitle", &mut generated),
-            ("summary", &mut summary),
-        ] {
-            if let Some(text) = value
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|text| valid_title(text))
-            {
-                *slot = Some(text.trim().to_owned());
-            }
-        }
+    if !indexes.contains_key(path) && indexes.len() >= INDEX_LIMIT {
+        // Finish active scans before admitting more files; otherwise a long list
+        // could repeatedly evict every unfinished scan before it reaches its end.
+        return Ok(None);
     }
-    Ok(custom.map(|text| Title { text, custom: true }).or_else(|| {
-        generated.or(summary).map(|text| Title {
-            text,
-            custom: false,
-        })
-    }))
+    indexes
+        .entry(path.to_owned())
+        .or_insert_with(|| TitleIndex::new(&metadata))
+        .read(&mut file, &metadata)
 }
+/// Offline rename always verifies the latest bounded tail, even if a large file's
+/// incremental index has not caught up yet. Partial tail records are ignored.
+fn read_tail(path: &Path) -> Result<Option<Title>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("Claude 会话不是普通文件");
+    }
+    let start = metadata.len().saturating_sub(WINDOW);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(WINDOW).read_to_end(&mut bytes)?;
+    let mut records = bytes.split_inclusive(|b| *b == b'\n');
+    if start != 0 {
+        records.next();
+    }
+    let mut titles = Titles::default();
+    for line in records.filter(|line| line.ends_with(b"\n")) {
+        titles.record(line);
+    }
+    Ok(titles.title())
+}
+
 pub fn read(cwd: &Path, id: &str) -> Result<Option<Title>> {
     let Some(path) = locate_in(&projects()?, cwd, id)? else {
         return Ok(None);
@@ -276,7 +406,7 @@ fn read_child_page_path(
 pub fn rename(cwd: &Path, id: &str, title: &str) -> Result<String> {
     let path = locate_in(&projects()?, cwd, id)?.context("未找到原生会话，标题未修改")?;
     append(&path, id, title)?;
-    let actual = read_path(&path)?.context("原生标题写入后未能确认")?;
+    let actual = read_tail(&path)?.context("原生标题写入后未能确认")?;
     if !actual.custom || actual.text != title.trim() {
         bail!("原生标题写入后发生变化，请核对后重试");
     }
@@ -292,6 +422,7 @@ fn append(path: &Path, id: &str, title: &str) -> Result<()> {
     }
     let mut file = OpenOptions::new()
         .append(true)
+        .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)?;
     let meta = file.metadata()?;
@@ -302,6 +433,12 @@ fn append(path: &Path, id: &str, title: &str) -> Result<()> {
         || path.canonicalize()? != path
     {
         bail!("原生会话文件不可用，标题未修改");
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    if last != *b"\n" {
+        bail!("原生会话记录尚未写入完整，标题未修改");
     }
     // Same append-only mutation as SDK rename_session; never create a missing session.
     let mut record = serde_json::to_vec(
@@ -436,6 +573,84 @@ mod tests {
         assert!(append(&dir.path().join("missing.jsonl"), "id", "No fake session").is_err());
     }
     #[test]
+    fn titles_in_the_middle_survive_transcript_growth_and_ignore_payload_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("session.jsonl");
+        let padding = format!(
+            "{{\"type\":\"assistant\",\"text\":\"{}\"}}\n",
+            "x".repeat(2048)
+        )
+        .repeat(40);
+        std::fs::write(
+            &path,
+            format!("{padding}{{\"type\":\"ai-title\",\"aiTitle\":\"AI name\"}}\n{padding}"),
+        )
+        .unwrap();
+        assert_eq!(read_path(&path).unwrap().unwrap().text, "AI name");
+        append(&path, "id", "Native name").unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(padding.as_bytes()).unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"user\",\"customTitle\":\"Not metadata\"}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"ai-title\",\"aiTitle\":\"Later AI name\"}}"
+        )
+        .unwrap();
+        let title = read_path(&path).unwrap().unwrap();
+        assert_eq!(title.text, "Native name");
+        assert!(title.custom);
+    }
+    #[test]
+    fn large_title_scans_resume_without_exposing_stale_names_and_retry_partial_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("session.jsonl");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"custom-title\",\"customTitle\":\"Old name\"}}"
+        )
+        .unwrap();
+        // An oversized transcript record crosses the scan boundary and must not
+        // consume unbounded memory or prevent subsequent metadata from being read.
+        file.write_all(&vec![b'x'; SCAN_BUDGET as usize]).unwrap();
+        writeln!(
+            file,
+            "\n{{\"type\":\"custom-title\",\"customTitle\":\"Latest name\"}}"
+        )
+        .unwrap();
+        assert!(read_path(&path).unwrap().is_none());
+        // Offline verification must also work before the index catches up.
+        append(&path, "id", "Offline latest").unwrap();
+        assert_eq!(read_tail(&path).unwrap().unwrap().text, "Offline latest");
+        assert_eq!(read_path(&path).unwrap().unwrap().text, "Offline latest");
+        file.write_all(b"{\"type\":\"custom-title\",\"customTitle\":\"Partial")
+            .unwrap();
+        assert!(read_path(&path).unwrap().is_none());
+        assert!(append(&path, "id", "Rejected").is_err());
+        file.write_all(b" name\"}\n").unwrap();
+        assert_eq!(read_path(&path).unwrap().unwrap().text, "Partial name");
+        std::fs::write(&path, "{\"type\":\"ai-title\",\"aiTitle\":\"Replaced\"}\n").unwrap();
+        let title = read_path(&path).unwrap().unwrap();
+        assert_eq!(title.text, "Replaced");
+        assert!(!title.custom);
+        let replacement = path.with_extension("new");
+        std::fs::write(
+            &replacement,
+            "{\"type\":\"custom-title\",\"customTitle\":\"New inode\"}\n",
+        )
+        .unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(read_path(&path).unwrap().unwrap().text, "New inode");
+    }
+    #[test]
     fn session_paths_reject_invalid_ids_symlinks_and_keep_reads_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("project");
@@ -460,7 +675,7 @@ mod tests {
         assert!(read_path(&folder.join(format!("{id}.jsonl"))).is_err());
         let large = dir.path().join("large.jsonl");
         let mut data = vec![b'x'; (WINDOW * 3) as usize];
-        data.extend(b"\n{\"aiTitle\":\"Tail title\"}\n");
+        data.extend(b"\n{\"type\":\"ai-title\",\"aiTitle\":\"Tail title\"}\n");
         std::fs::write(&large, data).unwrap();
         assert_eq!(read_path(&large).unwrap().unwrap().text, "Tail title");
     }

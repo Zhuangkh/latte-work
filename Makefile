@@ -7,7 +7,7 @@ SCCACHE := $(shell command -v sccache 2>/dev/null)
 ifneq ($(SCCACHE),)
 export RUSTC_WRAPPER ?= $(SCCACHE)
 endif
-.PHONY: help setup fmt fmt-check lint test test-unit test-e2e test-doc web-build types ci build dev package server clean cache-info
+.PHONY: help setup fmt fmt-check lint test test-unit test-e2e test-doc test-native web-build types ci build dev package server clean cache-info
 help: ## Show developer commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 setup: ## Install frontend dependencies, respecting lockfile
@@ -32,7 +32,13 @@ test-e2e: ## Final server binary, socket bridge, and deterministic Claude fixtur
 	cargo test -p latte-work-server --test e2e --locked -- --test-threads=1
 test-doc: ## Rust documentation tests
 	cargo test --workspace --exclude latte-work-desktop --doc --locked
-test: test-unit test-e2e test-doc ## Run every test layer
+test-native: ## macOS WebKit site-data boundaries and localhost favicon transport
+	python3 scripts/test-site-data.py
+	python3 scripts/test-site-icons.py
+test: test-unit test-e2e test-doc ## Run every supported test layer (including native on macOS)
+ifeq ($(shell uname -s),Darwin)
+test: test-native
+endif
 web-build: ## Typecheck and bundle React
 	npm run web-build
 ci: fmt-check types-check lint-ci lint test web-build ## Full local gate

@@ -3,6 +3,7 @@ mod adapter;
 mod claude;
 mod claude_models;
 mod claude_sessions;
+mod claude_skills;
 pub use adapter::{Action, AgentAdapter, AgentCommand, Input};
 use anyhow::{Result, bail};
 pub type ChildTranscript = (Vec<latte_work_protocol::Event>, bool);
@@ -148,6 +149,33 @@ pub fn model_labels(
         "claude" => claude_models::labels(project),
         _ => std::collections::BTreeMap::new(),
     }
+}
+
+/// Inspect known native skill locations. This never starts an Agent or grants file access.
+pub async fn skill_info(
+    agent: &str,
+    project: std::path::PathBuf,
+    name: String,
+) -> Result<Option<latte_work_protocol::SkillInfo>> {
+    if agent != "claude" {
+        bail!("此 Agent 尚不支持 Skill 信息");
+    }
+    static READS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = READS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("Skill 信息正在读取，请稍后重试"))?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            claude_skills::find(&project, &name)
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("读取 Skill 信息超时"))??
 }
 
 pub use claude_sessions::Title as NativeTitle;

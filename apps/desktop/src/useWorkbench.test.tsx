@@ -150,7 +150,8 @@ it("creates a new conversation on the first startup submission instead of sendin
   mocks.request.mockImplementation(async (host: string, r: Request) => {
     if (r.method === "create_session")
       return { kind: "session", session: created };
-    if (r.method === "send") return { kind: "ok" };
+    if (r.method === "send_queued")
+      return { kind: "accepted", duplicate: false };
     if (r.method === "poll" && r.session_id === created.id)
       return {
         kind: "events",
@@ -170,7 +171,9 @@ it("creates a new conversation on the first startup submission instead of sendin
   expect(
     mocks.request.mock.calls.filter(([, r]) => r.method === "create_session"),
   ).toHaveLength(1);
-  const sends = mocks.request.mock.calls.filter(([, r]) => r.method === "send");
+  const sends = mocks.request.mock.calls.filter(
+    ([, r]) => r.method === "send_queued",
+  );
   expect(sends).toHaveLength(1);
   expect(sends[0][1]).toMatchObject({
     session_id: created.id,
@@ -231,9 +234,9 @@ it("waits for the handshake before reading cached pinned history and reporting c
   expect(
     mocks.request.mock.calls.some(([, r]) => r.method === "pinned_sessions"),
   ).toBe(true);
-  expect(mocks.request.mock.calls.some(([, r]) => r.method === "send")).toBe(
-    false,
-  );
+  expect(
+    mocks.request.mock.calls.some(([, r]) => r.method === "send_queued"),
+  ).toBe(false);
 });
 it("adding a host initializes it once and preserves other hosts' live connections", async () => {
   const hook = renderHook(useWorkbench);
@@ -377,7 +380,7 @@ it("marks a new unsaved task disconnected after metadata transport failure and r
   expect(hook.result.current.connected).toBe(true);
   expect(hook.result.current.sessionId).toBe("");
   expect(
-    mocks.request.mock.calls.filter(([, r]) => r.method === "send"),
+    mocks.request.mock.calls.filter(([, r]) => r.method === "send_queued"),
   ).toHaveLength(0);
 });
 it("a background host's failure does not disconnect the selected host", async () => {
@@ -421,9 +424,9 @@ it("automatically recovers a background host without reconnecting the selected h
   expect(
     mocks.connect.mock.calls.filter(([h]) => h.id === "local"),
   ).toHaveLength(1);
-  expect(mocks.request.mock.calls.some(([, r]) => r.method === "send")).toBe(
-    false,
-  );
+  expect(
+    mocks.request.mock.calls.some(([, r]) => r.method === "send_queued"),
+  ).toBe(false);
 });
 it("does not reuse a failed replacement and restores the connection indicator without replaying a prompt", async () => {
   const hook = renderHook(useWorkbench);
@@ -440,9 +443,9 @@ it("does not reuse a failed replacement and restores the connection indicator wi
   expect(hook.result.current.connected).toBe(true);
   expect(hook.result.current.hostConnectionVersions.local).toBe(2);
   expect(mocks.connect).toHaveBeenCalledTimes(3);
-  expect(mocks.request.mock.calls.some(([, r]) => r.method === "send")).toBe(
-    false,
-  );
+  expect(
+    mocks.request.mock.calls.some(([, r]) => r.method === "send_queued"),
+  ).toBe(false);
 });
 it("retains history and an ambiguous send request ID without automatically replaying the message", async () => {
   const base = mocks.request.getMockImplementation()!;
@@ -460,7 +463,7 @@ it("retains history and an ambiguous send request ID without automatically repla
           },
         ],
       };
-    if (r.method !== "send") return base(host, r);
+    if (r.method !== "send_queued") return base(host, r);
     if (failSend) {
       const failure = new HostConnectionError(host, "发送响应丢失");
       window.dispatchEvent(
@@ -468,7 +471,7 @@ it("retains history and an ambiguous send request ID without automatically repla
       );
       throw failure;
     }
-    return { kind: "ok" };
+    return { kind: "message_queued", duplicate: true };
   });
   const hook = renderHook(useWorkbench);
   await act(async () => {});
@@ -488,7 +491,7 @@ it("retains history and an ambiguous send request ID without automatically repla
     await vi.advanceTimersByTimeAsync(5000);
   });
   const sends = () =>
-    mocks.request.mock.calls.filter(([, r]) => r.method === "send");
+    mocks.request.mock.calls.filter(([, r]) => r.method === "send_queued");
   expect(sends()).toHaveLength(1);
   failSend = false;
   await act(async () => {
@@ -498,6 +501,9 @@ it("retains history and an ambiguous send request ID without automatically repla
   });
   expect(sends()).toHaveLength(2);
   expect(sends()[1][1].request_id).toBe(sends()[0][1].request_id);
+  expect(hook.result.current.admissionNotice).toContain("此前已被接收");
+  act(() => hook.result.current.dismissAdmissionNotice());
+  expect(hook.result.current.admissionNotice).toBeUndefined();
 });
 
 it("opens selected Agent sessions and closes explicitly without reopening on refresh", async () => {
@@ -614,9 +620,9 @@ it("distinguishes first open, recovery, and switching to a live session", async 
       ([, r]) => r.method === "open_agent_session" && r.session_id === "s",
     ),
   ).toHaveLength(2);
-  expect(mocks.request.mock.calls.some(([, r]) => r.method === "send")).toBe(
-    false,
-  );
+  expect(
+    mocks.request.mock.calls.some(([, r]) => r.method === "send_queued"),
+  ).toBe(false);
 });
 
 it.each(["local", "remote"])(
@@ -721,9 +727,9 @@ it.each(["local", "remote"])(
     );
     await act(async () => result.current.setRetry((value) => value + 1));
     expect(mocks.connect.mock.calls.length).toBeGreaterThan(connections);
-    expect(mocks.request.mock.calls.some(([, r]) => r.method === "send")).toBe(
-      false,
-    );
+    expect(
+      mocks.request.mock.calls.some(([, r]) => r.method === "send_queued"),
+    ).toBe(false);
   },
 );
 
@@ -1157,5 +1163,124 @@ it.each(["/model", "/effort high"])(
     expect(hook.result.current.sessionId).toBe("");
     expect(hook.result.current.error).toContain("模型菜单");
     expect(mocks.request).not.toHaveBeenCalled();
+  },
+);
+
+it("retains project ordering after host refresh and a new workbench mount", async () => {
+  const projects = [
+    { id: "p", name: "P", path: "/p" },
+    { id: "second", name: "Second", path: "/second" },
+  ];
+  const original = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation((host, r) =>
+    r.method === "projects"
+      ? Promise.resolve({ kind: "projects", projects })
+      : original(host, r),
+  );
+  const first = renderHook(useWorkbench);
+  await act(async () => {});
+  const ids = () => first.result.current.projects.map((p) => p.id);
+  expect(ids()).toEqual(["p", "second"]);
+  const selectedProject = first.result.current.projectId;
+  act(() =>
+    first.result.current.moveProject(
+      JSON.stringify(["local", "second"]),
+      JSON.stringify(["local", "p"]),
+      false,
+    ),
+  );
+  expect(ids()).toEqual(["second", "p"]);
+  expect(first.result.current.projectId).toBe(selectedProject);
+  await act(async () =>
+    first.result.current.refreshHost(first.result.current.host),
+  );
+  expect(ids()).toEqual(["second", "p"]);
+  first.unmount();
+  const next = renderHook(useWorkbench);
+  await act(async () => {});
+  expect(next.result.current.projects.map((p) => p.id)).toEqual([
+    "second",
+    "p",
+  ]);
+});
+
+it("keeps the known lifecycle when reconciling a previously accepted request", async () => {
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) =>
+    r.method === "send_queued"
+      ? { kind: "accepted", duplicate: true }
+      : base(host, r),
+  );
+  const hook = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    hook.result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  const before = hook.result.current.session?.status;
+  await act(async () => {
+    expect(await hook.result.current.send("reconcile", null, null, null)).toBe(
+      true,
+    );
+  });
+  expect(hook.result.current.session?.status).toBe(before);
+  expect(hook.result.current.admissionNotice).toContain("没有重复发送");
+});
+
+it.each([false, true])(
+  "cleans archived session state only after confirmed close (failure=%s)",
+  async (fails) => {
+    const base = mocks.request.getMockImplementation()!;
+    let finish!: (value: unknown) => void;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "open_agent_session")
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      if (r.method === "archive_session") {
+        if (fails) throw new Error("native close failed");
+        return {
+          kind: "session",
+          session: { ...session(), archived: true, agent_session_open: false },
+        };
+      }
+      return base(host, r);
+    });
+    const hook = renderHook(useWorkbench);
+    await act(async () => {});
+    await act(async () =>
+      hook.result.current.openSession({ ...session(), hostId: "local" }),
+    );
+    expect(finish).toBeTypeOf("function");
+    await act(async () => {
+      const archive = hook.result.current.sessionAction("local", {
+        method: "archive_session",
+        session_id: "s",
+        archived: true,
+      });
+      if (fails) await expect(archive).rejects.toThrow("native close failed");
+      else await archive;
+    });
+    expect(hook.result.current.sessionId).toBe(fails ? "s" : "");
+    await act(async () => finish({ kind: "ok" }));
+    expect(
+      hook.result.current.sessions.find((s) => s.id === "s")?.archived,
+    ).toBe(!fails);
+    if (!fails) {
+      expect(
+        hook.result.current.agentSessionTransitions[
+          JSON.stringify(["local", "s"])
+        ],
+      ).toBeUndefined();
+      expect(
+        mocks.request.mock.calls.some(
+          ([, r]) => r.method === "poll" && r.after === Number.MAX_SAFE_INTEGER,
+        ),
+      ).toBe(false);
+      expect(
+        mocks.request.mock.calls.some(
+          ([, r]) => r.method === "close_agent_session",
+        ),
+      ).toBe(false);
+    }
   },
 );

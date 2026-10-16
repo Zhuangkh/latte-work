@@ -119,7 +119,7 @@ export function conversationMarkdown(title: string, events: Event[]): string {
     `# ${title}\n\n` +
     transcript(events)
       .flatMap((item) =>
-        item.type === "user" || item.type === "assistant"
+        (item.type === "user" && !item.hidden) || item.type === "assistant"
           ? [`## ${item.type === "user" ? "用户" : "助手"}\n\n${item.text}`]
           : [],
       )

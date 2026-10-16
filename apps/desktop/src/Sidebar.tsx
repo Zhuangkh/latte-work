@@ -1,4 +1,7 @@
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+import { useProjectReorder } from "./useProjectReorder";
+import { projectOrderKey } from "./projectOrder";
 import {
   Plus,
   Folder,
@@ -19,6 +22,7 @@ import {
 } from "lucide-react";
 import { WorkingStatus } from "./WorkingStatus";
 import { SessionHoverCard, ProjectHoverCard } from "./SidebarHoverCard";
+import { SessionTitle } from "./SessionTitle";
 import { agentSessionLabels, agentSessionState } from "./agentSessionState";
 import { useHistoryLoadingIndicator } from "./useHistoryLoadingIndicator";
 import { SessionActions } from "./SessionActions";
@@ -64,11 +68,6 @@ export function Sidebar({
     project: HostedProject;
     point: { x: number; y: number };
   } | null>(null);
-  const interactionActive = !!sessionContext || !!context;
-  useEffect(() => {
-    onInteractionChange?.(interactionActive);
-    return () => onInteractionChange?.(false);
-  }, [interactionActive, onInteractionChange]);
   useEffect(() => {
     if (!visible) {
       setSessionContext(null);
@@ -150,6 +149,22 @@ export function Sidebar({
     sessionId,
     setModal,
   } = state;
+  const reorder = useProjectReorder({
+    projects,
+    enabled: visible && sections.projects && !state.modal,
+    onMove: state.moveProject,
+  });
+  const interactionActive = !!sessionContext || !!context || !!reorder.drag;
+  useEffect(() => {
+    onInteractionChange?.(interactionActive);
+    return () => onInteractionChange?.(false);
+  }, [interactionActive, onInteractionChange]);
+  useEffect(() => {
+    if (reorder.drag) {
+      setSessionContext(null);
+      setContext(null);
+    }
+  }, [!!reorder.drag]);
   const connectionStatus = (id: string) =>
     state.hostConnectionStatus?.(id) ??
     (hostErrors[id]
@@ -390,7 +405,7 @@ export function Sidebar({
           }}
         >
           <span className="session-label">
-            {s.title}
+            <SessionTitle title={s.title} />
             {duplicateTitle && (
               <small>
                 {sourceProject?.name} · {sourceHost?.name}
@@ -602,6 +617,9 @@ export function Sidebar({
         <div
           id="sidebar-projects"
           className="project-list"
+          ref={reorder.list}
+          onClickCapture={reorder.click}
+          data-reordering={!!reorder.drag}
           hidden={!sections.projects}
         >
           {projects.map((p) => {
@@ -678,7 +696,15 @@ export function Sidebar({
               setContext({ project: p, point });
             };
             return (
-              <div className="project-group" key={key}>
+              <div
+                className="project-group"
+                key={key}
+                data-project-key={projectOrderKey(p)}
+                data-dragging={
+                  reorder.drag?.project.hostId === p.hostId &&
+                  reorder.drag.project.id === p.id
+                }
+              >
                 <div
                   className={`project-heading ${selected ? "selected" : ""} ${empty ? "empty" : ""}`}
                   data-menu-open={
@@ -711,6 +737,7 @@ export function Sidebar({
                   }}
                 >
                   <ProjectHoverCard
+                    disabled={!!reorder.drag}
                     title={p.name}
                     path={p.path}
                     host={projectHost}
@@ -719,11 +746,14 @@ export function Sidebar({
                   >
                     <button
                       className="project-row"
+                      onPointerDown={(event) => reorder.start(event, p)}
+                      onKeyDown={(event) => reorder.keyboard(event, p)}
+                      aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
                       onClick={toggle}
                       aria-label={p.name}
                       aria-expanded={expanded}
                       aria-controls={`sessions-${key}`}
-                      aria-description={`${p.path} · ${projectHost}${p.hostId !== "local" ? ` · ${connectionLabel}` : ""}`}
+                      aria-description={`${p.path} · ${projectHost}${p.hostId !== "local" ? ` · ${connectionLabel}` : ""} · 拖动调整顺序，或按 Option + 上下方向键`}
                     >
                       <span className="project-folder">
                         {p.hostId !== "local" ? (
@@ -861,6 +891,9 @@ export function Sidebar({
             </div>
           )}
         </div>
+        <span className="visually-hidden" role="status">
+          {reorder.announcement}
+        </span>
         <section className="recent-section" aria-label="最近对话">
           <div className="section-heading">
             {sectionToggle("recent", "最近")}
@@ -908,6 +941,42 @@ export function Sidebar({
           设置
         </button>
       </div>
+      {reorder.drag &&
+        createPortal(
+          <>
+            {reorder.drag.target && (
+              <div
+                className="project-drop-indicator"
+                aria-hidden="true"
+                style={{
+                  left: reorder.drag.target.left,
+                  top: reorder.drag.target.top,
+                  width: reorder.drag.target.width,
+                }}
+              />
+            )}
+            <div
+              className="project-drag-preview"
+              aria-hidden="true"
+              style={{
+                left: reorder.drag.x,
+                top: reorder.drag.y,
+                width: reorder.drag.width,
+              }}
+            >
+              {reorder.drag.project.hostId === "local" ? (
+                <FolderOpen size={16} />
+              ) : (
+                <RemoteProjectIcon
+                  state={connectionStatus(reorder.drag.project.hostId)}
+                  label=""
+                />
+              )}
+              <span>{reorder.drag.project.name}</span>
+            </div>
+          </>,
+          document.body,
+        )}
       {sessionContext && menuSession && (
         <SessionActions
           key={`${sessionContext.session.hostId}:${sessionContext.session.id}`}

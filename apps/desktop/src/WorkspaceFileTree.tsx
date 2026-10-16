@@ -7,6 +7,8 @@ import { useStatusIssues } from "./statusNotices";
 interface TreeProps {
   hostId: string;
   projectId: string;
+  reference?: FileEntry;
+  sessionId?: string;
   file: string;
   directoryPath?: string;
   active: boolean;
@@ -15,7 +17,13 @@ interface TreeProps {
 }
 
 export function WorkspaceFileTree(props: TreeProps) {
-  return <Directory {...props} path="" expanded />;
+  if (props.reference && !props.reference.directory)
+    return (
+      <ul className="file-tree-list">
+        <Entry {...props} entry={props.reference} />
+      </ul>
+    );
+  return <Directory {...props} path={props.reference?.path ?? ""} expanded />;
 }
 
 function Directory({
@@ -23,7 +31,7 @@ function Directory({
   expanded,
   ...props
 }: TreeProps & { path: string; expanded: boolean }) {
-  const { hostId, projectId, active, revision } = props;
+  const { hostId, projectId, active, revision, reference, sessionId } = props;
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -33,9 +41,20 @@ function Directory({
     let disposed = false;
     setLoading(true);
     setError("");
-    void request(hostId, { method: "files", project_id: projectId, path })
+    void request(
+      hostId,
+      reference
+        ? {
+            method: "preview_source",
+            project_id: projectId,
+            session_id: sessionId ?? null,
+            path,
+            offset: 0,
+          }
+        : { method: "files", project_id: projectId, path },
+    )
       .then((response) => {
-        if (response.kind !== "files")
+        if (response.kind !== "files" && response.kind !== "source_directory")
           throw new Error("无法读取项目文件，请检查 Server 版本");
         if (!disposed) setEntries(response.entries);
       })
@@ -48,7 +67,17 @@ function Directory({
     return () => {
       disposed = true;
     };
-  }, [hostId, projectId, path, active, expanded, revision, retry]);
+  }, [
+    hostId,
+    projectId,
+    path,
+    active,
+    expanded,
+    revision,
+    retry,
+    reference,
+    sessionId,
+  ]);
   useStatusIssues([
     {
       id: `file-tree:${hostId}:${projectId}:${path}`,

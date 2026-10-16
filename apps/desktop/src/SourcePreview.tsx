@@ -8,6 +8,7 @@ import {
   previewPdf,
   type SourceData,
 } from "./sourceLoader";
+import { useStatusIssues } from "./statusNotices";
 import type { SourceItem } from "./useTaskSources";
 function usePreview(
   hostId: string,
@@ -131,6 +132,8 @@ export function SourcePreview({
   source,
   active,
   open,
+  embedded = false,
+  wrap = false,
 }: {
   hostId: string;
   projectId: string;
@@ -138,6 +141,8 @@ export function SourcePreview({
   source: SourceItem;
   active: boolean;
   open: (source: SourceItem) => void;
+  embedded?: boolean;
+  wrap?: boolean;
 }) {
   const [revision, refresh] = useState(0);
   const preview = usePreview(
@@ -158,6 +163,19 @@ export function SourcePreview({
     setSystemError("");
   }, [scope]);
   const data = preview.data;
+  useStatusIssues(
+    embedded
+      ? [
+          {
+            id: `reference-file:${hostId}:${projectId}:${source.path}`,
+            title: `${source.name} 未能读取`,
+            error: active ? (preview.error ?? "") : "",
+            pending: active && !data && !preview.error,
+            action: { label: "重试", run: () => refresh((v) => v + 1) },
+          },
+        ]
+      : [],
+  );
   async function nativePreview() {
     setBusy(true);
     setSystemError("");
@@ -198,18 +216,24 @@ export function SourcePreview({
       </div>
     );
   return (
-    <div className="source-preview">
-      <div className="workspace-file-heading">
-        <span>{source.name}</span>
-        <button onClick={() => refresh((v) => v + 1)}>刷新</button>
-      </div>
-      <p className="source-path">{source.path}</p>
-      {preview.error && (
+    <div
+      className={embedded ? "workspace-reference-content" : "source-preview"}
+    >
+      {!embedded && (
+        <>
+          <div className="workspace-file-heading">
+            <span>{source.name}</span>
+            <button onClick={() => refresh((v) => v + 1)}>刷新</button>
+          </div>
+          <p className="source-path">{source.path}</p>
+        </>
+      )}
+      {!embedded && preview.error && (
         <p role="alert" className="notice failure">
           {preview.error}
         </p>
       )}
-      {!data && !preview.error && <p className="muted">正在读取来源…</p>}
+      {!data && !preview.error && <p className="muted">正在读取…</p>}
       {data?.directory ? (
         <div>
           {data.directory.map((entry) => (
@@ -229,9 +253,11 @@ export function SourcePreview({
       ) : (
         data && (
           <>
-            <p className="muted">
-              {data.mime} · {(data.size / 1024).toFixed(1)} KiB
-            </p>
+            {(!embedded || data.mime !== "text/plain") && (
+              <p className="muted">
+                {data.mime} · {(data.size / 1024).toFixed(1)} KiB
+              </p>
+            )}
             {data.mime.startsWith("image/") && preview.url ? (
               <img
                 className="source-image-preview"
@@ -255,16 +281,21 @@ export function SourcePreview({
                 />
               </>
             ) : data.mime === "text/plain" ? (
-              <CodeView content={new TextDecoder().decode(data.bytes)} />
+              <CodeView
+                content={new TextDecoder().decode(data.bytes)}
+                wrap={wrap}
+              />
             ) : (
               <p>此格式可使用系统预览打开。</p>
             )}
-            <button
-              disabled={busy || !active}
-              onClick={() => void nativePreview()}
-            >
-              {busy ? "正在准备预览…" : "系统预览"}
-            </button>
+            {(!embedded || data.mime !== "text/plain") && (
+              <button
+                disabled={busy || !active}
+                onClick={() => void nativePreview()}
+              >
+                {busy ? "正在准备预览…" : "系统预览"}
+              </button>
+            )}
           </>
         )
       )}

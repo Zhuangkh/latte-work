@@ -79,7 +79,9 @@ pub fn tool_source(name: &str) -> Option<TaskSource> {
 }
 pub fn event_sources(event: &EventKind) -> Vec<TaskSource> {
     match event {
-        EventKind::User { text, .. } => references(text),
+        EventKind::User { text, .. } | EventKind::QueuedMessageSent { text, .. } => {
+            references(text)
+        }
         EventKind::Tool { name, .. } => tool_source(name).into_iter().collect(),
         _ => vec![],
     }

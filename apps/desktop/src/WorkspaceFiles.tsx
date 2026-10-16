@@ -1,8 +1,9 @@
 import { useAppClose } from "./appLifecycle";
+import { SourcePreview } from "./SourcePreview";
 import { CodeView } from "./CodeView";
 import { useEffect, useState } from "react";
 import { Folders, RefreshCw, WrapText } from "lucide-react";
-import type { Project } from "./protocol";
+import type { FileEntry, Project } from "./protocol";
 import { request, message } from "./api";
 import { ChangesView } from "./ChangesView";
 import { WorkspaceFileTree } from "./WorkspaceFileTree";
@@ -27,6 +28,8 @@ export function WorkspaceFiles({
   path,
   file,
   navigate,
+  reference,
+  sessionId,
 }: {
   hostId: string;
   project: Project;
@@ -35,6 +38,8 @@ export function WorkspaceFiles({
   path: string;
   file: string;
   navigate: (value: { path?: string; file?: string }) => void;
+  reference?: FileEntry;
+  sessionId?: string;
 }) {
   const [closing, setClosing] = useState(false);
   const active = visible && !closing;
@@ -62,6 +67,12 @@ export function WorkspaceFiles({
   }, [wrap]);
   useEffect(() => {
     if (!active || tab !== "files") return;
+    if (reference) {
+      setLoading(false);
+      setError("");
+      setTruncated(false);
+      return;
+    }
     if (!file) {
       setLoading(false);
       setError("");
@@ -91,12 +102,12 @@ export function WorkspaceFiles({
     return () => {
       disposed = true;
     };
-  }, [hostId, project.id, file, tab, revision, active]);
+  }, [hostId, project.id, file, tab, revision, active, reference]);
   useStatusIssues([
     {
       id: `file:${hostId}:${project.id}:${file || path}`,
       title: `${file || path || project.name} 未能读取`,
-      error: active && tab === "files" && file ? error : "",
+      error: active && tab === "files" && file && !reference ? error : "",
       pending: active && tab === "files" && !!file && loading,
       action: { label: "重试", run: () => refresh((value) => value + 1) },
     },
@@ -108,26 +119,39 @@ export function WorkspaceFiles({
       <div className="workspace-file-header">
         <div
           className="workspace-file-path"
-          title={`${project.path}/${file || path}`}
+          title={
+            reference
+              ? file || reference.path
+              : `${project.path}/${file || path}`
+          }
         >
-          <button
-            className="workspace-file-project"
-            aria-label="返回项目目录"
-            title={project.path}
-            disabled={!file && !path}
-            onClick={() => {
-              navigate({ file: "", path: "" });
-              setTreeOpen(true);
-            }}
-          >
-            {project.name}
-          </button>
-          <span className="workspace-file-path-separator">/</span>
+          {(!reference || reference.directory) && (
+            <>
+              <button
+                className="workspace-file-project"
+                aria-label={reference ? "返回所选目录" : "返回项目目录"}
+                title={reference?.path ?? project.path}
+                disabled={
+                  reference ? !reference.directory || !file : !file && !path
+                }
+                onClick={() => {
+                  navigate({ file: "", path: reference?.path ?? "" });
+                  setTreeOpen(true);
+                }}
+              >
+                {reference?.name ?? project.name}
+              </button>
+              <span className="workspace-file-path-separator">/</span>
+            </>
+          )}
           <span className="workspace-file-location">
-            {file || path || "文件"}
+            {reference
+              ? file.slice(reference.path.length).replace(/^\//, "") ||
+                (file ? reference.name : "文件")
+              : file || path || "文件"}
           </span>
         </div>
-        {file && !loading && !error && truncated && (
+        {file && !reference && !loading && !error && truncated && (
           <span className="workspace-file-truncated">内容已截断</span>
         )}
         <div className="workspace-file-actions">
@@ -168,6 +192,22 @@ export function WorkspaceFiles({
               <strong>打开文件</strong>
               <span>从右侧目录选择文件</span>
             </div>
+          ) : reference ? (
+            <SourcePreview
+              key={`${file}:${revision}`}
+              hostId={hostId}
+              projectId={project.id}
+              sessionId={sessionId}
+              source={{
+                path: file,
+                name: file.split("/").at(-1) || file,
+                directory: false,
+              }}
+              active={active}
+              open={() => {}}
+              embedded
+              wrap={wrap}
+            />
           ) : loading ? (
             <div className="panel-empty" role="status">
               正在读取…
@@ -196,9 +236,11 @@ export function WorkspaceFiles({
           style={{ flexBasis: treeWidth.width }}
         >
           <WorkspaceFileTree
-            key={`${hostId}:${project.id}`}
+            key={`${hostId}:${project.id}:${reference?.path ?? ""}`}
             hostId={hostId}
             projectId={project.id}
+            reference={reference}
+            sessionId={sessionId}
             file={file}
             directoryPath={path}
             active={active && treeOpen}

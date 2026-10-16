@@ -25,6 +25,11 @@ def metadata(value):
 turns=0
 child=None
 background=None
+native_lock=threading.Lock()
+native_pending=[]
+native_head=False
+native_generation=0
+native_mode=False
 resumed=any(arg.startswith('--resume=') for arg in sys.argv)
 for line in sys.stdin:
     value=json.loads(line)
@@ -40,10 +45,20 @@ for line in sys.stdin:
                 emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id']}})
             continue
         if value['request']['subtype']=='interrupt':
+            if native_mode: pathlib.Path('native-interrupt-pending').write_text('received')
+            result_first=os.environ.get('LATTE_FIXTURE_INTERRUPT_RESULT_FIRST')=='1'
+            if result_first: emit({'type':'result','subtype':'success','is_error':False})
+            time.sleep(min(15,float(os.environ.get('LATTE_FIXTURE_INTERRUPT_DELAY','0'))))
+            with native_lock:
+                native_generation+=1
+                native_head=False
+                native_pending.clear()
+            if native_mode:
+                with pathlib.Path('native-interrupts').open('a') as record: record.write('interrupt\n')
             if child is not None:
                 child.terminate();child.wait();child=None
             # Result and control acknowledgement may arrive in either order.
-            emit({'type':'result','subtype':'success','is_error':False})
+            if not result_first: emit({'type':'result','subtype':'success','is_error':False})
             emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id']}})
             continue
         if '--no-session-persistence' not in sys.argv:
@@ -56,10 +71,16 @@ for line in sys.stdin:
         metadata({'type':'user','message':{'content':text},'sessionId':native_id})
         if name: metadata({'type':'custom-title','customTitle':name,'sessionId':native_id})
         emit({'type':'system','subtype':'init','session_id':native_id})
+        if text=='native-generated-title':
+            metadata({'type':'ai-title','aiTitle':'Generated native title','sessionId':native_id})
+            emit({'type':'assistant','message':{'content':[{'type':'text','text':'TITLE_OK'}]}})
+            emit({'type':'result','subtype':'success','is_error':False})
+            continue
         if text in ('native-title', 'native-title-update'):
             if not name or text=='native-title-update':
-                metadata({'type':'ai-title','aiTitle':'Agent generated title','sessionId':native_id})
-                emit({'type':'system','subtype':'session_title_changed','title':'Agent generated title','session_id':native_id})
+                name='Native session name' if text=='native-title' else 'Native renamed session'
+                metadata({'type':'custom-title','customTitle':name,'sessionId':native_id})
+                emit({'type':'system','subtype':'session_title_changed','title':name,'session_id':native_id})
             emit({'type':'assistant','message':{'content':[{'type':'text','text':'TITLE_OK'}]}})
             emit({'type':'result','subtype':'success','is_error':False})
             continue
@@ -93,6 +114,53 @@ for line in sys.stdin:
             continue
         if text=='malformed': print('this is not json',flush=True);sys.exit(0)
         if text=='exit': sys.exit(2)
+        if text in ('native-queue-head', 'native-queue-batch-head'):
+            batch=text=='native-queue-batch-head'
+            native_mode=True
+            with native_lock:
+                native_head=True
+                native_generation+=1
+                generation=native_generation
+            def finish_native_head(generation=generation,batch=batch):
+                global native_head
+                deadline=time.monotonic()+min(600,float(os.environ.get('LATTE_FIXTURE_QUEUE_TIMEOUT','20')))
+                while not pathlib.Path('native-release').exists() and time.monotonic()<deadline: time.sleep(.02)
+                with native_lock:
+                    if native_generation!=generation: return
+                    emit({'type':'assistant','message':{'content':[{'type':'text','text':'NATIVE_HEAD_COMPLETE'}]}})
+                    if not batch: emit({'type':'result','subtype':'success','is_error':False})
+                    for queued,queued_uuid in native_pending:
+                        if os.environ.get('LATTE_FIXTURE_QUEUE_RESULT_ONLY_FAILURE')=='1':
+                            emit({'type':'result','subtype':'error_during_execution','is_error':True,'result':'native queue failure','user_message_uuid':queued_uuid})
+                            continue
+                        emit({'type':'assistant','message':{'content':[{'type':'text','text':'NATIVE_PROCESSED:'+queued}]}})
+                        if not batch: emit({'type':'result','subtype':'success','is_error':False,'user_message_uuid':queued_uuid})
+                    if batch: emit({'type':'result','subtype':'success','is_error':False,'user_message_uuids':[uuid for _,uuid in native_pending]})
+                    native_pending.clear()
+                    native_head=False
+            threading.Thread(target=finish_native_head,daemon=True).start()
+            emit({'type':'assistant','message':{'content':[{'type':'text','text':'NATIVE_HEAD_WAITING'}]}})
+            continue
+        if text.startswith('native-message-'):
+            native_mode=True
+            with native_lock:
+                with pathlib.Path('native-inputs').open('a') as record: record.write(text+'\n')
+                if native_head:
+                    native_pending.append((text,value.get('uuid')))
+                    continue
+            emit({'type':'assistant','message':{'content':[{'type':'text','text':'NATIVE_PROCESSED:'+text}]}})
+            emit({'type':'result','subtype':'success','is_error':False,'user_message_uuid':value.get('uuid')})
+            continue
+        if text=='queue-slow':
+            def finish_queue_head():
+                deadline=time.monotonic()+min(600,float(os.environ.get('LATTE_FIXTURE_QUEUE_TIMEOUT','20')))
+                while not pathlib.Path('queue-release').exists() and time.monotonic()<deadline:
+                    time.sleep(.02)
+                emit({'type':'assistant','message':{'content':[{'type':'text','text':'QUEUE_HEAD_COMPLETE'}]}})
+                emit({'type':'result','subtype':'success','is_error':False})
+            threading.Thread(target=finish_queue_head,daemon=True).start()
+            emit({'type':'assistant','message':{'content':[{'type':'text','text':'QUEUE_HEAD_WAITING'}]}})
+            continue
         if text=='hang':
             child=subprocess.Popen(['sleep','120'])
             emit({'type':'assistant','message':{'content':[{'type':'text','text':f'child:{child.pid}'}]}})
@@ -127,7 +195,7 @@ for line in sys.stdin:
                         for i in range(700):
                             f.write(json.dumps(child_record('assistant',[{'type':'tool_use','id':f'long-read-{i}','name':'Read','input':{'step':i,'text':'process evidence '+('x'*1024)}}]))+'\n')
 
-            emit({'type':'assistant','message':{'content':[{'type':'tool_use','id':'process-agent','name':'Agent','input':{'description':'Inspect with process'}}]}})
+            emit({'type':'assistant','message':{'content':[{'type':'tool_use','id':'process-agent','name':'Agent','input':{'description':'Inspect with process','prompt':'Inspect the exact project changes with evidence.'}}]}})
             emit({'type':'system','subtype':'task_started','task_id':'process-native','task_type':'local_agent','tool_use_id':'process-agent','description':'Inspect with process'})
             for part in ['child ', 'progress']:
                 emit({'type':'stream_event','parent_tool_use_id':'process-agent','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':part}}})
@@ -151,7 +219,7 @@ for line in sys.stdin:
                 emit({'type':'system','subtype':'session_state_changed','state':'idle'})
             threading.Thread(target=finish_process_child,daemon=True).start()
         elif text=='subagents':
-            emit({'type':'assistant','message':{'content':[{'type':'tool_use','id':'agent-tool','name':'Agent','input':{'description':'Inspect project'}}]}})
+            emit({'type':'assistant','message':{'content':[{'type':'tool_use','id':'agent-tool','name':'Agent','input':{'description':'Inspect project','subagent_type':'Explore'}}]}})
             emit({'type':'system','subtype':'task_started','task_id':'native-child','task_type':'local_agent','tool_use_id':'agent-tool','description':'Inspect project'})
             emit({'type':'system','subtype':'task_progress','task_id':'native-child','description':'Inspect project','last_tool_name':'Read'})
             emit({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'agent-tool','content':'Launched in background'}]}})

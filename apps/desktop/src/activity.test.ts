@@ -12,6 +12,21 @@ const call = (seq: number, id: string, name = "Read") =>
 const result = (seq: number, id: string, is_error = false) =>
   e(seq, { kind: "tool_result", id, content: `${id} output`, is_error });
 describe("readable activity projection", () => {
+  it("keeps an in-flight tool paired across a queued input handoff", () => {
+    const rows = activityTranscript([
+      call(1, "a"),
+      e(2, {
+        kind: "queued_message_sent",
+        request_id: "queued",
+        text: "follow up",
+      }),
+      result(3, "a"),
+    ]);
+    expect(rows).toMatchObject([
+      { type: "tool", name: "Read", output: "a output", status: "completed" },
+      { type: "user", text: "follow up", handoff: true },
+    ]);
+  });
   it("pairs parallel results by ID and compacts consecutive operations", () => {
     expect(
       activityTranscript([

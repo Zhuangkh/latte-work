@@ -1,3 +1,5 @@
+import { referenceMessage } from "./referenceMessage";
+import { MessageQueue } from "./MessageQueue";
 import { TurnChangesCard } from "./TurnChangesCard";
 import { UserMessage } from "./UserMessage";
 import { WorkingStatus } from "./WorkingStatus";
@@ -129,11 +131,14 @@ export function Conversation({
 }: Props) {
   const draftKey = session ? JSON.stringify([hostId, session.id]) : "new-task";
   const draft = useDraft(drafts, draftKey);
+  const editingScope = useRef(draftKey);
+  editingScope.current = draftKey;
   const text = draft.text;
   const setText = (text: string) => drafts.update(draftKey, { text });
   const root = useRef<HTMLElement>(null);
   const modelPicker = useRef<ModelPickerHandle>(null);
   const [sending, setSending] = useState(false);
+  const [composerFocus, setComposerFocus] = useState(0);
   const previousDraftKey = useRef(draftKey);
   const migrated = useRef<string | null>(null);
   const submission = useRef<{
@@ -362,7 +367,6 @@ export function Conversation({
     if (
       !prompt.trim() ||
       sending ||
-      active ||
       !connected ||
       !available ||
       !modelReady ||
@@ -790,7 +794,46 @@ export function Conversation({
             ))}
           </section>
         )}
+        <MessageQueue
+          key={`${hostId}:${session?.id}`}
+          hostId={hostId}
+          sessionId={session?.id}
+          connected={connected}
+          active={!settingsOpen}
+          revision={String(sending)}
+          running={!!active}
+          onEdit={(entry) => {
+            const current = drafts.get(draftKey);
+            const restored = referenceMessage(entry.text);
+            const scope = `${hostId}:${projectId}:${agentId}`;
+            const existing =
+              current.references.scope === scope
+                ? current.references.entries
+                : [];
+            const combined = [
+              ...existing,
+              ...restored.references.filter(
+                (item) => !existing.some((old) => old.path === item.path),
+              ),
+            ];
+            drafts.update(draftKey, {
+              text: [
+                current.text,
+                combined.length <= 20 ? restored.text : entry.text,
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+              references: {
+                scope,
+                entries: combined.length <= 20 ? combined : existing,
+              },
+            });
+            if (editingScope.current === draftKey)
+              setComposerFocus((v) => v + 1);
+          }}
+        />
         <Composer
+          focusRequest={composerFocus}
           referenceState={draft.references}
           onReferencesChange={(references) =>
             drafts.update(draftKey, { references })
@@ -859,8 +902,15 @@ export function Conversation({
                   !!active || sending || !projectName || !!session?.archived
                 }
               />
+              {!!active && hasContent && !localNavigation && (
+                <ComposerAction
+                  active
+                  disabled={!connected || stopping}
+                  onClick={stop}
+                />
+              )}
               <ComposerAction
-                active={!!active && !localNavigation}
+                active={!!active && !hasContent && !localNavigation}
                 label={
                   localNavigation === "subagents"
                     ? "打开子智能体"
@@ -868,14 +918,18 @@ export function Conversation({
                       ? "选择模型"
                       : localNavigation === "effort"
                         ? "思考强度"
-                        : undefined
+                        : active && hasContent
+                          ? "加入队列"
+                          : undefined
                 }
                 sending={sending}
                 disabled={
                   localNavigation
                     ? !!session?.archived || !projectName || sending
                     : active
-                      ? !connected
+                      ? !connected ||
+                        sending ||
+                        (hasContent && (!modelReady || !available))
                       : !!session?.archived ||
                         !modelReady ||
                         liveSessionState === "opening" ||
@@ -888,7 +942,9 @@ export function Conversation({
                         !available ||
                         sending
                 }
-                onClick={active && !localNavigation ? stop : submit}
+                onClick={
+                  active && !hasContent && !localNavigation ? stop : submit
+                }
               />
             </>
           )}

@@ -57,9 +57,13 @@ export function LinkHandling({
 export function WebLink({
   href,
   children,
+  className,
+  "aria-label": ariaLabel,
 }: {
   href?: string;
   children?: ReactNode;
+  className?: string;
+  "aria-label"?: string;
 }) {
   const open = useContext(LinkContext);
   const link = useRef<HTMLAnchorElement>(null);
@@ -67,12 +71,22 @@ export function WebLink({
   const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
   const [error, setError] = useState("");
   if (!url)
-    return <a href={href?.startsWith("#") ? href : undefined}>{children}</a>;
+    return (
+      <a
+        href={href?.startsWith("#") ? href : undefined}
+        className={className}
+        aria-label={ariaLabel}
+      >
+        {children}
+      </a>
+    );
   return (
     <>
       <a
         ref={link}
         href={url}
+        className={className}
+        aria-label={ariaLabel}
         title={url}
         onClick={(event) => {
           event.preventDefault();

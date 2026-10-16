@@ -1,8 +1,11 @@
+import { SourcePreview } from "./SourcePreview";
 import { BrowserPane } from "./BrowserPane";
+import { SiteIcon } from "./SiteIcon";
 import { TaskChangesView } from "./TaskChangesView";
 import { ChangesView } from "./ChangesView";
 import {
   openSubagent,
+  openArtifact,
   openBrowser,
   useWorkspaceState,
   type WorkspaceTab as Tab,
@@ -11,6 +14,8 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Bot,
+  Info,
+  FileText,
   Globe2,
   Files,
   GitCompareArrows,
@@ -64,6 +69,8 @@ function ConversationTab({
 type Kind = "terminal" | "files" | "diff" | "subagents" | "browser";
 
 const labels = {
+  taskInfo: "任务摘要",
+  artifact: "文件产物",
   browser: "浏览器",
   terminal: "终端",
   files: "文件",
@@ -73,6 +80,8 @@ const labels = {
   subagent: "子智能体",
 };
 const icons = {
+  taskInfo: Info,
+  artifact: FileText,
   browser: Globe2,
   subagents: Bot,
   subagent: Bot,
@@ -86,6 +95,7 @@ export function Workspace({
   workspaceId,
   subagents,
   overview,
+  taskInfo,
   conversationActions,
   statusCenter,
   sessionId,
@@ -104,6 +114,7 @@ export function Workspace({
   workspaceId: string;
   subagents?: SubagentsState;
   overview?: React.ReactNode;
+  taskInfo?: React.ReactNode;
   conversationActions?: React.ReactNode;
   statusCenter?: React.ReactNode;
   sessionId?: string;
@@ -158,6 +169,7 @@ export function Workspace({
             workspaceId={page.key}
             subagents={selected ? subagents : undefined}
             overview={selected ? overview : undefined}
+            taskInfo={selected ? taskInfo : undefined}
             conversationActions={selected ? conversationActions : undefined}
             statusCenter={selected ? statusCenter : undefined}
             sessionId={selected ? sessionId : page.sessionId}
@@ -186,6 +198,7 @@ function WorkspacePage({
   workspaceId,
   subagents,
   overview,
+  taskInfo,
   conversationActions,
   statusCenter,
   sessionId,
@@ -209,6 +222,7 @@ function WorkspacePage({
   workspaceId: string;
   subagents?: SubagentsState;
   overview?: React.ReactNode;
+  taskInfo?: React.ReactNode;
   conversationActions?: React.ReactNode;
   statusCenter?: React.ReactNode;
   sessionId?: string;
@@ -276,6 +290,10 @@ function WorkspacePage({
   const tabPrefix = useId();
   const tablist = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
+    if (active && current === "taskInfo" && !conversationActive)
+      tablist.current
+        ?.querySelector<HTMLButtonElement>('[data-task-info="true"]')
+        ?.focus();
     if (active)
       tablist.current
         ?.querySelector<HTMLElement>('[aria-selected="true"]')
@@ -428,14 +446,16 @@ function WorkspacePage({
     }
   }
   const title = (tab: Tab) =>
-    tab.kind === "terminal"
-      ? `${tab.terminal.title} · ${tab.hostName ?? hostName}`
-      : tab.kind === "subagent"
-        ? (subagents?.tasks.find((task) => task.id === tab.taskId)?.title ??
-          tab.title)
-        : tab.kind === "turnChanges" || tab.kind === "browser"
-          ? tab.title
-          : labels[tab.kind];
+    tab.kind === "artifact"
+      ? tab.name
+      : tab.kind === "terminal"
+        ? `${tab.terminal.title} · ${tab.hostName ?? hostName}`
+        : tab.kind === "subagent"
+          ? (subagents?.tasks.find((task) => task.id === tab.taskId)?.title ??
+            tab.title)
+          : tab.kind === "turnChanges" || tab.kind === "browser"
+            ? tab.title
+            : labels[tab.kind];
   return (
     <div
       className={`workspace-page${tabs.length ? "" : " empty"}`}
@@ -471,6 +491,7 @@ function WorkspacePage({
                 className={`workspace-tab${!conversationActive && current === tab.id ? " active" : ""}`}
               >
                 <button
+                  data-task-info={tab.kind === "taskInfo" ? "true" : undefined}
                   role="tab"
                   id={`tab-${tabPrefix}-${tab.id}`}
                   aria-selected={!conversationActive && current === tab.id}
@@ -480,7 +501,11 @@ function WorkspacePage({
                   onClick={() => select(tab.id)}
                   onKeyDown={navigateTabs}
                 >
-                  <Icon size={16} />
+                  {tab.kind === "browser" ? (
+                    <SiteIcon url={tab.url} />
+                  ) : (
+                    <Icon size={16} />
+                  )}
                   <span>{title(tab)}</span>
                 </button>
                 <button
@@ -560,6 +585,36 @@ function WorkspacePage({
           {["files", "diff", "turnChanges"].includes(tab.kind) &&
           !(tab.project ?? project) ? (
             <div className="workspace-empty">选择项目后打开此标签。</div>
+          ) : tab.kind === "taskInfo" ? (
+            taskInfo
+          ) : tab.kind === "artifact" ? (
+            (tab.project ?? project) ? (
+              <SourcePreview
+                hostId={tab.hostId ?? hostId}
+                projectId={(tab.project ?? project)!.id}
+                sessionId={tab.sessionId ?? sessionId}
+                source={{
+                  path: tab.path,
+                  name: tab.name,
+                  directory: tab.directory,
+                }}
+                active={
+                  active &&
+                  !conversationActive &&
+                  current === tab.id &&
+                  connected
+                }
+                open={(file) =>
+                  openArtifact(workspaceId, file, {
+                    hostId: tab.hostId ?? hostId,
+                    project: tab.project ?? project,
+                    sessionId: tab.sessionId ?? sessionId,
+                  })
+                }
+              />
+            ) : (
+              <div className="workspace-empty">选择项目后查看文件产物。</div>
+            )
           ) : tab.kind === "browser" ? (
             <BrowserPane
               workspaceId={workspaceId}
@@ -627,6 +682,8 @@ function WorkspacePage({
               hostId={tab.hostId ?? hostId}
               project={tab.project ?? project!}
               tab={tab.kind}
+              reference={tab.reference}
+              sessionId={tab.sessionId ?? sessionId}
               path={tab.path ?? ""}
               file={tab.file ?? ""}
               navigate={(value) =>

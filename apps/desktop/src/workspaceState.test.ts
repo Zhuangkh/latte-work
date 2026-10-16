@@ -238,3 +238,67 @@ it("reuses a single review tab for historical turns and the overview, and migrat
     ],
   });
 });
+
+it("pins task information in the right pane, reuses it, and restores it independently per conversation", async () => {
+  const state = await import("./workspaceState");
+  const key = crypto.randomUUID();
+  state.updateWorkspace(key, { expanded: true, conversationActive: true });
+  state.openTaskInfo(key);
+  state.openTaskInfo(key);
+  expect(state.readWorkspace(key)).toMatchObject({
+    tabs: [{ id: "taskInfo", kind: "taskInfo" }],
+    current: "taskInfo",
+    expanded: false,
+    conversationActive: false,
+    visible: true,
+  });
+  vi.resetModules();
+  const fresh = await import("./workspaceState");
+  expect(fresh.readWorkspace(key).tabs).toEqual([
+    { id: "taskInfo", kind: "taskInfo" },
+  ]);
+  expect(fresh.readWorkspace(crypto.randomUUID()).tabs).toEqual([]);
+});
+
+it("uses the shared file tab and consistent host paths for project-local Skill trees", async () => {
+  const {
+    openArtifact,
+    openTaskInfo,
+    readWorkspace: read,
+  } = await import("./workspaceState");
+  const key = crypto.randomUUID();
+  const owner = {
+    hostId: "ssh",
+    project: { id: "p", name: "P", path: "/project" },
+    sessionId: "s",
+  };
+  openTaskInfo(key);
+  openArtifact(
+    key,
+    { name: "review", path: ".claude/skills/review", directory: true },
+    owner,
+    ".claude/skills/review/SKILL.md",
+  );
+  expect(read(key)).toMatchObject({
+    current: "files",
+    tabs: [
+      { kind: "taskInfo" },
+      {
+        kind: "files",
+        file: "/project/.claude/skills/review/SKILL.md",
+        reference: { path: "/project/.claude/skills/review", directory: true },
+      },
+    ],
+  });
+  openArtifact(
+    key,
+    { name: "report.md", path: "report.md", directory: false },
+    owner,
+  );
+  expect(read(key).tabs).toHaveLength(2);
+  expect(read(key).tabs[1]).toMatchObject({
+    kind: "files",
+    file: "report.md",
+    reference: undefined,
+  });
+});

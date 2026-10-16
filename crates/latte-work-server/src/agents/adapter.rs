@@ -27,6 +27,11 @@ pub enum Input<'a> {
     Start {
         prompt: &'a str,
     },
+    /// Hand an input to the native agent while retaining the active turn.
+    Queue {
+        request_id: &'a str,
+        prompt: &'a str,
+    },
     /// One complete line without its delimiter. Only the adapter interprets its payload.
     Message(&'a str),
     /// Delivered only after Runtime validates and consumes a pending public approval ID.
@@ -44,7 +49,8 @@ pub enum Input<'a> {
 }
 
 pub enum Action {
-    Title(String),
+    /// Authoritative native session name, including external manual renames.
+    NativeName(String),
     TitleRenamed(Result<String, String>),
     SourceUsed {
         id: String,
@@ -57,6 +63,9 @@ pub enum Action {
     Ready,
     /// Native evidence that the main agent started an autonomous follow-up turn.
     TurnStarted,
+    /// Native completion evidence for inputs consumed in this turn (possibly a batch).
+    /// A delivered input does not necessarily start an independent native turn.
+    InputsConsumed(Vec<String>),
     Interrupted,
     Event(EventKind),
     /// Native child output; never changes the parent turn's text or execution state.
