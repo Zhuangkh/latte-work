@@ -43,6 +43,18 @@ fn emit(value: Value) {
 }
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "connect-existing") {
+        // SSH launcher fixture: preserve standard handles while forwarding to
+        // the real Server with an isolated state directory. No model is involved.
+        let status =
+            std::process::Command::new(std::env::var_os("LATTE_NATIVE_BRIDGE_SERVER").unwrap())
+                .arg("connect-existing")
+                .arg("--state-dir")
+                .arg(std::env::var_os("LATTE_NATIVE_BRIDGE_STATE").unwrap())
+                .status()
+                .unwrap();
+        std::process::exit(status.code().unwrap_or(1));
+    }
     if args
         .first()
         .is_some_and(|arg| arg == "--terminal-tree" || arg == "--terminal-leaf")

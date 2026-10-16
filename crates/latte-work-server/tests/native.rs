@@ -13,6 +13,8 @@ use tokio::process::{Child, Command};
 const SERVER: &str = env!("CARGO_BIN_EXE_latte-work-server");
 #[path = "native/owned_resources.rs"]
 mod owned_resources;
+#[path = "native/ssh.rs"]
+mod ssh;
 #[cfg(windows)]
 #[path = "native/terminal.rs"]
 mod terminal;

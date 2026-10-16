@@ -10,6 +10,7 @@ export interface Host {
   name: string;
   ssh: string | null;
   server_path: string | null;
+  platform?: "unix" | "windows";
   auth?: "none" | "identity_file" | "password";
   identity_file?: string | null;
   port?: number | null;

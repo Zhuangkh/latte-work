@@ -67,9 +67,9 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    let bridge = std::env::args_os()
-        .nth(1)
-        .is_some_and(|command| command == "connect" || command == "connect-local");
+    let bridge = std::env::args_os().nth(1).is_some_and(|command| {
+        command == "connect" || command == "connect-local" || command == "connect-existing"
+    });
     let runtime = if bridge {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -108,7 +108,7 @@ async fn entry() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
         println!(
-            "latte-work-server 0.1.0\nUsage: latte-work-server <serve|connect|connect-local> [--state-dir PATH]\nOne daemon per host user; connect starts it if absent.\nLATTE_WORK_CLAUDE: absolute CLI path override (default auto-detected claude)."
+            "latte-work-server 0.1.0\nUsage: latte-work-server <serve|connect|connect-local|connect-existing> [--state-dir PATH]\nOne daemon per host user; connect starts it if absent; connect-existing never starts it.\nLATTE_WORK_CLAUDE: absolute CLI path override (default auto-detected claude)."
         );
         return Ok(());
     }
@@ -124,6 +124,21 @@ async fn entry() -> Result<()> {
     match args[0].to_str().context("命令名称不是 UTF-8")? {
         "serve" => serve(&endpoint).await,
         "connect" => bridge(&endpoint).await,
+        "connect-existing" => match endpoint.connect(Duration::from_secs(3)).await {
+            Ok(stream) => forward(stream).await,
+            Err(error) => {
+                let response = Response::Error {
+                    code: "server_unavailable".into(),
+                    message: format!(
+                        "无法连接独立运行的 Server；请先在远端同一用户的本机终端运行 latte-work-server.exe serve 并保持运行（不要在 SSH 会话内启动）：{error}"
+                    ),
+                };
+                let mut bytes = serde_json::to_vec(&response)?;
+                bytes.push(b'\n');
+                tokio::io::stdout().write_all(&bytes).await?;
+                Ok(())
+            }
+        },
         "connect-local" => match upgrade::connect_local(&endpoint).await {
             Ok(stream) => forward(stream).await,
             Err(error) => {

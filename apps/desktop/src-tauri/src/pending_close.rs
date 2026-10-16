@@ -129,6 +129,7 @@ fn same_target(a: &Host, b: &Host) -> bool {
         && a.ssh == b.ssh
         && a.port == b.port
         && a.server_path == b.server_path
+        && a.platform == b.platform
         && a.identity_file == b.identity_file
         && a.auth == b.auth
 }
@@ -310,6 +311,9 @@ mod tests {
         let mut different = host();
         different.ssh = Some("other-target".into());
         assert!(!same_target(&host(), &different));
+        let mut different_platform = host();
+        different_platform.platform = latte_work_client::SshPlatform::Windows;
+        assert!(!same_target(&host(), &different_platform));
         drop(locked);
         std::fs::remove_dir_all(directory).unwrap();
     }

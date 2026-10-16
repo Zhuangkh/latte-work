@@ -1,7 +1,10 @@
 //! GUI-independent host connection. An SSH bridge is only a transport, never an agent.
+mod diagnostics;
+mod ssh;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use latte_work_protocol::{MAX_FRAME, Request, Response, VERSION};
+pub use ssh::SshPlatform;
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{
     io::AsyncWriteExt,
@@ -13,6 +16,7 @@ pub struct Client {
     child: Child,
     input: ChildStdin,
     output: FramedRead<ChildStdout, LinesCodec>,
+    diagnostics: diagnostics::StartupDiagnostics,
     broken: bool,
     permission_settings: bool,
     server_id: String,
@@ -51,10 +55,19 @@ impl Client {
         port: Option<u16>,
         auth: SshAuthentication<'_>,
     ) -> Result<Self> {
-        let command = ssh_command(host, binary, port, auth)?;
+        Self::ssh_with_platform(host, binary, port, auth, SshPlatform::Unix).await
+    }
+    pub async fn ssh_with_platform(
+        host: &str,
+        binary: &str,
+        port: Option<u16>,
+        auth: SshAuthentication<'_>,
+        platform: SshPlatform,
+    ) -> Result<Self> {
+        let command = ssh_command_for_platform(host, binary, port, auth, platform)?;
         Self::spawn(command)
             .await
-            .context("SSH 连接失败；请确认主机指纹已在终端验证，并检查认证方式和远程 Server")
+            .context("SSH 连接失败；请检查主机指纹、认证方式、远端系统、Server 路径及运行用户")
     }
     async fn spawn(mut command: Command) -> Result<Self> {
         #[cfg(windows)]
@@ -66,10 +79,13 @@ impl Client {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("无法启动 Host 连接程序")?;
+        let diagnostics = diagnostics::StartupDiagnostics::start(
+            child.stderr.take().context("bridge stderr missing")?,
+        );
         let input = child.stdin.take().context("bridge stdin missing")?;
         let output = FramedRead::new(
             child.stdout.take().context("bridge stdout missing")?,
@@ -79,11 +95,24 @@ impl Client {
             child,
             input,
             output,
+            diagnostics,
             broken: false,
             permission_settings: false,
             server_id: String::new(),
         };
-        match client.request(Request::Hello { version: VERSION }).await? {
+        let hello = match client.request(Request::Hello { version: VERSION }).await {
+            Ok(hello) => hello,
+            Err(error) => {
+                let detail = client.diagnostics.failure_detail().await;
+                return Err(if detail.is_empty() {
+                    error
+                } else {
+                    error.context(format!("Host 启动诊断：{detail}"))
+                });
+            }
+        };
+        client.diagnostics.discard();
+        match hello {
             Response::Hello {
                 version: VERSION,
                 permission_settings,
@@ -478,16 +507,26 @@ async fn request_with_snapshot(
     }
 }
 
+#[cfg(test)]
 fn ssh_command(
     host: &str,
     binary: &str,
     port: Option<u16>,
     auth: SshAuthentication<'_>,
 ) -> Result<Command> {
+    ssh_command_for_platform(host, binary, port, auth, SshPlatform::Unix)
+}
+/// Build an OpenSSH transport command using the explicitly selected remote OS.
+/// The command's stdin/stdout must be piped without text conversion by the caller.
+pub fn ssh_command_for_platform(
+    host: &str,
+    binary: &str,
+    port: Option<u16>,
+    auth: SshAuthentication<'_>,
+    platform: SshPlatform,
+) -> Result<Command> {
     validate_host(host)?;
-    if (!binary.is_empty() && !binary.starts_with('/')) || binary.contains(['\n', '\r', '\0']) {
-        bail!("远程 Server 必须是绝对路径");
-    }
+    let remote_command = ssh::remote_command(binary, platform)?;
     let mut command = Command::new("ssh");
     command.arg("-T");
     if let Some(port) = port {
@@ -544,20 +583,6 @@ fn ssh_command(
         "--",
         host,
     ]);
-    let remote_command = if binary.is_empty() {
-        // Noninteractive SSH often omits ~/.local/bin from PATH.
-        let discover = r#"if [ -x "$HOME/.local/bin/latte-work-server" ]; then
-  exec "$HOME/.local/bin/latte-work-server" connect
-fi
-candidate=$(command -v latte-work-server 2>/dev/null || true)
-if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-  exec "$candidate" connect
-fi
-printf '%s\n' '{"kind":"error","code":"server_not_found","message":"远程未找到 latte-work-server；请先安装或填写绝对路径"}'"#;
-        format!("exec /bin/sh -c {}", shell_quote(discover))
-    } else {
-        format!("exec {} connect", shell_quote(binary))
-    };
     command.arg(remote_command);
     Ok(command)
 }
@@ -603,6 +628,10 @@ pub fn validate_host(host: &str) -> Result<()> {
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
+#[cfg(test)]
+#[path = "diagnostics_tests.rs"]
+mod diagnostics_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

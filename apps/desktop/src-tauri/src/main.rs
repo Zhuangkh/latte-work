@@ -120,6 +120,8 @@ struct Host {
     ssh: Option<String>,
     server_path: Option<String>,
     #[serde(default)]
+    platform: latte_work_client::SshPlatform,
+    #[serde(default)]
     auth: SshAuthMode,
     #[serde(default)]
     identity_file: Option<String>,
@@ -300,11 +302,12 @@ async fn open_host_client(
                 }
             }
         };
-        let result = Client::ssh_with_auth(
+        let result = Client::ssh_with_platform(
             ssh,
             host.server_path.as_deref().unwrap_or(""),
             host.port,
             auth,
+            host.platform,
         )
         .await;
         drop(challenge);
@@ -1030,12 +1033,16 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(host.auth, SshAuthMode::None));
+        assert_eq!(host.platform, latte_work_client::SshPlatform::Unix);
         let json = serde_json::to_string(&Host {
             auth: SshAuthMode::Password,
+            platform: latte_work_client::SshPlatform::Windows,
             ..host
         })
         .unwrap();
         assert!(json.contains("\"auth\":\"password\""));
+        let restored: Host = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.platform, latte_work_client::SshPlatform::Windows);
         assert!(!json.contains("password\":\"secret"));
     }
 
