@@ -62,8 +62,9 @@ impl ManagedChild {
         if !grace.is_zero() && self.tree.request_termination()? {
             let _ = tokio::time::timeout(grace, self.child.wait()).await;
         }
-        self.tree.kill()?;
-        tokio::time::timeout(Duration::from_secs(3), async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        self.tree.kill_for_close(&mut self.child, deadline).await?;
+        tokio::time::timeout_at(deadline, async {
             self.child.wait().await?;
             self.tree.wait_empty().await
         })

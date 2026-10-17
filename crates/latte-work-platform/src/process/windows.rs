@@ -48,6 +48,13 @@ impl Tree {
     pub(super) fn kill(&self) -> io::Result<()> {
         self.0.terminate()
     }
+    pub(super) async fn kill_for_close(
+        &self,
+        _child: &mut Child,
+        _deadline: tokio::time::Instant,
+    ) -> io::Result<()> {
+        self.kill()
+    }
     pub(super) async fn wait_empty(&self) -> io::Result<()> {
         while !self.0.is_empty()? {
             tokio::time::sleep(Duration::from_millis(10)).await;

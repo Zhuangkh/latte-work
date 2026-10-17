@@ -172,6 +172,45 @@ async fn close_cleans_descendants_after_root_exit_and_is_repeatable() {
     released(dir.path()).await;
     child.close(Duration::ZERO).await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_close_retains_tree_for_later_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = ManagedChild::spawn(&mut fixture("tree", dir.path())).unwrap();
+    ready(dir.path()).await;
+    child.tree.fail_kill(Some(nix::errno::Errno::EIO));
+    let error = child.close(Duration::ZERO).await.unwrap_err();
+    assert!(error.to_string().contains("SIGKILL"), "{error}");
+    assert!(!child.closed);
+    alive(dir.path());
+    child.tree.fail_kill(None);
+    child.close(Duration::ZERO).await.unwrap();
+    released(dir.path()).await;
+    assert!(child.closed);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cancelled_permission_retry_retains_tree_for_later_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = ManagedChild::spawn(&mut fixture("tree", dir.path())).unwrap();
+    ready(dir.path()).await;
+    child.tree.fail_kill(Some(nix::errno::Errno::EPERM));
+    {
+        let close = child.close(Duration::ZERO);
+        tokio::pin!(close);
+        tokio::select! {
+            result = &mut close => panic!("close completed before cancellation: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+        }
+    }
+    assert!(!child.closed);
+    alive(dir.path());
+    child.tree.fail_kill(None);
+    child.close(Duration::ZERO).await.unwrap();
+    released(dir.path()).await;
+}
 #[tokio::test]
 async fn dropping_or_aborting_owner_cleans_tree() {
     for abort in [false, true] {

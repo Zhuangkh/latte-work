@@ -258,10 +258,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
           $packages = Join-Path $metadata.target_directory 'windows-package'
           $before = @()
+          $beforeRuns = @()
           if (Test-Path -LiteralPath $packages) {
             $before = @(Get-ChildItem -LiteralPath $packages -Filter provenance.json -Recurse -File | Select-Object -ExpandProperty FullName)
+            $beforeRuns = @(Get-ChildItem -LiteralPath $packages -Directory | Select-Object -ExpandProperty FullName)
           }
-          ./scripts/desktop.ps1 package 2>&1 | Tee-Object -FilePath native-evidence/package.log
+          try {
+            ./scripts/desktop.ps1 package 2>&1 | Tee-Object -FilePath native-evidence/package.log
+          } finally {
+            if (Test-Path -LiteralPath $packages) {
+              foreach ($run in @(Get-ChildItem -LiteralPath $packages -Directory | Where-Object { $_.FullName -notin $beforeRuns })) {
+                $destination = Join-Path 'native-evidence/windows-package' $run.Name
+                New-Item -ItemType Directory -Path $destination -Force | Out-Null
+                foreach ($name in @('source-before.json', 'source-after.json', 'source-changes.txt')) {
+                  $source = Join-Path $run.FullName $name
+                  if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination $destination }
+                }
+              }
+            }
+          }
           $created = @(Get-ChildItem -LiteralPath $packages -Filter provenance.json -Recurse -File | Where-Object { $_.FullName -notin $before })
           if ($created.Count -ne 1) { throw 'Expected exactly one fresh successful package provenance' }
           $provenance = Get-Content -LiteralPath $created[0].FullName -Raw | ConvertFrom-Json

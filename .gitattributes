@@ -1,0 +1,2 @@
+# Tauri CLI rewrites this manifest with LF before building. Keep checkout bytes stable.
+apps/desktop/src-tauri/Cargo.toml text eol=lf

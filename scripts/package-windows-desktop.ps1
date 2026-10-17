@@ -5,6 +5,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'windows-package-common.ps1')
+$runDir = $null
+$sourceBefore = $null
+$sourceAfter = $null
 Push-Location $root
 try {
     if (-not $IsWindows) { throw 'Windows desktop packaging requires native Windows' }
@@ -59,10 +62,8 @@ try {
     $desktop = Join-Path $releaseDir 'latte-work-desktop.exe'
     $desktopArtifact = Get-ProductionArtifact $desktopLog 'latte-work-desktop' $desktop
     $sourceAfter = Get-PackageSourceIdentity $root
-    $sourceAfter | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runDir 'source-after.json') -Encoding utf8
-    if ($sourceBefore.head -ne $sourceAfter.head -or $sourceBefore.build_inputs_sha256 -ne $sourceAfter.build_inputs_sha256) {
-        throw "Build inputs changed during packaging; evidence retained at $runDir. Retry after edits finish."
-    }
+    Write-PackageSourceEvidence $sourceBefore $sourceAfter $runDir
+    Assert-PackageSourceUnchanged $sourceBefore $sourceAfter
     Assert-PackageHash $server $serverHash
     Assert-PackageHash $sidecar $serverHash
     $installer = Join-Path $runDir $installerName
@@ -82,4 +83,12 @@ try {
     $provenance | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $provenancePath -Encoding utf8
     Write-Host "Package provenance: $provenancePath"
     Write-Host "Installer: $installer`nSHA256: $installerHash"
-} finally { Pop-Location }
+} finally {
+    try {
+        # Build failures still need an after snapshot; never create a successful receipt here.
+        if ($null -ne $sourceBefore -and $null -eq $sourceAfter) {
+            $sourceAfter = Get-PackageSourceIdentity $root
+            Write-PackageSourceEvidence $sourceBefore $sourceAfter $runDir
+        }
+    } finally { Pop-Location }
+}

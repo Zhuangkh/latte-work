@@ -28,6 +28,17 @@ security sandboxes. Non-child zombies are reaped by their parents/init, and a
 successful Unix close confirms group signaling and root reaping rather than a
 Windows-style kernel count of zero.
 
+On macOS only, explicit forced cleanup retries a typed SIGKILL/EPERM failure
+within the same absolute three-second cleanup deadline used for root reaping and
+the final tree check. Each retry polls the root so an exited child can be reaped,
+then uses a cancellable timer of at most ten milliseconds. Root exit, EPERM and
+elapsed time never count as successful group signaling: KILL must succeed or
+report ESRCH, followed by confirmed root reaping. Persistent EPERM retains its
+PermissionDenied error, signal/PGID/errno source and deadline context. Other KILL
+errors and TERM errors propagate immediately. Grace remains a separate budget;
+cancelled or failed close retains ownership for a later retry. Drop keeps its
+synchronous best-effort force-stop path.
+
 Windows creates an unnamed, non-inheritable Job with KILL_ON_JOB_CLOSE. It starts
 the child suspended with CREATE_NO_WINDOW, assigns it to the Job, then resumes
 its initial threads. Assignment/resume failure kills the root and closes the
@@ -71,6 +82,9 @@ on success, nonzero exit, oversized output and timeout. Version output is capped
 at 16 KiB/5 seconds; permission help at 128 KiB/5 seconds. Native command discovery
 retains its 12-second/frame/message limits. Cleanup can add at most three seconds
 to a probe deadline. Cancelling the probe future still invokes owned Drop cleanup.
+Probe cleanup errors take precedence over output-limit, timeout or exit results;
+the probe's local guard then drops with best-effort cleanup rather than remaining
+in a retry owner.
 
 Windows environment initialization inherits Server variables and executes no
 shell/profile. Unix capture remains in a platform-selected module with its
@@ -112,6 +126,11 @@ inherited. This validates platform integration, not the final Server binary.
 
 Unix adds a real SIGTERM notification/cleanup test. Linux and macOS platform code
 and tests cross-compile with Clippy; native execution remains for their CI hosts.
+Retry-policy tests inject typed signal errors under a paused clock, checking
+EPERM recovery, persistent failure, root polling, deadline reuse, cancellation
+and immediate propagation of other errors. Real-process fixtures also check
+failed-close ownership and, on macOS, cancellation followed by a successful close.
+These tests do not establish zombie membership in a historical CI failure.
 A Server unit regression checks that shutdown propagates failed cleanup, permits
 other actors to finish, and reaps remaining tasks. Final-server native lifecycle
 and Agent E2E tests must also pass on Unix CI. This Windows workstation cannot run

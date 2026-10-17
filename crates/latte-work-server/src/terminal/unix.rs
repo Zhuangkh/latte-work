@@ -4,10 +4,8 @@ use nix::{
     unistd::Pid,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::{
-    io::{Read, Write},
-    time::Instant,
-};
+use std::{io::Write, time::Instant};
+use tokio::io::{Interest, unix::AsyncFd};
 struct Control {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -65,6 +63,7 @@ pub(super) fn spawn(
     let mut reader = filedescriptor::FileDescriptor::dup(&fd)?;
     reader.set_non_blocking(true)?;
     let writer = reader.try_clone()?;
+    let reader = AsyncFd::with_interest(reader, Interest::READABLE)?;
     let child = pair
         .slave
         .spawn_command(command)
@@ -121,9 +120,31 @@ async fn input(
     }
     Ok(())
 }
+async fn drain_output(
+    reader: &mut AsyncFd<filedescriptor::FileDescriptor>,
+    output: &Mutex<Output>,
+) -> std::io::Result<bool> {
+    let mut ready = reader.readable_mut().await?;
+    let result = drain::drain(ready.get_inner_mut(), |bytes| {
+        if let Ok(mut out) = output.lock() {
+            out.append(bytes);
+        }
+    });
+    match result {
+        Ok(drain::Progress::WouldBlock) => {
+            ready.clear_ready();
+            Ok(false)
+        }
+        Ok(drain::Progress::Eof) => Ok(true),
+        // Linux PTYs report EIO after the last slave closes.
+        Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => Ok(true),
+        Err(error) => Err(error),
+        Ok(drain::Progress::BudgetExhausted) => Ok(false),
+    }
+}
 async fn supervise(
     mut control: Control,
-    mut reader: filedescriptor::FileDescriptor,
+    mut reader: AsyncFd<filedescriptor::FileDescriptor>,
     writer: filedescriptor::FileDescriptor,
     mut commands: mpsc::Receiver<Command>,
     mut close: watch::Receiver<bool>,
@@ -133,6 +154,7 @@ async fn supervise(
     let mut pending: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
     let mut closing: Option<Instant> = None;
     let mut exited: Option<Instant> = None;
+    let mut output_ended = false;
     let mut current = state.borrow().clone();
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     loop {
@@ -143,16 +165,6 @@ async fn supervise(
                 closing = Some(Instant::now());
             }
             _ = interval.tick() => {
-                let mut buffer = [0; 8192];
-                for _ in 0..8 {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(n) => { if let Ok(mut out) = output.lock() { out.append(&buffer[..n]); } }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(nix::libc::EIO) => break,
-                        Err(error) => { current.error = Some(format!("终端读取失败：{error}")); closing.get_or_insert_with(Instant::now); break; }
-                    }
-                }
                 if let Some(at) = closing {
                     control.foreground();
                     if at.elapsed() >= Duration::from_millis(100) {
@@ -218,6 +230,139 @@ async fn supervise(
                     }
                 }
             }
+            result = drain_output(&mut reader, &output), if !output_ended => {
+                match result {
+                    Ok(ended) => output_ended = ended,
+                    Err(error) => {
+                        current.error = Some(format!("终端读取失败：{error}"));
+                        closing.get_or_insert_with(Instant::now);
+                        output_ended = true;
+                    }
+                }
+                // Keep readiness on budget exhaustion, but give input and other
+                // tasks a turn before immediately continuing to drain output.
+                tokio::task::yield_now().await;
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn descriptors() -> (
+        AsyncFd<filedescriptor::FileDescriptor>,
+        filedescriptor::FileDescriptor,
+        tokio::net::UnixStream,
+    ) {
+        let (master, slave) = UnixStream::pair().unwrap();
+        master.set_nonblocking(true).unwrap();
+        slave.set_nonblocking(true).unwrap();
+        let reader = filedescriptor::FileDescriptor::dup(&master).unwrap();
+        let writer = reader.try_clone().unwrap();
+        (
+            AsyncFd::with_interest(reader, Interest::READABLE).unwrap(),
+            writer,
+            tokio::net::UnixStream::from_std(slave).unwrap(),
+        )
+    }
+
+    fn fill_input(writer: &mut filedescriptor::FileDescriptor) -> usize {
+        let mut queued = 0;
+        for _ in 0..1024 {
+            match writer.write(&[b'q'; INPUT_LIMIT]) {
+                Ok(n) if n > 0 => queued += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return queued,
+                result => panic!("unexpected socket write: {result:?}"),
+            }
+        }
+        panic!("socket input did not block within 16 MiB");
+    }
+
+    #[tokio::test]
+    async fn readiness_drains_large_output_before_the_peer_accepts_remaining_input() {
+        let (mut reader, mut writer, mut slave) = descriptors();
+        let output = Mutex::new(Output::default());
+        let (_, close) = watch::channel(false);
+        let mut queued = fill_input(&mut writer);
+        let peer = async {
+            slave.write_all(&vec![b'v'; 4 * 1024 * 1024]).await.unwrap();
+            let mut rest = [0; INPUT_LIMIT];
+            while queued != 0 {
+                let length = rest.len().min(queued);
+                slave.read_exact(&mut rest[..length]).await.unwrap();
+                assert!(rest[..length].iter().all(|byte| *byte == b'q'));
+                queued -= length;
+            }
+            slave.read_exact(&mut rest).await.unwrap();
+            assert!(rest.iter().all(|byte| *byte == b'x'));
+            slave.write_all(b"DUPLEX_OK").await.unwrap();
+            drop(slave);
+        };
+        let read = async {
+            while !drain_output(&mut reader, &output).await.unwrap() {
+                tokio::task::yield_now().await;
+            }
+        };
+        let data = vec![b'x'; INPUT_LIMIT];
+        tokio::time::timeout(INPUT_TIMEOUT, async {
+            let (result, (), ()) = tokio::join!(input(&mut writer, &data, &close), peer, read);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        let mut output = output.lock().unwrap();
+        assert_eq!(output.end, (4 * 1024 * 1024 + 9) as u64);
+        assert_eq!(output.bytes.len(), OUTPUT_LIMIT);
+        assert!(output.bytes.make_contiguous().ends_with(b"DUPLEX_OK"));
+    }
+
+    #[tokio::test]
+    async fn drained_readiness_waits_for_more_output_and_eof_finishes_reading() {
+        let (mut reader, _writer, mut slave) = descriptors();
+        let output = Mutex::new(Output::default());
+        slave.write_all(b"ready").await.unwrap();
+        assert!(!drain_output(&mut reader, &output).await.unwrap());
+        assert_eq!(output.lock().unwrap().end, 5);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                drain_output(&mut reader, &output)
+            )
+            .await
+            .is_err()
+        );
+        drop(slave);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                drain_output(&mut reader, &output)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_input_observes_close_without_waiting_for_its_deadline() {
+        let (_reader, mut writer, _slave) = descriptors();
+        // Fill the peer's unread socket buffer before exercising input cancellation.
+        fill_input(&mut writer);
+        let (closing, close) = watch::channel(false);
+        let write = input(&mut writer, b"unread", &close);
+        let cancel = async {
+            tokio::task::yield_now().await;
+            closing.send(true).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(write, cancel)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
     }
 }

@@ -5,6 +5,9 @@ mod backend;
 #[cfg(windows)]
 #[path = "terminal/windows.rs"]
 mod backend;
+#[cfg(any(unix, test))]
+#[path = "terminal/drain.rs"]
+mod drain;
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{Response, TerminalInfo};
 use std::{
@@ -332,6 +335,82 @@ pub fn helper() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_fixture() -> (
+        SharedTerminals,
+        mpsc::Receiver<Command>,
+        watch::Receiver<bool>,
+    ) {
+        let terminals = SharedTerminals::default();
+        let (commands, receive) = mpsc::channel(8);
+        let (closing, close) = watch::channel(false);
+        let (_state, current) = watch::channel(State {
+            ready: true,
+            ..State::default()
+        });
+        terminals.lock().unwrap().entries.insert(
+            "input".into(),
+            Arc::new(Terminal {
+                info: TerminalInfo {
+                    id: "input".into(),
+                    project_id: "project".into(),
+                    title: "fixture".into(),
+                    exited: false,
+                    exit_code: None,
+                },
+                output: Arc::new(Mutex::new(Output::default())),
+                backend: Backend {
+                    title: "fixture".into(),
+                    commands,
+                    closing,
+                    state: current,
+                },
+            }),
+        );
+        (terminals, receive, close)
+    }
+
+    #[tokio::test]
+    async fn full_input_queue_rejects_without_requesting_close_or_sending_more_input() {
+        let (terminals, mut receive, close) = input_fixture();
+        let terminal = terminals.lock().unwrap().get("input").unwrap();
+        for _ in 0..8 {
+            let (reply, _) = oneshot::channel();
+            terminal
+                .backend
+                .commands
+                .try_send(Command {
+                    operation: Operation::Write(vec![b'x']),
+                    reply,
+                })
+                .ok()
+                .unwrap();
+        }
+        let error = write(&terminals, "input", vec![b'y']).await.unwrap_err();
+        assert!(error.to_string().contains("输入未发送"));
+        assert!(!*close.borrow());
+        for _ in 0..8 {
+            assert!(matches!(
+                receive.try_recv().unwrap().operation,
+                Operation::Write(data) if data == b"x"
+            ));
+        }
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_input_requests_close_without_replaying_the_command() {
+        let (terminals, mut receive, close) = input_fixture();
+        let request = tokio::spawn(async move { write(&terminals, "input", vec![b'x']).await });
+        let command = receive.recv().await.unwrap();
+        tokio::time::advance(INPUT_TIMEOUT).await;
+        let error = request.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("输入可能部分送达，请勿自动重试"));
+        assert!(*close.borrow());
+        assert!(command.reply.is_closed());
+        assert!(receive.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn cancelled_close_keeps_registry_until_cleanup_is_confirmed() {
         let terminals = SharedTerminals::default();

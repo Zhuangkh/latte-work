@@ -48,12 +48,41 @@ function Get-PackageSourceIdentity([string]$Root) {
     })
     # Documentation/CI edits may continue during a build; compiled inputs must stay stable.
     $buildInputs = @($files | Where-Object {
-        $_.path -match '^(apps/|crates/|\.cargo/|Cargo\.|rust-toolchain|package|Makefile$)' -or
+        $_.path -match '^(apps/|crates/|\.cargo/|Cargo\.|rust-toolchain|package|Makefile$|\.gitattributes$)' -or
         $_.path -match '^scripts/(desktop|package-windows-desktop|verify-windows-package|windows-package-common)\.ps1$'
     })
     $bytes = [System.Text.Encoding]::UTF8.GetBytes(($buildInputs | ConvertTo-Json -Depth 5 -Compress))
     $buildHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
     return [ordered]@{ head = "$head"; dirty = ($status.Count -gt 0); status = $status; files = $files; build_inputs_sha256 = $buildHash }
+}
+
+function Write-PackageSourceEvidence($Before, $After, [string]$Directory) {
+    $Before | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Directory 'source-before.json') -Encoding utf8
+    $After | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Directory 'source-after.json') -Encoding utf8
+    $beforeFiles = @{}
+    $afterFiles = @{}
+    foreach ($file in $Before.files) { $beforeFiles[$file.path] = $file.sha256 }
+    foreach ($file in $After.files) { $afterFiles[$file.path] = $file.sha256 }
+    $changes = @(
+        "HEAD before: $($Before.head)"
+        "HEAD after:  $($After.head)"
+        "Build inputs before: $($Before.build_inputs_sha256)"
+        "Build inputs after:  $($After.build_inputs_sha256)"
+        foreach ($path in @($beforeFiles.Keys + $afterFiles.Keys | Sort-Object -Unique)) {
+            if ($beforeFiles[$path] -cne $afterFiles[$path]) {
+                $beforeHash = if ($beforeFiles.ContainsKey($path)) { $beforeFiles[$path] } else { 'absent' }
+                $afterHash = if ($afterFiles.ContainsKey($path)) { $afterFiles[$path] } else { 'absent' }
+                "${path}:`n  before: $beforeHash`n  after:  $afterHash"
+            }
+        }
+    )
+    $changes | Set-Content -LiteralPath (Join-Path $Directory 'source-changes.txt') -Encoding utf8
+}
+
+function Assert-PackageSourceUnchanged($Before, $After) {
+    if ($Before.head -cne $After.head -or $Before.build_inputs_sha256 -cne $After.build_inputs_sha256) {
+        throw 'Build inputs changed during packaging; see source-before.json, source-after.json and source-changes.txt. Retry after edits finish.'
+    }
 }
 
 function Get-ProductionArtifact([string]$LogPath, [string]$Name, [string]$ExpectedPath) {

@@ -57,4 +57,50 @@ Set-Content -LiteralPath $desktop -Value 'prefix__TAURI_BUNDLE_TYPE_VAR_NSSsuffi
 Assert-Rejected 'missing original Tauri marker' { Get-NsisDesktopPatch $desktop }
 Set-Content -LiteralPath $desktop -Value '__TAURI_BUNDLE_TYPE_VAR_UNK__TAURI_BUNDLE_TYPE_VAR_UNK' -NoNewline
 Assert-Rejected 'ambiguous original Tauri markers' { Get-NsisDesktopPatch $desktop }
+
+# Borrow only Git objects/HEAD for identity tests; no commit, build or dependency copy.
+$root = Split-Path -Parent $PSScriptRoot
+$sourceFixture = Join-Path $testDir 'source'
+& git clone --quiet --shared --no-checkout $root $sourceFixture
+if ($LASTEXITCODE -ne 0) { throw 'Cannot create isolated source identity fixture' }
+$inputPaths = @('Cargo.toml', 'apps/desktop/src-tauri/Cargo.toml', 'crates/latte-work-platform/src/lib.rs', 'apps/desktop/src-tauri/tauri.conf.json')
+& git -C $sourceFixture checkout HEAD -- @inputPaths
+if ($LASTEXITCODE -ne 0) { throw 'Cannot populate source identity fixture' }
+Copy-Item -LiteralPath (Join-Path $root '.gitattributes') -Destination $sourceFixture
+$before = Get-PackageSourceIdentity $sourceFixture
+Assert-PackageSourceUnchanged $before (Get-PackageSourceIdentity $sourceFixture)
+$script:passed++
+foreach ($path in @($inputPaths + '.gitattributes')) {
+    $absolute = Join-Path $sourceFixture $path
+    $original = [IO.File]::ReadAllBytes($absolute)
+    try {
+        $text = [IO.File]::ReadAllText($absolute)
+        $changed = switch ($path) {
+            'Cargo.toml' { $text.Replace('version = "0.1.0"', 'version = "0.1.1"') }
+            'apps/desktop/src-tauri/Cargo.toml' { $text.Replace('features = ["unstable"]', 'features = ["unstable", "tray-icon"]') }
+            'apps/desktop/src-tauri/tauri.conf.json' {
+                $config = $text | ConvertFrom-Json
+                $config.version = '0.1.1'
+                $config | ConvertTo-Json -Depth 12
+            }
+            'crates/latte-work-platform/src/lib.rs' { $text + "`npub const PACKAGE_INPUT_TEST: bool = true;`n" }
+            '.gitattributes' { $text + "`n*.rs text eol=lf`n" }
+        }
+        if ($changed -ceq $text) { throw "Source fixture mutation was ineffective: $path" }
+        [IO.File]::WriteAllText($absolute, $changed)
+        $after = Get-PackageSourceIdentity $sourceFixture
+        Assert-Rejected "changed $path" { Assert-PackageSourceUnchanged $before $after }
+        Write-PackageSourceEvidence $before $after $testDir
+        $report = Get-Content -LiteralPath (Join-Path $testDir 'source-changes.txt') -Raw
+        if (-not $report.Contains($path) -or -not $report.Contains((Get-PackageHash $absolute))) {
+            throw "Source evidence omitted changed input: $path"
+        }
+    } finally { [IO.File]::WriteAllBytes($absolute, $original) }
+}
+$added = Join-Path $sourceFixture 'apps/desktop/new-package-input.rs'
+Set-Content -LiteralPath $added -Value 'new Rust source'
+Assert-Rejected 'added source input' { Assert-PackageSourceUnchanged $before (Get-PackageSourceIdentity $sourceFixture) }
+$restored = Get-PackageSourceIdentity $sourceFixture
+$beforeDifferentHead = [ordered]@{ head = 'different revision'; build_inputs_sha256 = $restored.build_inputs_sha256 }
+Assert-Rejected 'changed HEAD' { Assert-PackageSourceUnchanged $beforeDifferentHead $restored }
 Write-Host "PASS: $script:passed focused package checks. Evidence retained at $testDir"
